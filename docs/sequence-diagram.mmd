@@ -4,13 +4,23 @@ sequenceDiagram
     participant K as Kernel
     participant T as Tracee
 
-    Note over D,T: ── Phase 1: Attach ──
-    D->>K: PtraceAttach(pid)
-    K->>T: deliver SIGSTOP
-    Note over T: Tracee STOPS
+    Note over D,T: ── Phase 1a: Launch (debug=true) ──
+    D->>K: fork + exec with PTRACE_TRACEME
+    Note over T: Child calls exec → kernel sends SIGTRAP
+    Note over T: Tracee STOPS (trace stop)
     Note over D: Debugger BLOCKED
     D->>K: wait4(pid) — blocks until tracee stops
-    K-->>D: returns WaitStatus (stopped by SIGSTOP)
+    K-->>D: returns WaitStatus (stopped by SIGTRAP)
+    Note over D: Debugger UNBLOCKED
+    Note over T: Tracee remains STOPPED
+
+    Note over D,T: ── Phase 1b: Attach (PTRACE_SEIZE) ──
+    D->>K: PTRACE_SEIZE(pid) — attach without SIGSTOP
+    D->>K: PTRACE_INTERRUPT(pid) — request stop
+    Note over T: Tracee STOPS (ptrace-stop)
+    Note over D: Debugger BLOCKED
+    D->>K: wait4(pid) — blocks until tracee stops
+    K-->>D: returns WaitStatus (stopped)
     Note over D: Debugger UNBLOCKED
     Note over T: Tracee remains STOPPED
 

@@ -44,40 +44,65 @@ func newStopReason(ws syscall.WaitStatus) StopReason {
 type Process struct {
 	pid            int
 	terminateOnEnd bool
+	isAttached     bool
 	state          ProcessState
 }
 
-// Launch starts a new process with ptrace enabled and returns a Process
-// that manages it.
+// Launch starts a new process under ptrace and returns a Process that
+// manages it. The process is stopped immediately after exec so the
+// debugger can control it.
 //
 // The calling goroutine is pinned to its current OS thread for the
 // lifetime of the returned Process (released by Close). This is
 // required because Linux ptrace is per-thread: only the thread that
 // forked the tracee may issue subsequent ptrace requests for it.
-func Launch(program string) (*Process, error) {
-	runtime.LockOSThread()
+func Launch(program string, args ...string) (*Process, error) {
+	return launch(program, true, args)
+}
 
-	cmd := exec.Command(program)
+// LaunchNoDebug starts a new process without ptrace tracing and returns
+// a Process that manages it. The process runs freely; use Attach to
+// begin tracing it later. This is primarily useful in tests that need
+// a running target to attach to separately.
+func LaunchNoDebug(program string, args ...string) (*Process, error) {
+	return launch(program, false, args)
+}
+
+func launch(program string, debug bool, args []string) (*Process, error) {
+	if debug {
+		runtime.LockOSThread()
+	}
+
+	cmd := exec.Command(program, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Ptrace: true,
+	if debug {
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Ptrace: true,
+		}
 	}
 
 	if err := cmd.Start(); err != nil {
-		runtime.UnlockOSThread()
+		if debug {
+			runtime.UnlockOSThread()
+		}
 		return nil, newErrorf("exec failed: %v", err)
 	}
 
 	proc := &Process{
 		pid:            cmd.Process.Pid,
 		terminateOnEnd: true,
+		isAttached:     debug,
 		state:          ProcessStopped,
 	}
 
-	if _, err := proc.WaitOnSignal(); err != nil {
-		runtime.UnlockOSThread()
-		return nil, err
+	if debug {
+		if _, err := proc.WaitOnSignal(); err != nil {
+			runtime.UnlockOSThread()
+			return nil, err
+		}
+	} else {
+		proc.state = ProcessRunning
 	}
 
 	return proc, nil
@@ -85,6 +110,10 @@ func Launch(program string) (*Process, error) {
 
 // Attach attaches to an existing process by PID and returns a Process
 // that manages it.
+//
+// It uses PTRACE_SEIZE + PTRACE_INTERRUPT rather than the older
+// PTRACE_ATTACH because the latter sends SIGSTOP, which can produce
+// duplicate stop events and confuse subsequent Resume calls.
 //
 // Like Launch, the calling goroutine is pinned to its OS thread for
 // the lifetime of the returned Process (released by Close).
@@ -95,14 +124,20 @@ func Attach(pid int) (*Process, error) {
 
 	runtime.LockOSThread()
 
-	if err := syscall.PtraceAttach(pid); err != nil {
+	if err := ptraceSeizeProcess(pid); err != nil {
 		runtime.UnlockOSThread()
 		return nil, newErrorf("could not attach: %v", err)
+	}
+
+	if err := ptraceInterruptProcess(pid); err != nil {
+		runtime.UnlockOSThread()
+		return nil, newErrorf("could not stop tracee: %v", err)
 	}
 
 	proc := &Process{
 		pid:            pid,
 		terminateOnEnd: false,
+		isAttached:     true,
 		state:          ProcessStopped,
 	}
 
@@ -153,14 +188,16 @@ func (p *Process) Close() {
 		return
 	}
 
-	if p.state == ProcessRunning {
-		_ = syscall.Kill(p.pid, syscall.SIGSTOP)
-		var ws syscall.WaitStatus
-		syscall.Wait4(p.pid, &ws, 0, nil)
-	}
+	if p.isAttached {
+		if p.state == ProcessRunning {
+			_ = syscall.Kill(p.pid, syscall.SIGSTOP)
+			var ws syscall.WaitStatus
+			syscall.Wait4(p.pid, &ws, 0, nil)
+		}
 
-	syscall.PtraceDetach(p.pid)
-	_ = syscall.Kill(p.pid, syscall.SIGCONT)
+		syscall.PtraceDetach(p.pid)
+		_ = syscall.Kill(p.pid, syscall.SIGCONT)
+	}
 
 	if p.terminateOnEnd {
 		_ = syscall.Kill(p.pid, syscall.SIGKILL)
@@ -168,5 +205,7 @@ func (p *Process) Close() {
 		syscall.Wait4(p.pid, &ws, 0, nil)
 	}
 
-	runtime.UnlockOSThread()
+	if p.isAttached {
+		runtime.UnlockOSThread()
+	}
 }
