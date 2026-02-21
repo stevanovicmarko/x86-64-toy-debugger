@@ -3,6 +3,7 @@ package debugger
 import (
 	"os"
 	"os/exec"
+	"runtime"
 	"syscall"
 )
 
@@ -48,7 +49,14 @@ type Process struct {
 
 // Launch starts a new process with ptrace enabled and returns a Process
 // that manages it.
+//
+// The calling goroutine is pinned to its current OS thread for the
+// lifetime of the returned Process (released by Close). This is
+// required because Linux ptrace is per-thread: only the thread that
+// forked the tracee may issue subsequent ptrace requests for it.
 func Launch(program string) (*Process, error) {
+	runtime.LockOSThread()
+
 	cmd := exec.Command(program)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -57,6 +65,7 @@ func Launch(program string) (*Process, error) {
 	}
 
 	if err := cmd.Start(); err != nil {
+		runtime.UnlockOSThread()
 		return nil, newErrorf("exec failed: %v", err)
 	}
 
@@ -67,6 +76,7 @@ func Launch(program string) (*Process, error) {
 	}
 
 	if _, err := proc.WaitOnSignal(); err != nil {
+		runtime.UnlockOSThread()
 		return nil, err
 	}
 
@@ -75,12 +85,18 @@ func Launch(program string) (*Process, error) {
 
 // Attach attaches to an existing process by PID and returns a Process
 // that manages it.
+//
+// Like Launch, the calling goroutine is pinned to its OS thread for
+// the lifetime of the returned Process (released by Close).
 func Attach(pid int) (*Process, error) {
 	if pid == 0 {
 		return nil, newError("invalid PID")
 	}
 
+	runtime.LockOSThread()
+
 	if err := syscall.PtraceAttach(pid); err != nil {
+		runtime.UnlockOSThread()
 		return nil, newErrorf("could not attach: %v", err)
 	}
 
@@ -91,6 +107,7 @@ func Attach(pid int) (*Process, error) {
 	}
 
 	if _, err := proc.WaitOnSignal(); err != nil {
+		runtime.UnlockOSThread()
 		return nil, err
 	}
 
@@ -109,7 +126,7 @@ func (p *Process) State() ProcessState {
 
 // Resume continues a stopped process.
 func (p *Process) Resume() error {
-	if err := syscall.PtraceCont(p.pid, 0); err != nil {
+	if err := ptraceCont(p.pid); err != nil {
 		return newErrorf("could not resume: %v", err)
 	}
 	p.state = ProcessRunning
@@ -130,13 +147,13 @@ func (p *Process) WaitOnSignal() (StopReason, error) {
 }
 
 // Close detaches from the process and optionally terminates it.
+// It also releases the OS-thread pin established by Launch or Attach.
 func (p *Process) Close() {
 	if p.pid == 0 {
 		return
 	}
 
 	if p.state == ProcessRunning {
-		// Process must be stopped for PTRACE_DETACH to work.
 		_ = syscall.Kill(p.pid, syscall.SIGSTOP)
 		var ws syscall.WaitStatus
 		syscall.Wait4(p.pid, &ws, 0, nil)
@@ -150,4 +167,6 @@ func (p *Process) Close() {
 		var ws syscall.WaitStatus
 		syscall.Wait4(p.pid, &ws, 0, nil)
 	}
+
+	runtime.UnlockOSThread()
 }

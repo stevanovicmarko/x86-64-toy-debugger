@@ -1,63 +1,62 @@
 flowchart TD
     subgraph main_main["main()"]
-        main_main_1["runtime.LockOSThread()"]
-        main_main_2{"len(os.Args) &lt; 2"}
-        main_main_3["fmt.Fprintln(os.Stderr, #quot;No arguments given#quot;)"]
-        main_main_4["os.Exit(1)"]
-        main_main_5["proc := attach(os.Args)"]
-        main_main_6{"err != nil"}
-        main_main_7["fmt.Fprintln(os.Stderr, err)"]
-        main_main_8["os.Exit(1)"]
-        main_main_9["defer proc.Close()"]
-        main_main_10["mainLoop(proc)"]
+        main_main_1["var pid int"]
+        main_main_2["flag.IntVar(&pid, #quot;p#quot;, 0, #quot;attach to process by PID#quot;)"]
+        main_main_3["flag.Usage = usage"]
+        main_main_4["flag.Parse()"]
+        main_main_5{"(pid == 0 && flag.NArg() != 1) || (pid != 0 && flag.NArg() != 0)"}
+        main_main_6["usage()"]
+        main_main_7["os.Exit(2)"]
+        main_main_8["var proc *debugger.Process"]
+        main_main_9{"pid != 0"}
+        main_main_10["proc = debugger.Attach(pid)"]
+        main_main_11["proc = debugger.Launch(flag.Arg(0))"]
+        main_main_12{"err != nil"}
+        main_main_13["fmt.Fprintf(os.Stderr, #quot;toydbg: %v\n#quot;, err)"]
+        main_main_14["os.Exit(1)"]
+        main_main_15["defer proc.Close()"]
+        main_main_16["rl := readline.NewEx(&readline.Config{  Prompt: #quot;(toydbg) #quot;, })"]
+        main_main_17{"err != nil"}
+        main_main_18["fmt.Fprintf(os.Stderr, #quot;toydbg: REPL init failed: %v\n#quot;, err)"]
+        main_main_19["os.Exit(1)"]
+        main_main_20["defer rl.Close()"]
+        main_main_21{"loop"}
+        main_main_22["line := rl.Readline()"]
+        main_main_23{"err == readline.ErrInterrupt"}
+        main_main_24(["continue"])
+        main_main_25{"err == io.EOF"}
+        main_main_26["fmt.Println()"]
+        main_main_27(["return"])
+        main_main_28{"err != nil"}
+        main_main_29["fmt.Fprintf(os.Stderr, #quot;toydbg: REPL read failed: %v\n#quot;, err)"]
+        main_main_30(["return"])
+        main_main_31{"strings.TrimSpace(line)"}
+        main_main_32["fmt.Println(#quot;commands: continue (c), quit (q), help (h)#quot;)"]
+        main_main_33{"err != nil"}
+        main_main_34["fmt.Fprintf(os.Stderr, #quot;toydbg: %v\n#quot;, err)"]
+        main_main_35(["continue"])
+        main_main_36["reason := proc.WaitOnSignal()"]
+        main_main_37{"err != nil"}
+        main_main_38["fmt.Fprintf(os.Stderr, #quot;toydbg: %v\n#quot;, err)"]
+        main_main_39(["return"])
+        main_main_40["printStopReason(reason)"]
+        main_main_41{"reason.Reason == debugger.ProcessExited || reason.Reason == debugger.ProcessT..."}
+        main_main_42(["return"])
+        main_main_43(["return"])
+        main_main_44["fmt.Printf(#quot;unknown command: %q\n#quot;, strings.TrimSpace(line))"]
     end
-    subgraph main_attach["attach()"]
-        main_attach_1{"len(args) == 3 && args[1] == #quot;-p#quot;"}
-        main_attach_2["pid := strconv.Atoi(args[2])"]
-        main_attach_3{"err != nil || pid &lt;= 0"}
-        main_attach_4(["return nil, fmt.Errorf(#quot;invalid pid#quot;)"])
-        main_attach_5(["return debugger.Attach(pid)"])
-        main_attach_6(["return debugger.Launch(args[1])"])
-    end
-    subgraph main_mainLoop["mainLoop()"]
-        main_mainLoop_1["rl := readline.New(#quot;(toydbg) #quot;)"]
-        main_mainLoop_2{"err != nil"}
-        main_mainLoop_3["fmt.Fprintln(os.Stderr, #quot;readline init:#quot;, err)"]
-        main_mainLoop_4(["return"])
-        main_mainLoop_5["defer rl.Close()"]
-        main_mainLoop_6["var lastCmd string"]
-        main_mainLoop_7{"loop"}
-        main_mainLoop_8["line := rl.Readline()"]
-        main_mainLoop_9{"err != nil"}
-        main_mainLoop_10(["break"])
-        main_mainLoop_11{"line == #quot;#quot;"}
-        main_mainLoop_12["line = lastCmd"]
-        main_mainLoop_13["lastCmd = line"]
-        main_mainLoop_14{"line != #quot;#quot;"}
-        main_mainLoop_15{"err != nil"}
-        main_mainLoop_16["fmt.Fprintln(os.Stderr, err)"]
-    end
-    subgraph main_handleCommand["handleCommand()"]
-        main_handleCommand_1["args := strings.Fields(line)"]
-        main_handleCommand_2["command := args[0]"]
-        main_handleCommand_3{"strings.HasPrefix(#quot;continue#quot;, command)"}
-        main_handleCommand_4{"err != nil"}
-        main_handleCommand_5(["return err"])
-        main_handleCommand_6["reason := proc.WaitOnSignal()"]
-        main_handleCommand_7{"err != nil"}
-        main_handleCommand_8(["return err"])
-        main_handleCommand_9["printStopReason(proc, reason)"]
-        main_handleCommand_10(["return nil"])
-        main_handleCommand_11["fmt.Fprintln(os.Stderr, #quot;Unknown command#quot;)"]
-        main_handleCommand_12(["return nil"])
+    subgraph main_usage["usage()"]
+        main_usage_1["fmt.Fprintln(os.Stderr, #quot;Usage:#quot;)"]
+        main_usage_2["fmt.Fprintln(os.Stderr, #quot;  toydbg /path/to/program#quot;)"]
+        main_usage_3["fmt.Fprintln(os.Stderr, #quot;  toydbg -p &lt;pid&gt;#quot;)"]
     end
     subgraph main_printStopReason["printStopReason()"]
-        main_printStopReason_1["fmt.Printf(#quot;Process %d #quot;, proc.Pid())"]
-        main_printStopReason_2{"reason.Reason"}
-        main_printStopReason_3["fmt.Printf(#quot;exited with status %d#quot;, reason.Info)"]
-        main_printStopReason_4["fmt.Printf(#quot;terminated with signal %s#quot;,  unix.SignalName(unix.Signal(reason.I..."]
-        main_printStopReason_5["fmt.Printf(#quot;stopped with signal %s#quot;,  unix.SignalName(unix.Signal(reason.Info)))"]
-        main_printStopReason_6["fmt.Println()"]
+        main_printStopReason_1{"reason.Reason"}
+        main_printStopReason_2["fmt.Printf(#quot;process stopped by signal %d\n#quot;, reason.Info)"]
+        main_printStopReason_3["fmt.Printf(#quot;process exited with code %d\n#quot;, reason.Info)"]
+        main_printStopReason_4["fmt.Printf(#quot;process terminated by signal %d\n#quot;, reason.Info)"]
+        main_printStopReason_5["fmt.Println(#quot;process running#quot;)"]
+        main_printStopReason_6["fmt.Println(#quot;process status changed#quot;)"]
     end
     subgraph debugger_Error["debugger.Error()"]
         debugger_Error_1(["return e.msg"])
@@ -131,11 +130,12 @@ flowchart TD
         debugger_Close_11["var ws syscall.WaitStatus"]
         debugger_Close_12["syscall.Wait4(p.pid, &ws, 0, nil)"]
     end
+    subgraph debugger_ptraceCont["debugger.ptraceCont()"]
+        debugger_ptraceCont_1(["return syscall.ENOSYS"])
+    end
 
-    main_main_10 ~~~ main_attach_1
-    main_attach_6 ~~~ main_mainLoop_1
-    main_mainLoop_16 ~~~ main_handleCommand_1
-    main_handleCommand_12 ~~~ main_printStopReason_1
+    main_main_44 ~~~ main_usage_1
+    main_usage_3 ~~~ main_printStopReason_1
     main_printStopReason_6 ~~~ debugger_Error_1
     debugger_Error_1 ~~~ debugger_newError_1
     debugger_newError_1 ~~~ debugger_newErrorf_1
@@ -147,60 +147,65 @@ flowchart TD
     debugger_State_1 ~~~ debugger_Resume_1
     debugger_Resume_4 ~~~ debugger_WaitOnSignal_1
     debugger_WaitOnSignal_6 ~~~ debugger_Close_1
+    debugger_Close_12 ~~~ debugger_ptraceCont_1
 
-    main_main_3 --> main_main_4
-    main_main_2 -->|"Yes"| main_main_3
     main_main_1 --> main_main_2
+    main_main_2 --> main_main_3
+    main_main_3 --> main_main_4
+    main_main_6 --> main_main_7
+    main_main_5 -->|"Yes"| main_main_6
     main_main_4 --> main_main_5
-    main_main_2 -->|"No"| main_main_5
     main_main_7 --> main_main_8
-    main_main_6 -->|"Yes"| main_main_7
-    main_main_5 --> main_main_6
+    main_main_5 -->|"No"| main_main_8
+    main_main_9 -->|"Yes"| main_main_10
+    main_main_9 -->|"No"| main_main_11
     main_main_8 --> main_main_9
-    main_main_6 -->|"No"| main_main_9
-    main_main_9 --> main_main_10
-    main_attach_3 -->|"Yes"| main_attach_4
-    main_attach_2 --> main_attach_3
-    main_attach_3 -->|"No"| main_attach_5
-    main_attach_1 -->|"Yes"| main_attach_2
-    main_attach_1 -->|"No"| main_attach_6
-    main_mainLoop_3 --> main_mainLoop_4
-    main_mainLoop_2 -->|"Yes"| main_mainLoop_3
-    main_mainLoop_1 --> main_mainLoop_2
-    main_mainLoop_2 -->|"No"| main_mainLoop_5
-    main_mainLoop_5 --> main_mainLoop_6
-    main_mainLoop_9 -->|"Yes"| main_mainLoop_10
-    main_mainLoop_8 --> main_mainLoop_9
-    main_mainLoop_11 -->|"Yes"| main_mainLoop_12
-    main_mainLoop_11 -->|"No"| main_mainLoop_13
-    main_mainLoop_9 -->|"No"| main_mainLoop_11
-    main_mainLoop_15 -->|"Yes"| main_mainLoop_16
-    main_mainLoop_14 -->|"Yes"| main_mainLoop_15
-    main_mainLoop_12 --> main_mainLoop_14
-    main_mainLoop_13 --> main_mainLoop_14
-    main_mainLoop_7 -->|"Yes"| main_mainLoop_8
-    main_mainLoop_16 --> main_mainLoop_7
-    main_mainLoop_15 -->|"No"| main_mainLoop_7
-    main_mainLoop_14 -->|"No"| main_mainLoop_7
-    main_mainLoop_6 --> main_mainLoop_7
-    main_handleCommand_1 --> main_handleCommand_2
-    main_handleCommand_4 -->|"Yes"| main_handleCommand_5
-    main_handleCommand_4 -->|"No"| main_handleCommand_6
-    main_handleCommand_7 -->|"Yes"| main_handleCommand_8
-    main_handleCommand_6 --> main_handleCommand_7
-    main_handleCommand_7 -->|"No"| main_handleCommand_9
-    main_handleCommand_9 --> main_handleCommand_10
-    main_handleCommand_3 -->|"Yes"| main_handleCommand_4
-    main_handleCommand_2 --> main_handleCommand_3
-    main_handleCommand_3 -->|"No"| main_handleCommand_11
-    main_handleCommand_11 --> main_handleCommand_12
-    main_printStopReason_2 -->|"debugger.ProcessExited"| main_printStopReason_3
-    main_printStopReason_2 -->|"debugger.ProcessTerminated"| main_printStopReason_4
-    main_printStopReason_2 -->|"debugger.ProcessStopped"| main_printStopReason_5
-    main_printStopReason_1 --> main_printStopReason_2
-    main_printStopReason_3 --> main_printStopReason_6
-    main_printStopReason_4 --> main_printStopReason_6
-    main_printStopReason_5 --> main_printStopReason_6
+    main_main_13 --> main_main_14
+    main_main_12 -->|"Yes"| main_main_13
+    main_main_10 --> main_main_12
+    main_main_11 --> main_main_12
+    main_main_14 --> main_main_15
+    main_main_12 -->|"No"| main_main_15
+    main_main_15 --> main_main_16
+    main_main_18 --> main_main_19
+    main_main_17 -->|"Yes"| main_main_18
+    main_main_16 --> main_main_17
+    main_main_19 --> main_main_20
+    main_main_17 -->|"No"| main_main_20
+    main_main_23 -->|"Yes"| main_main_24
+    main_main_22 --> main_main_23
+    main_main_26 --> main_main_27
+    main_main_25 -->|"Yes"| main_main_26
+    main_main_23 -->|"No"| main_main_25
+    main_main_29 --> main_main_30
+    main_main_28 -->|"Yes"| main_main_29
+    main_main_25 -->|"No"| main_main_28
+    main_main_31 -->|"#quot;#quot;, #quot;help#quot;, #quot;h#quot;"| main_main_32
+    main_main_34 --> main_main_35
+    main_main_33 -->|"Yes"| main_main_34
+    main_main_33 -->|"No"| main_main_36
+    main_main_38 --> main_main_39
+    main_main_37 -->|"Yes"| main_main_38
+    main_main_36 --> main_main_37
+    main_main_37 -->|"No"| main_main_40
+    main_main_41 -->|"Yes"| main_main_42
+    main_main_40 --> main_main_41
+    main_main_31 -->|"#quot;continue#quot;, #quot;c#quot;"| main_main_33
+    main_main_31 -->|"#quot;quit#quot;, #quot;q#quot;, #quot;exit#quot;"| main_main_43
+    main_main_31 -->|"default"| main_main_44
+    main_main_28 -->|"No"| main_main_31
+    main_main_21 -->|"Yes"| main_main_22
+    main_main_32 --> main_main_21
+    main_main_41 -->|"No"| main_main_21
+    main_main_44 --> main_main_21
+    main_main_20 --> main_main_21
+    main_usage_1 --> main_usage_2
+    main_usage_2 --> main_usage_3
+    main_printStopReason_1 -->|"debugger.ProcessStopped"| main_printStopReason_2
+    main_printStopReason_1 -->|"debugger.ProcessExited"| main_printStopReason_3
+    main_printStopReason_1 -->|"debugger.ProcessTerminated"| main_printStopReason_4
+    main_printStopReason_1 -->|"debugger.ProcessRunning"| main_printStopReason_5
+    main_printStopReason_1 -->|"default"| main_printStopReason_6
     debugger_newStopReason_1 -->|"ws.Exited()"| debugger_newStopReason_2
     debugger_newStopReason_1 -->|"ws.Signaled()"| debugger_newStopReason_3
     debugger_newStopReason_1 -->|"ws.Stopped()"| debugger_newStopReason_4

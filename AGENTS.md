@@ -27,13 +27,15 @@ go test ./... -v
 # Sync dependencies after editing go.mod or adding imports
 go mod tidy
 
-# Build Docker image (for macOS / Windows; substitute podman for docker if needed)
-docker build -t toydbg . # or podman build -t toydbg .
+# Build container image (use whichever runtime is available: podman or docker)
+podman build -t toydbg .
+# docker build -t toydbg .
 
-# Run inside Docker / Podman
-docker run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
-  -it toydbg /path/to/program # or podman run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+# Run inside container (requires ptrace capabilities)
+podman run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
   -it toydbg /path/to/program
+# docker run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+#   -it toydbg /path/to/program
 ```
 
 ## Architecture
@@ -79,19 +81,19 @@ go build ./cmd/toydbg
 
 Containers also work on Linux but native execution is preferred (less overhead, no extra security flags).
 
-### macOS (via Docker / Podman)
+### macOS (via Podman, Docker, or another container runtime)
 
 macOS does not support ptrace in the way the debugger requires. Use a Linux container:
 
 ```bash
-docker build -t toydbg .   # or: podman build -t toydbg .
-docker run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+podman build -t toydbg .   # or: docker build -t toydbg .
+podman run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
   -it toydbg /path/to/program
 ```
 
-### Windows (via WSL2)
+### Windows (via WSL2, Podman, or Docker)
 
-Use WSL2, which provides a real Linux kernel with full ptrace support:
+Use **WSL2**, which provides a real Linux kernel with full ptrace support:
 
 ```bash
 # Inside a WSL2 terminal
@@ -99,9 +101,75 @@ go build ./cmd/toydbg
 ./toydbg /path/to/program
 ```
 
-Alternatively, use Docker Desktop or Podman with the same container commands as macOS above. WSL**1** does *not* support ptrace — you must use WSL**2** or containers.
+Alternatively, use **Docker Desktop** or **Podman** with the same container commands as macOS above. WSL**1** does *not* support ptrace — you must use WSL**2** or containers.
 
 > **⚠ Container ptrace note:** Containers drop `SYS_PTRACE` by default, so `ptrace(PTRACE_TRACEME, ...)` inside `Launch` would fail with `EPERM`. The default seccomp profile also blocks ptrace. Both `--cap-add=SYS_PTRACE` and `--security-opt seccomp=unconfined` are required. Podman is rootless by default, so these capabilities are granted explicitly without running as root on the host.
+
+## Agentic Workflow Requirement
+
+After any code change, you **must** build and run the debugger inside a Linux environment and verify it produces valid output before considering the task complete. A passing `go test ./...` on the host is **not** sufficient — ptrace behavior can only be tested inside a real Linux kernel.
+
+### Step 0 — Detect the available Linux environment
+
+Run the following checks (in order) and use the **first** match:
+
+| Priority | Check | Environment |
+|----------|-------|-------------|
+| 1 | `uname -s` returns `Linux` (native or WSL2) | **Native Linux / WSL2** — build and run directly, no container needed. |
+| 2 | `command -v podman` succeeds | **Podman** |
+| 3 | `command -v docker` succeeds | **Docker** |
+
+If none match, stop and inform the user that a Linux environment is required.
+
+### Step 1 — Build
+
+**Native Linux / WSL2:**
+
+```bash
+go build ./cmd/toydbg && go test ./...
+```
+
+**Podman / Docker** (substitute `docker` for `podman` if that is what was detected):
+
+```bash
+podman build -t toydbg .
+```
+
+### Step 2 — Smoke-test: continue to exit
+
+**Native Linux / WSL2:**
+
+```bash
+echo "c" | ./toydbg /bin/true
+# Expected output: "process exited with code 0"
+```
+
+**Podman / Docker:**
+
+```bash
+echo "c" | podman run --rm -i --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+  toydbg /bin/true
+# Expected output: "process exited with code 0"
+```
+
+### Step 3 — Smoke-test: REPL help
+
+**Native Linux / WSL2:**
+
+```bash
+echo "help" | ./toydbg /bin/true
+# Expected output: "commands: continue (c), quit (q), help (h)"
+```
+
+**Podman / Docker:**
+
+```bash
+echo "help" | podman run --rm -i --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+  toydbg /bin/true
+# Expected output: "commands: continue (c), quit (q), help (h)"
+```
+
+Do **not** skip these steps or assume the task is complete without them.
 
 ## Key Files
 

@@ -7,7 +7,6 @@ sequenceDiagram
     CLI->>debugger: Launch()
     debugger->>OS: Command()
     debugger->>OS: PtraceAttach()
-    debugger->>OS: PtraceCont()
     debugger->>OS: Wait4()
     debugger->>OS: Kill()
     debugger->>OS: Wait4()
