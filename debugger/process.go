@@ -1,14 +1,54 @@
 package debugger
 
 import (
-	"fmt"
 	"os"
 	"os/exec"
 	"syscall"
 )
 
-// Launch starts a new process with ptrace enabled and returns its PID.
-func Launch(program string) (int, error) {
+// ProcessState represents the running state of a traced process.
+type ProcessState int
+
+const (
+	ProcessStopped    ProcessState = iota // Process is stopped by a signal
+	ProcessRunning                        // Process is currently executing
+	ProcessExited                         // Process exited normally
+	ProcessTerminated                     // Process was killed by a signal
+)
+
+// StopReason holds the reason a process stopped and additional info
+// such as the exit code or signal number.
+type StopReason struct {
+	Reason ProcessState
+	Info   uint8
+}
+
+// newStopReason parses a syscall.WaitStatus into a StopReason.
+func newStopReason(ws syscall.WaitStatus) StopReason {
+	switch {
+	case ws.Exited():
+		return StopReason{Reason: ProcessExited, Info: uint8(ws.ExitStatus())}
+	case ws.Signaled():
+		return StopReason{Reason: ProcessTerminated, Info: uint8(ws.Signal())}
+	case ws.Stopped():
+		return StopReason{Reason: ProcessStopped, Info: uint8(ws.StopSignal())}
+	default:
+		return StopReason{Reason: ProcessStopped, Info: 0}
+	}
+}
+
+// Process represents a running process being debugged.
+// Users must create one via Launch or Attach; direct construction is not possible
+// because all fields are unexported.
+type Process struct {
+	pid            int
+	terminateOnEnd bool
+	state          ProcessState
+}
+
+// Launch starts a new process with ptrace enabled and returns a Process
+// that manages it.
+func Launch(program string) (*Process, error) {
 	cmd := exec.Command(program)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -17,43 +57,97 @@ func Launch(program string) (int, error) {
 	}
 
 	if err := cmd.Start(); err != nil {
-		return 0, fmt.Errorf("exec failed: %w", err)
+		return nil, newErrorf("exec failed: %v", err)
 	}
 
-	return cmd.Process.Pid, nil
+	proc := &Process{
+		pid:            cmd.Process.Pid,
+		terminateOnEnd: true,
+		state:          ProcessStopped,
+	}
+
+	if _, err := proc.WaitOnSignal(); err != nil {
+		return nil, err
+	}
+
+	return proc, nil
 }
 
-// AttachPID attaches to a running process via PTRACE_ATTACH.
-func AttachPID(pid int) error {
+// Attach attaches to an existing process by PID and returns a Process
+// that manages it.
+func Attach(pid int) (*Process, error) {
+	if pid == 0 {
+		return nil, newError("invalid PID")
+	}
+
 	if err := syscall.PtraceAttach(pid); err != nil {
-		return fmt.Errorf("could not attach: %w", err)
+		return nil, newErrorf("could not attach: %v", err)
 	}
+
+	proc := &Process{
+		pid:            pid,
+		terminateOnEnd: false,
+		state:          ProcessStopped,
+	}
+
+	if _, err := proc.WaitOnSignal(); err != nil {
+		return nil, err
+	}
+
+	return proc, nil
+}
+
+// Pid returns the OS process ID.
+func (p *Process) Pid() int {
+	return p.pid
+}
+
+// State returns the current process state.
+func (p *Process) State() ProcessState {
+	return p.state
+}
+
+// Resume continues a stopped process.
+func (p *Process) Resume() error {
+	if err := syscall.PtraceCont(p.pid, 0); err != nil {
+		return newErrorf("could not resume: %v", err)
+	}
+	p.state = ProcessRunning
 	return nil
 }
 
-// Resume continues a stopped tracee via PTRACE_CONT.
-func Resume(pid int) error {
-	if err := syscall.PtraceCont(pid, 0); err != nil {
-		return fmt.Errorf("couldn't continue: %w", err)
-	}
-	return nil
-}
-
-// WaitOnSignal blocks until the tracee stops or terminates.
-func WaitOnSignal(pid int) error {
+// WaitOnSignal blocks until the process stops or terminates and returns
+// the reason for stopping.
+func (p *Process) WaitOnSignal() (StopReason, error) {
 	var ws syscall.WaitStatus
-	if _, err := syscall.Wait4(pid, &ws, 0, nil); err != nil {
-		return fmt.Errorf("waitpid failed: %w", err)
+	if _, err := syscall.Wait4(p.pid, &ws, 0, nil); err != nil {
+		return StopReason{}, newErrorf("waitpid failed: %v", err)
 	}
 
-	switch {
-	case ws.Stopped():
-		return nil
-	case ws.Exited():
-		return fmt.Errorf("exited with status %d", ws.ExitStatus())
-	case ws.Signaled():
-		return fmt.Errorf("killed by signal %d", ws.Signal())
-	default:
-		return fmt.Errorf("unknown wait status: %v", ws)
+	reason := newStopReason(ws)
+	p.state = reason.Reason
+	return reason, nil
+}
+
+// Close detaches from the process and optionally terminates it.
+func (p *Process) Close() {
+	if p.pid == 0 {
+		return
+	}
+
+	if p.state == ProcessRunning {
+		// Process must be stopped for PTRACE_DETACH to work.
+		_ = syscall.Kill(p.pid, syscall.SIGSTOP)
+		var ws syscall.WaitStatus
+		syscall.Wait4(p.pid, &ws, 0, nil)
+	}
+
+	syscall.PtraceDetach(p.pid)
+	_ = syscall.Kill(p.pid, syscall.SIGCONT)
+
+	if p.terminateOnEnd {
+		_ = syscall.Kill(p.pid, syscall.SIGKILL)
+		var ws syscall.WaitStatus
+		syscall.Wait4(p.pid, &ws, 0, nil)
 	}
 }

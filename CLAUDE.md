@@ -38,7 +38,7 @@ This is a Go port of a C++ x86-64 debugger from the book *Building a Debugger* b
 
 **Package layout:**
 
-- `debugger/` — public library (equivalent to the book's `libsdb`). Exports process primitives: `Launch`, `AttachPID`, `Resume`, `WaitOnSignal`.
+- `debugger/` — public library. Exports process primitives: `Launch`, `AttachPID`, `Resume`, `WaitOnSignal`.
 - `internal/` — private implementation details. Go compiler enforces this boundary.
 - `cmd/toydbg/` — CLI binary with interactive REPL (`(toydbg) ` prompt). Handles argument parsing and command dispatch.
 - `test/` — black-box integration tests that consume `debugger/` as an external package.
