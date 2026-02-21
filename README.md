@@ -13,8 +13,11 @@ A toy x86-64 debugger written in Go, inspired by the C++ project in [*Building a
 # Build the binary
 go build ./cmd/toydbg
 
-# Run directly
-go run ./cmd/toydbg
+# Launch a program under the debugger
+./toydbg /path/to/program
+
+# Attach to a running process by PID
+./toydbg -p <pid>
 ```
 
 ## Test
@@ -26,14 +29,25 @@ go test ./...
 ## Project Structure
 
 ```
-cmd/toydbg/   CLI binary (interactive REPL)
-debugger/     Public library — all debugger primitives are exported from here
-internal/     Private implementation details (compiler-enforced boundary)
-test/         Black-box integration tests
-docs/         Documentation and notes
+cmd/toydbg/      CLI binary (interactive REPL)
+debugger/        Public library — all debugger primitives are exported from here
+internal/        Private implementation details (compiler-enforced boundary)
+test/            Black-box integration tests
+tools/flowgen/   Code-flow diagram generator
+docs/            Documentation and generated diagrams
 ```
 
 The `debugger` package is the sole public API surface. Both the CLI and tests consume it; neither reaches into `internal/` directly.
+
+## Code Flow Diagram
+
+A Mermaid sequence diagram at [`docs/code-flow.mmd`](docs/code-flow.mmd) visualizes the call flow between the CLI, debugger library, and OS syscalls. It is auto-generated from the source AST by `tools/flowgen`.
+
+Regenerate it after changing `.go` files in `cmd/`, `debugger/`, or `internal/`:
+
+```bash
+go generate ./...
+```
 
 ## License
 

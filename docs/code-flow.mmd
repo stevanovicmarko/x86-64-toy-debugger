@@ -1,0 +1,14 @@
+sequenceDiagram
+    participant CLI
+    participant debugger
+    participant OS
+
+    CLI->>debugger: WaitOnSignal()
+    CLI->>debugger: AttachPID()
+    CLI->>debugger: Launch()
+    CLI->>debugger: Resume()
+    CLI->>debugger: WaitOnSignal()
+    debugger->>OS: Command()
+    debugger->>OS: PtraceAttach()
+    debugger->>OS: PtraceCont()
+    debugger->>OS: Wait4()

@@ -4,7 +4,7 @@ This file provides guidance to AI coding assistants working with this repository
 
 ## Project Overview
 
-A toy x86-64 debugger written in Go, ported from the C++ project in *Building a Debugger* by No Starch Press. The project is in early scaffolding; most debugger logic is yet to be written.
+A toy x86-64 debugger written in Go, ported from the C++ project in *Building a Debugger* by No Starch Press. The debugger can launch or attach to processes via ptrace and has an interactive REPL with the `continue` command.
 
 ## Commands
 
@@ -55,9 +55,13 @@ go mod tidy
 - **Tests** live in `test/` as a separate package to enforce black-box testing through the public API.
 - **Error handling** follows Go idioms: return `error` values, don't panic.
 - Run `go mod tidy` after adding or removing imports.
+- **Diagram regeneration:** After modifying `.go` files in `cmd/`, `debugger/`, or `internal/`, run `go generate ./...` and commit the updated `docs/code-flow.mmd`.
 
 ## Key Files
 
-- `cmd/toydbg/main.go` — CLI entry point, sets up readline REPL.
+- `cmd/toydbg/main.go` — CLI entry point: argument parsing, attach logic, REPL, command dispatch.
+- `debugger/process.go` — process primitives: Launch, AttachPID, Resume, WaitOnSignal.
 - `debugger/debugger.go` — public library root.
 - `test/debugger_test.go` — integration tests.
+- `tools/flowgen/main.go` — code-flow diagram generator (Mermaid sequence diagrams).
+- `docs/code-flow.mmd` — generated Mermaid diagram (auto-generated, do not hand-edit).
