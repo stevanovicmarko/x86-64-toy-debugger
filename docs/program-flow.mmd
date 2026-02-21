@@ -1,0 +1,149 @@
+flowchart TD
+    subgraph main_main["main()"]
+        main_main_1["runtime.LockOSThread()"]
+        main_main_2{"len(os.Args) &lt; 2"}
+        main_main_3["fmt.Fprintln(os.Stderr, #quot;No arguments given#quot;)"]
+        main_main_4["os.Exit(1)"]
+        main_main_5["pid := attach(os.Args)"]
+        main_main_6{"err != nil"}
+        main_main_7["fmt.Fprintln(os.Stderr, err)"]
+        main_main_8["os.Exit(1)"]
+        main_main_9{"err != nil"}
+        main_main_10["fmt.Fprintln(os.Stderr, #quot;waitpid failed:#quot;, err)"]
+        main_main_11["os.Exit(1)"]
+        main_main_12["rl := readline.New(#quot;(toydbg) #quot;)"]
+        main_main_13{"err != nil"}
+        main_main_14["fmt.Fprintln(os.Stderr, #quot;readline init:#quot;, err)"]
+        main_main_15["os.Exit(1)"]
+        main_main_16["defer rl.Close()"]
+        main_main_17["var lastCmd string"]
+        main_main_18{"loop"}
+        main_main_19["line := rl.Readline()"]
+        main_main_20{"err != nil"}
+        main_main_21(["break"])
+        main_main_22{"line == #quot;#quot;"}
+        main_main_23["line = lastCmd"]
+        main_main_24["lastCmd = line"]
+        main_main_25{"line != #quot;#quot;"}
+        main_main_26["handleCommand(pid, line)"]
+    end
+    subgraph main_attach["attach()"]
+        main_attach_1{"len(args) == 3 && args[1] == #quot;-p#quot;"}
+        main_attach_2["pid := strconv.Atoi(args[2])"]
+        main_attach_3{"err != nil || pid &lt;= 0"}
+        main_attach_4(["return 0, fmt.Errorf(#quot;invalid pid#quot;)"])
+        main_attach_5{"err != nil"}
+        main_attach_6(["return 0, err"])
+        main_attach_7(["return pid, nil"])
+        main_attach_8(["return debugger.Launch(args[1])"])
+    end
+    subgraph main_handleCommand["handleCommand()"]
+        main_handleCommand_1["args := strings.Fields(line)"]
+        main_handleCommand_2["command := args[0]"]
+        main_handleCommand_3{"strings.HasPrefix(#quot;continue#quot;, command)"}
+        main_handleCommand_4{"err != nil"}
+        main_handleCommand_5["fmt.Fprintln(os.Stderr, err)"]
+        main_handleCommand_6(["return"])
+        main_handleCommand_7{"err != nil"}
+        main_handleCommand_8["fmt.Fprintln(os.Stderr, err)"]
+        main_handleCommand_9(["return"])
+        main_handleCommand_10["fmt.Fprintln(os.Stderr, #quot;Unknown command#quot;)"]
+    end
+    subgraph debugger_SayHello["debugger.SayHello()"]
+        debugger_SayHello_1["fmt.Println(#quot;Hello, toydbg!#quot;)"]
+    end
+    subgraph debugger_Launch["debugger.Launch()"]
+        debugger_Launch_1["cmd := exec.Command(program)"]
+        debugger_Launch_2["cmd.Stdout = os.Stdout"]
+        debugger_Launch_3["cmd.Stderr = os.Stderr"]
+        debugger_Launch_4["cmd.SysProcAttr = &syscall.SysProcAttr{  Ptrace: true, }"]
+        debugger_Launch_5{"err != nil"}
+        debugger_Launch_6(["return 0, fmt.Errorf(#quot;exec failed: %w#quot;, err)"])
+        debugger_Launch_7(["return cmd.Process.Pid, nil"])
+    end
+    subgraph debugger_AttachPID["debugger.AttachPID()"]
+        debugger_AttachPID_1{"err != nil"}
+        debugger_AttachPID_2(["return fmt.Errorf(#quot;could not attach: %w#quot;, err)"])
+        debugger_AttachPID_3(["return nil"])
+    end
+    subgraph debugger_Resume["debugger.Resume()"]
+        debugger_Resume_1{"err != nil"}
+        debugger_Resume_2(["return fmt.Errorf(#quot;couldn't continue: %w#quot;, err)"])
+        debugger_Resume_3(["return nil"])
+    end
+    subgraph debugger_WaitOnSignal["debugger.WaitOnSignal()"]
+        debugger_WaitOnSignal_1["var ws syscall.WaitStatus"]
+        debugger_WaitOnSignal_2{"err != nil"}
+        debugger_WaitOnSignal_3(["return fmt.Errorf(#quot;waitpid failed: %w#quot;, err)"])
+        debugger_WaitOnSignal_4{"switch"}
+        debugger_WaitOnSignal_5(["return nil"])
+        debugger_WaitOnSignal_6(["return fmt.Errorf(#quot;exited with status %d#quot;, ws.ExitStatus())"])
+        debugger_WaitOnSignal_7(["return fmt.Errorf(#quot;killed by signal %d#quot;, ws.Signal())"])
+        debugger_WaitOnSignal_8(["return fmt.Errorf(#quot;unknown wait status: %v#quot;, ws)"])
+    end
+
+    main_main_3 --> main_main_4
+    main_main_2 -->|"Yes"| main_main_3
+    main_main_1 --> main_main_2
+    main_main_4 --> main_main_5
+    main_main_2 -->|"No"| main_main_5
+    main_main_7 --> main_main_8
+    main_main_6 -->|"Yes"| main_main_7
+    main_main_5 --> main_main_6
+    main_main_10 --> main_main_11
+    main_main_9 -->|"Yes"| main_main_10
+    main_main_8 --> main_main_9
+    main_main_6 -->|"No"| main_main_9
+    main_main_11 --> main_main_12
+    main_main_9 -->|"No"| main_main_12
+    main_main_14 --> main_main_15
+    main_main_13 -->|"Yes"| main_main_14
+    main_main_12 --> main_main_13
+    main_main_15 --> main_main_16
+    main_main_13 -->|"No"| main_main_16
+    main_main_16 --> main_main_17
+    main_main_20 -->|"Yes"| main_main_21
+    main_main_19 --> main_main_20
+    main_main_22 -->|"Yes"| main_main_23
+    main_main_22 -->|"No"| main_main_24
+    main_main_20 -->|"No"| main_main_22
+    main_main_25 -->|"Yes"| main_main_26
+    main_main_23 --> main_main_25
+    main_main_24 --> main_main_25
+    main_main_18 -->|"Yes"| main_main_19
+    main_main_26 --> main_main_18
+    main_main_25 -->|"No"| main_main_18
+    main_main_17 --> main_main_18
+    main_attach_3 -->|"Yes"| main_attach_4
+    main_attach_2 --> main_attach_3
+    main_attach_5 -->|"Yes"| main_attach_6
+    main_attach_3 -->|"No"| main_attach_5
+    main_attach_5 -->|"No"| main_attach_7
+    main_attach_1 -->|"Yes"| main_attach_2
+    main_attach_1 -->|"No"| main_attach_8
+    main_handleCommand_1 --> main_handleCommand_2
+    main_handleCommand_5 --> main_handleCommand_6
+    main_handleCommand_4 -->|"Yes"| main_handleCommand_5
+    main_handleCommand_8 --> main_handleCommand_9
+    main_handleCommand_7 -->|"Yes"| main_handleCommand_8
+    main_handleCommand_4 -->|"No"| main_handleCommand_7
+    main_handleCommand_3 -->|"Yes"| main_handleCommand_4
+    main_handleCommand_3 -->|"No"| main_handleCommand_10
+    main_handleCommand_2 --> main_handleCommand_3
+    debugger_Launch_1 --> debugger_Launch_2
+    debugger_Launch_2 --> debugger_Launch_3
+    debugger_Launch_3 --> debugger_Launch_4
+    debugger_Launch_5 -->|"Yes"| debugger_Launch_6
+    debugger_Launch_4 --> debugger_Launch_5
+    debugger_Launch_5 -->|"No"| debugger_Launch_7
+    debugger_AttachPID_1 -->|"Yes"| debugger_AttachPID_2
+    debugger_AttachPID_1 -->|"No"| debugger_AttachPID_3
+    debugger_Resume_1 -->|"Yes"| debugger_Resume_2
+    debugger_Resume_1 -->|"No"| debugger_Resume_3
+    debugger_WaitOnSignal_2 -->|"Yes"| debugger_WaitOnSignal_3
+    debugger_WaitOnSignal_1 --> debugger_WaitOnSignal_2
+    debugger_WaitOnSignal_4 -->|"ws.Stopped()"| debugger_WaitOnSignal_5
+    debugger_WaitOnSignal_4 -->|"ws.Exited()"| debugger_WaitOnSignal_6
+    debugger_WaitOnSignal_4 -->|"ws.Signaled()"| debugger_WaitOnSignal_7
+    debugger_WaitOnSignal_4 -->|"default"| debugger_WaitOnSignal_8
+    debugger_WaitOnSignal_2 -->|"No"| debugger_WaitOnSignal_4

@@ -33,7 +33,8 @@ cmd/toydbg/      CLI binary (interactive REPL)
 debugger/        Public library — all debugger primitives are exported from here
 internal/        Private implementation details (compiler-enforced boundary)
 test/            Black-box integration tests
-tools/flowgen/   Code-flow diagram generator
+tools/flowgen/   Code-flow diagram generator (sequence diagrams)
+tools/progflow/  Program-flow diagram generator (control-flow flowcharts)
 docs/            Documentation and generated diagrams
 ```
 
@@ -48,6 +49,10 @@ Regenerate it after changing `.go` files in `cmd/`, `debugger/`, or `internal/`:
 ```bash
 go generate ./...
 ```
+
+## Program Flow Diagram
+
+A Mermaid flowchart at [`docs/program-flow.mmd`](docs/program-flow.mmd) shows the internal control flow of every function — if/else branches, for loops, switch statements, function calls, and returns. It is auto-generated from the source AST by `tools/progflow`.
 
 ## License
 

@@ -55,7 +55,7 @@ go mod tidy
 - **Tests** live in `test/` as a separate package to enforce black-box testing through the public API.
 - **Error handling** follows Go idioms: return `error` values, don't panic.
 - Run `go mod tidy` after adding or removing imports.
-- **Diagram regeneration:** After modifying `.go` files in `cmd/`, `debugger/`, or `internal/`, run `go generate ./...` and commit the updated `docs/code-flow.mmd`.
+- **Diagram regeneration:** After modifying `.go` files in `cmd/`, `debugger/`, or `internal/`, run `go generate ./...` and commit the updated `docs/code-flow.mmd` and `docs/program-flow.mmd`.
 
 ## Key Files
 
@@ -64,4 +64,6 @@ go mod tidy
 - `debugger/debugger.go` — public library root.
 - `test/debugger_test.go` — integration tests.
 - `tools/flowgen/main.go` — code-flow diagram generator (Mermaid sequence diagrams).
-- `docs/code-flow.mmd` — generated Mermaid diagram (auto-generated, do not hand-edit).
+- `tools/progflow/main.go` — program-flow diagram generator (Mermaid flowcharts with control flow).
+- `docs/code-flow.mmd` — generated Mermaid sequence diagram (auto-generated, do not hand-edit).
+- `docs/program-flow.mmd` — generated Mermaid flowchart (auto-generated, do not hand-edit).

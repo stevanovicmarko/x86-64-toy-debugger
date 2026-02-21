@@ -1,6 +1,7 @@
 # Go build output
 toydbg
 /flowgen
+/progflow
 *.exe
 *.test
 *.out

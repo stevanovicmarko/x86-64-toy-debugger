@@ -30,7 +30,7 @@ go mod tidy
 go generate ./...
 ```
 
-**Diagram rule:** After modifying `.go` files in `cmd/`, `debugger/`, or `internal/`, run `go generate ./...` and commit the updated `docs/code-flow.mmd`.
+**Diagram rule:** After modifying `.go` files in `cmd/`, `debugger/`, or `internal/`, run `go generate ./...` and commit the updated `docs/code-flow.mmd` and `docs/program-flow.mmd`.
 
 ## Architecture
 
