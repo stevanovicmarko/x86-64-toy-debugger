@@ -82,6 +82,14 @@ flowchart TD
         debugger_WaitOnSignal_8(["return fmt.Errorf(#quot;unknown wait status: %v#quot;, ws)"])
     end
 
+    main_main_26 ~~~ main_attach_1
+    main_attach_8 ~~~ main_handleCommand_1
+    main_handleCommand_10 ~~~ debugger_SayHello_1
+    debugger_SayHello_1 ~~~ debugger_Launch_1
+    debugger_Launch_7 ~~~ debugger_AttachPID_1
+    debugger_AttachPID_3 ~~~ debugger_Resume_1
+    debugger_Resume_3 ~~~ debugger_WaitOnSignal_1
+
     main_main_3 --> main_main_4
     main_main_2 -->|"Yes"| main_main_3
     main_main_1 --> main_main_2

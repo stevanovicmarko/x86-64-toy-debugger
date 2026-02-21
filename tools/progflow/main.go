@@ -335,6 +335,21 @@ func writeMermaid(outPath string, sgs []subgraph) error {
 
 	b.WriteByte('\n')
 
+	// Add invisible edges between consecutive subgraphs so the layout
+	// engine stacks them vertically instead of side-by-side.
+	for i := 0; i < len(sgs)-1; i++ {
+		cur := sgs[i]
+		nxt := sgs[i+1]
+		// Pick the last node of the current subgraph and the first of the next.
+		if len(cur.nodes) > 0 && len(nxt.nodes) > 0 {
+			fromID := extractNodeID(cur.nodes[len(cur.nodes)-1])
+			toID := extractNodeID(nxt.nodes[0])
+			fmt.Fprintf(&b, "    %s ~~~ %s\n", fromID, toID)
+		}
+	}
+
+	b.WriteByte('\n')
+
 	// Write all edges outside subgraphs.
 	for _, sg := range sgs {
 		for _, e := range sg.edges {
@@ -344,6 +359,18 @@ func writeMermaid(outPath string, sgs []subgraph) error {
 	}
 
 	return os.WriteFile(outPath, []byte(b.String()), 0o644)
+}
+
+// extractNodeID pulls the node ID from a Mermaid node definition line.
+// A line looks like: "        main_main_1[\"label\"]"  → returns "main_main_1".
+func extractNodeID(nodeLine string) string {
+	s := strings.TrimSpace(nodeLine)
+	for i, ch := range s {
+		if ch == '[' || ch == '{' || ch == '(' {
+			return s[:i]
+		}
+	}
+	return s
 }
 
 // formatExpr renders an AST expression to a readable string using go/printer.
