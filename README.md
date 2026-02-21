@@ -1,11 +1,11 @@
 # toydbg
 
-A toy x86-64 debugger written in Go, ported from the C++ project in [*Building a Debugger*](https://nostarch.com/building-a-debugger) by No Starch Press.
+A toy x86-64 debugger written in Go, inspired by the C++ project in [*Building a Debugger*](https://nostarch.com/building-a-debugger) by No Starch Press.
 
 ## Prerequisites
 
 - Go 1.25+
-- Linux x86-64
+- Linux x86-64s
 
 ## Build & Run
 
