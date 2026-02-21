@@ -1,0 +1,37 @@
+sequenceDiagram
+    participant U as User (stdin)
+    participant D as Debugger
+    participant K as Kernel
+    participant T as Tracee
+
+    Note over D,T: ── Phase 1: Attach ──
+    D->>K: PtraceAttach(pid)
+    K->>T: deliver SIGSTOP
+    Note over T: Tracee STOPS
+    Note over D: Debugger BLOCKED
+    D->>K: wait4(pid) — blocks until tracee stops
+    K-->>D: returns WaitStatus (stopped by SIGSTOP)
+    Note over D: Debugger UNBLOCKED
+    Note over T: Tracee remains STOPPED
+
+    Note over D,T: ── Phase 2: REPL loop ──
+    D->>U: print prompt "(toydbg) "
+    Note over D: Debugger BLOCKED on readline
+    Note over T: Tracee still STOPPED
+    U-->>D: types "continue"
+    Note over D: Debugger UNBLOCKED
+
+    D->>K: PtraceCont(pid, 0)
+    Note over T: Tracee RESUMES execution
+    Note over D: Debugger BLOCKED
+    D->>K: wait4(pid) — blocks until tracee stops
+    Note over T: Tracee hits breakpoint / exits / gets signal
+    Note over T: Tracee STOPS again
+    K-->>D: returns WaitStatus
+    Note over D: Debugger UNBLOCKED
+
+    D->>U: print stop reason
+    D->>U: print prompt "(toydbg) "
+    Note over D: Debugger BLOCKED on readline again
+    Note over T: Tracee STOPPED again
+    Note over D,T: ── cycle repeats ──

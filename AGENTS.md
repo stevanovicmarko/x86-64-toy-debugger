@@ -66,7 +66,7 @@ podman run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
 - **Tests** live in `test/` as a separate package to enforce black-box testing through the public API.
 - **Error handling** follows Go idioms: return `error` values, don't panic.
 - Run `go mod tidy` after adding or removing imports.
-- **Diagram regeneration:** After modifying `.go` files in `cmd/`, `debugger/`, or `internal/`, run `go generate ./...` and commit the updated `docs/code-flow.mmd` and `docs/program-flow.mmd`.
+- **Sequence diagram:** The file [`docs/sequence-diagram.mmd`](docs/sequence-diagram.mmd) is the canonical Mermaid sequence diagram documenting the debugger's attach-and-REPL lifecycle (User, Debugger, Kernel, Tracee). When adding new debugger features or changing the attach/resume/wait flow, update the diagram to reflect the new interactions. Every agentic coding flow that modifies the debugger's control flow **must** update this diagram and commit it alongside the code changes.
 
 ## Platform-Specific Setup
 
@@ -177,7 +177,4 @@ Do **not** skip these steps or assume the task is complete without them.
 - `debugger/process.go` — process primitives: Launch, AttachPID, Resume, WaitOnSignal.
 - `debugger/debugger.go` — public library root.
 - `test/debugger_test.go` — integration tests.
-- `tools/flowgen/main.go` — code-flow diagram generator (Mermaid sequence diagrams).
-- `tools/progflow/main.go` — program-flow diagram generator (Mermaid flowcharts with control flow).
-- `docs/code-flow.mmd` — generated Mermaid sequence diagram (auto-generated, do not hand-edit).
-- `docs/program-flow.mmd` — generated Mermaid flowchart (auto-generated, do not hand-edit).
+- `docs/sequence-diagram.mmd` — Mermaid sequence diagram showing the debugger's attach-and-REPL lifecycle.

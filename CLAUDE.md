@@ -26,9 +26,6 @@ go get github.com/some/package
 # Sync dependencies (after editing go.mod or adding imports)
 go mod tidy
 
-# Regenerate code-flow diagram
-go generate ./...
-
 # Build container image (use whichever runtime is available: podman or docker)
 podman build -t toydbg .
 # docker build -t toydbg .
@@ -40,7 +37,7 @@ podman run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
 #   -it toydbg /path/to/program
 ```
 
-**Diagram rule:** After modifying `.go` files in `cmd/`, `debugger/`, or `internal/`, run `go generate ./...` and commit the updated `docs/code-flow.mmd` and `docs/program-flow.mmd`.
+**Sequence diagram rule:** The file [`docs/sequence-diagram.mmd`](docs/sequence-diagram.mmd) is the canonical Mermaid sequence diagram documenting the debugger's attach-and-REPL lifecycle (User, Debugger, Kernel, Tracee). When adding new debugger features or changing the attach/resume/wait flow, update the diagram to reflect the new interactions. Every agentic coding flow that modifies the debugger's control flow **must** update this diagram and commit it alongside the code changes.
 
 ## Architecture
 
