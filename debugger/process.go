@@ -46,6 +46,7 @@ type Process struct {
 	terminateOnEnd bool
 	isAttached     bool
 	state          ProcessState
+	regs           *Registers
 }
 
 // Launch starts a new process under ptrace and returns a Process that
@@ -101,6 +102,11 @@ func launch(program string, debug bool, args []string) (*Process, error) {
 			runtime.UnlockOSThread()
 			return nil, err
 		}
+		proc.regs = &Registers{pid: proc.pid}
+		if err := proc.regs.readAll(); err != nil {
+			proc.Close()
+			return nil, err
+		}
 	} else {
 		proc.state = ProcessRunning
 	}
@@ -146,6 +152,12 @@ func Attach(pid int) (*Process, error) {
 		return nil, err
 	}
 
+	proc.regs = &Registers{pid: proc.pid}
+	if err := proc.regs.readAll(); err != nil {
+		proc.Close()
+		return nil, err
+	}
+
 	return proc, nil
 }
 
@@ -159,6 +171,12 @@ func (p *Process) State() ProcessState {
 	return p.state
 }
 
+// Registers returns the cached register state. The cache is refreshed
+// automatically by WaitOnSignal each time the process stops.
+func (p *Process) Registers() *Registers {
+	return p.regs
+}
+
 // Resume continues a stopped process.
 func (p *Process) Resume() error {
 	if err := ptraceCont(p.pid); err != nil {
@@ -169,7 +187,8 @@ func (p *Process) Resume() error {
 }
 
 // WaitOnSignal blocks until the process stops or terminates and returns
-// the reason for stopping.
+// the reason for stopping. When the process is stopped and we are
+// attached, the register cache is refreshed automatically.
 func (p *Process) WaitOnSignal() (StopReason, error) {
 	var ws syscall.WaitStatus
 	if _, err := syscall.Wait4(p.pid, &ws, 0, nil); err != nil {
@@ -178,6 +197,13 @@ func (p *Process) WaitOnSignal() (StopReason, error) {
 
 	reason := newStopReason(ws)
 	p.state = reason.Reason
+
+	if p.isAttached && p.state == ProcessStopped && p.regs != nil {
+		if err := p.regs.readAll(); err != nil {
+			return reason, err
+		}
+	}
+
 	return reason, nil
 }
 

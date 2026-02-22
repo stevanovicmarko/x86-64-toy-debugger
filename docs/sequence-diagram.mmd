@@ -12,6 +12,13 @@ sequenceDiagram
     D->>K: wait4(pid) — blocks until tracee stops
     K-->>D: returns WaitStatus (stopped by SIGTRAP)
     Note over D: Debugger UNBLOCKED
+    D->>K: PtraceGetRegs(pid) — read GPRs
+    K-->>D: returns GPR values
+    D->>K: PTRACE_GETFPREGS(pid) — read FP regs
+    K-->>D: returns FP register values
+    D->>K: PTRACE_PEEKUSER × 8 — read debug regs
+    K-->>D: returns debug register values
+    Note over D: Registers cached in Process.regs
     Note over T: Tracee remains STOPPED
 
     Note over D,T: ── Phase 1b: Attach (PTRACE_SEIZE) ──
@@ -22,6 +29,13 @@ sequenceDiagram
     D->>K: wait4(pid) — blocks until tracee stops
     K-->>D: returns WaitStatus (stopped)
     Note over D: Debugger UNBLOCKED
+    D->>K: PtraceGetRegs(pid) — read GPRs
+    K-->>D: returns GPR values
+    D->>K: PTRACE_GETFPREGS(pid) — read FP regs
+    K-->>D: returns FP register values
+    D->>K: PTRACE_PEEKUSER × 8 — read debug regs
+    K-->>D: returns debug register values
+    Note over D: Registers cached in Process.regs
     Note over T: Tracee remains STOPPED
 
     Note over D,T: ── Phase 2: REPL loop ──
@@ -39,6 +53,9 @@ sequenceDiagram
     Note over T: Tracee STOPS again
     K-->>D: returns WaitStatus
     Note over D: Debugger UNBLOCKED
+    D->>K: PtraceGetRegs / GETFPREGS / PeekUser
+    K-->>D: register values
+    Note over D: Registers cached in Process.regs
 
     D->>U: print stop reason
     D->>U: print prompt "(toydbg) "
