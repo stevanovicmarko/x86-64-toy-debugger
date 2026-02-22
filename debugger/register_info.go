@@ -18,10 +18,10 @@ const (
 type RegisterFormat int
 
 const (
-	RegisterFormatUint       RegisterFormat = iota // Unsigned integer
-	RegisterFormatDoubleFloat                      // 64-bit IEEE 754 double
-	RegisterFormatLongDouble                       // 80-bit x87 extended precision (stored as 16 bytes)
-	RegisterFormatVector                           // Opaque byte vector (SIMD)
+	RegisterFormatUint        RegisterFormat = iota // Unsigned integer
+	RegisterFormatDoubleFloat                       // 64-bit IEEE 754 double
+	RegisterFormatLongDouble                        // 80-bit x87 extended precision (stored as 16 bytes)
+	RegisterFormatVector                            // Opaque byte vector (SIMD)
 )
 
 // RegisterInfo describes a single register: its identity, name, DWARF
@@ -114,11 +114,11 @@ const (
 
 // registerInfos is the single source of truth for all x86-64 registers.
 // The slice index is the RegisterID. An init function sets each entry's
-// ID field automatically, eliminating the C++ X-Macro sync problem.
+// ID field automatically.
 //
 // Register count: 25 64-bit GPRs + 16 32-bit sub + 16 16-bit sub
-//   + 4 high-8 sub + 16 low-8 sub + 8 FP control/status
-//   + 8 ST + 8 MM + 16 XMM + 8 DR = 125 registers.
+//   - 4 high-8 sub + 16 low-8 sub + 8 FP control/status
+//   - 8 ST + 8 MM + 16 XMM + 8 DR = 125 registers.
 var registerInfos = []RegisterInfo{
 	// ── 64-bit GPRs ────────────────────────────────────────────────
 	// DWARF IDs from the SYSV ABI x86-64 supplement.

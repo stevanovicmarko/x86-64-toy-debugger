@@ -54,7 +54,7 @@ This is a Go port of a C++ x86-64 debugger from the book *Building a Debugger* b
 
 **Key constraint:** `debugger` is the sole public API. CLI and tests must go through it; neither should import `internal/`.
 
-**Dependency:** `github.com/chzyer/readline` provides the interactive command line (equivalent to `libedit` in the C++ version).
+**Dependency:** `github.com/chzyer/readline` provides the interactive command line.
 
 ## Platform-Specific Setup
 

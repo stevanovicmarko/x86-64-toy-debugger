@@ -109,8 +109,7 @@ func TestLaunchSuccess(t *testing.T) {
 }
 
 func TestLaunchNoSuchProgram(t *testing.T) {
-	// Go's os/exec propagates exec failures via an internal pipe,
-	// so unlike the C++ version we don't need our own pipe wrapper.
+	// Go's os/exec propagates exec failures via an internal pipe.
 	_, err := debugger.Launch("you_do_not_have_to_be_good")
 	if err == nil {
 		t.Fatal("expected an error for nonexistent program")
@@ -481,5 +480,195 @@ func TestReadRegistersAfterContinue(t *testing.T) {
 		if ripAfter == ripBefore {
 			t.Error("rip did not change after continue")
 		}
+	}
+}
+
+func TestWriteSubregisterPreservesParent(t *testing.T) {
+	proc, err := debugger.Launch(targetPath("run_endlessly"))
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	defer proc.Close()
+
+	regs := proc.Registers()
+	raxInfo, _ := debugger.RegisterInfoByName("rax")
+	eaxInfo, _ := debugger.RegisterInfoByName("eax")
+
+	// Set rax to a known 64-bit value.
+	if err := regs.Write(raxInfo, uint64(0x1122334455667788)); err != nil {
+		t.Fatalf("Write rax failed: %v", err)
+	}
+
+	// Overwrite the lower 32 bits via eax.
+	if err := regs.Write(eaxInfo, uint32(0xAABBCCDD)); err != nil {
+		t.Fatalf("Write eax failed: %v", err)
+	}
+
+	// The upper 32 bits of rax should be preserved.
+	got := regs.Read(raxInfo).(uint64)
+	want := uint64(0x11223344AABBCCDD)
+	if got != want {
+		t.Errorf("rax after eax write: got %#016x, want %#016x", got, want)
+	}
+}
+
+func TestWriteHighByteRegister(t *testing.T) {
+	proc, err := debugger.Launch(targetPath("run_endlessly"))
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	defer proc.Close()
+
+	regs := proc.Registers()
+	raxInfo, _ := debugger.RegisterInfoByName("rax")
+	ahInfo, _ := debugger.RegisterInfoByName("ah")
+
+	// Set rax to a known value where byte 0 = 0x34, byte 1 = 0x12.
+	if err := regs.Write(raxInfo, uint64(0x0000000000001234)); err != nil {
+		t.Fatalf("Write rax failed: %v", err)
+	}
+
+	// Write 0xFF to ah (byte 1 of the low word).
+	if err := regs.Write(ahInfo, uint8(0xFF)); err != nil {
+		t.Fatalf("Write ah failed: %v", err)
+	}
+
+	got := regs.Read(raxInfo).(uint64)
+	want := uint64(0x000000000000FF34)
+	if got != want {
+		t.Errorf("rax after ah write: got %#016x, want %#016x", got, want)
+	}
+}
+
+func TestWriteFPRegister(t *testing.T) {
+	proc, err := debugger.Launch(targetPath("run_endlessly"))
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	defer proc.Close()
+
+	regs := proc.Registers()
+	mxcsrInfo, _ := debugger.RegisterInfoByName("mxcsr")
+
+	// Read the current mxcsr value.
+	orig := regs.Read(mxcsrInfo).(uint32)
+
+	// Toggle bit 6 (DAZ — Denormals Are Zero), which is a safe bit to flip.
+	modified := orig ^ (1 << 6)
+	if err := regs.Write(mxcsrInfo, modified); err != nil {
+		t.Fatalf("Write mxcsr failed: %v", err)
+	}
+
+	got := regs.Read(mxcsrInfo).(uint32)
+	if got != modified {
+		t.Errorf("mxcsr after write: got %#08x, want %#08x", got, modified)
+	}
+}
+
+func TestReadWriteXMMRegister(t *testing.T) {
+	proc, err := debugger.Launch(targetPath("run_endlessly"))
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	defer proc.Close()
+
+	regs := proc.Registers()
+	xmm0Info, _ := debugger.RegisterInfoByName("xmm0")
+
+	want := [16]byte{
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+	}
+	if err := regs.Write(xmm0Info, want); err != nil {
+		t.Fatalf("Write xmm0 failed: %v", err)
+	}
+
+	got := regs.Read(xmm0Info).([16]byte)
+	if got != want {
+		t.Errorf("xmm0 after write: got %v, want %v", got, want)
+	}
+}
+
+func TestReadWriteDebugRegister(t *testing.T) {
+	proc, err := debugger.Launch(targetPath("run_endlessly"))
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	defer proc.Close()
+
+	regs := proc.Registers()
+	dr0Info, _ := debugger.RegisterInfoByName("dr0")
+
+	// dr0 holds a linear address for hardware breakpoints.
+	want := uint64(0x00007FFF12345678)
+	if err := regs.Write(dr0Info, want); err != nil {
+		t.Fatalf("Write dr0 failed: %v", err)
+	}
+
+	got := regs.Read(dr0Info).(uint64)
+	if got != want {
+		t.Errorf("dr0 after write: got %#016x, want %#016x", got, want)
+	}
+}
+
+func TestReadByIDAndWriteByID(t *testing.T) {
+	proc, err := debugger.Launch(targetPath("run_endlessly"))
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	defer proc.Close()
+
+	regs := proc.Registers()
+	raxInfo, _ := debugger.RegisterInfoByName("rax")
+
+	// Round-trip via WriteByID / ReadByID.
+	want := uint64(0xFEEDFACECAFEBEEF)
+	if err := regs.WriteByID(raxInfo.ID, want); err != nil {
+		t.Fatalf("WriteByID failed: %v", err)
+	}
+
+	got, err := regs.ReadByID(raxInfo.ID)
+	if err != nil {
+		t.Fatalf("ReadByID failed: %v", err)
+	}
+	if got.(uint64) != want {
+		t.Errorf("ReadByID(rax): got %#x, want %#x", got, want)
+	}
+
+	// Invalid ID should return an error.
+	_, err = regs.ReadByID(debugger.RegisterID(9999))
+	if err == nil {
+		t.Fatal("ReadByID with invalid ID should return error")
+	}
+	if !isDebuggerError(err) {
+		t.Fatalf("expected *debugger.Error, got %T: %v", err, err)
+	}
+
+	err = regs.WriteByID(debugger.RegisterID(9999), uint64(0))
+	if err == nil {
+		t.Fatal("WriteByID with invalid ID should return error")
+	}
+	if !isDebuggerError(err) {
+		t.Fatalf("expected *debugger.Error, got %T: %v", err, err)
+	}
+}
+
+func TestWriteTypeMismatchReturnsError(t *testing.T) {
+	proc, err := debugger.Launch(targetPath("run_endlessly"))
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	defer proc.Close()
+
+	regs := proc.Registers()
+	raxInfo, _ := debugger.RegisterInfoByName("rax")
+
+	// rax is an 8-byte uint register; writing [16]byte should fail.
+	err = regs.Write(raxInfo, [16]byte{})
+	if err == nil {
+		t.Fatal("expected error writing [16]byte to uint64 register")
+	}
+	if !isDebuggerError(err) {
+		t.Fatalf("expected *debugger.Error, got %T: %v", err, err)
 	}
 }

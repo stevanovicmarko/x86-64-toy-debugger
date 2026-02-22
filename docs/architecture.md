@@ -278,8 +278,7 @@ shell over the `debugger` API, not an independent system.
 
 - **Ctrl+C** (`readline.ErrInterrupt`) — ignored, loops back to prompt.
 - **Ctrl+D** (`io.EOF`) — exits gracefully.
-- The `readline` library (equivalent to `libedit` in the C++ version)
-  provides line editing, history, and signal handling.
+- The `readline` library provides line editing, history, and signal handling.
 
 ---
 

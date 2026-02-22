@@ -65,8 +65,7 @@ func (r *Registers) readAll() error {
 
 // bytesForOffset returns a byte-slice view into the backing store that
 // contains the register at the given struct-user offset, along with the
-// local offset within that slice. This is the Go equivalent of the C++
-// as_bytes(data_) + info.offset pattern.
+// local offset within that slice.
 func (r *Registers) bytesForOffset(off, size int) []byte {
 	switch {
 	case off < 216:
