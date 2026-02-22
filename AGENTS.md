@@ -150,7 +150,7 @@ echo "c" | podman run --rm -i --cap-add=SYS_PTRACE --security-opt seccomp=unconf
 ```bash
 echo "help" | podman run --rm -i --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
   toydbg /bin/true
-# Expected output: "commands: continue (c), register (reg), quit (q), help (h)"
+# Expected output: "commands: continue (c), step (s), breakpoint (break), register (reg), quit (q), help (h)"
 ```
 
 > **Why is the container build mandatory?** Native-only testing does not guarantee the container environment works. The container is where `gcc` compiles assembly test targets, and where the Dockerfile's `RUN go test ./...` gate catches regressions in the full toolchain.
@@ -159,16 +159,18 @@ Do **not** skip the container build or assume the task is complete without it.
 
 ## Key Files
 
-- `cmd/toydbg/main.go` — CLI entry point: argument parsing, REPL loop, command dispatch (continue, register read/write, help, quit).
-- `debugger/process.go` — process lifecycle: Launch, LaunchWithOptions, Attach, Resume, WaitOnSignal, GetPC, Close.
+- `cmd/toydbg/main.go` — CLI entry point: argument parsing, REPL loop, command dispatch (continue, step, breakpoint, register, help, quit).
+- `debugger/process.go` — process lifecycle: Launch, LaunchWithOptions, Attach, Resume, WaitOnSignal, GetPC, SetPC, breakpoint management, StepInstruction, Close.
+- `debugger/breakpoint_site.go` — BreakpointSite type (enable/disable via PEEKDATA/POKEDATA) and breakpointSiteCollection.
 - `debugger/format.go` — `FormatRegisterValue` — display formatting for all register types.
 - `debugger/parse.go` — `ParseRegisterValue` — CLI string → typed value conversion.
 - `debugger/register_info.go` — register metadata table (125 entries) and lookup functions.
 - `debugger/registers_linux.go` — register cache: read/write via ptrace.
 - `debugger/debugger.go` — public library root (package documentation).
 - `debugger/error.go` — custom error type and constructors.
-- `test/debugger_test.go` — integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests).
+- `test/debugger_test.go` — integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests, breakpoint tests).
 - `test/targets/reg_read.s` — assembly test target: sets known register values and traps (no libc, built with gcc).
 - `test/targets/reg_write.s` — assembly test target: prints debugger-written register values via printf (built with gcc).
+- `test/targets/hello_toydbg.s` — assembly test target: write + exit (no libc, non-PIE, used for breakpoint tests).
 - `docs/sequence-diagram.mmd` — Mermaid sequence diagram showing the debugger's attach-and-REPL lifecycle.
 - `docs/architecture.md` — Educational architecture guide (onion pattern: high-level concepts → implementation details). Must be updated alongside code changes.

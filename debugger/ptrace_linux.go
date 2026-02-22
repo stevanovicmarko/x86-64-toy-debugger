@@ -22,6 +22,11 @@ const (
 	ptraceSetFPRegsReq = 0xf // PTRACE_SETFPREGS
 	ptracePeekUserReq  = 0x3 // PTRACE_PEEKUSER
 	ptracePokeUserReq  = 0x6 // PTRACE_POKEUSER
+
+	// ptrace requests for memory access and single-stepping.
+	ptracePeekDataReq  = 0x2 // PTRACE_PEEKDATA
+	ptracePokeDataReq  = 0x5 // PTRACE_POKEDATA
+	ptraceSingleStepReq = 0x9 // PTRACE_SINGLESTEP
 )
 
 func ptraceCont(pid int) error {
@@ -102,6 +107,40 @@ func ptracePokeUser(pid int, offset uintptr, data uint64) error {
 	_, _, errno := syscall.RawSyscall6(syscall.SYS_PTRACE,
 		uintptr(ptracePokeUserReq), uintptr(pid), offset,
 		uintptr(data), 0, 0)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// ptracePeekData reads a single word from the tracee's address space.
+func ptracePeekData(pid int, addr uint64) (uint64, error) {
+	var val uint64
+	_, _, errno := syscall.RawSyscall6(syscall.SYS_PTRACE,
+		uintptr(ptracePeekDataReq), uintptr(pid), uintptr(addr),
+		uintptr(unsafe.Pointer(&val)), 0, 0)
+	if errno != 0 {
+		return 0, errno
+	}
+	return val, nil
+}
+
+// ptracePokeData writes a single word to the tracee's address space.
+func ptracePokeData(pid int, addr uint64, data uint64) error {
+	_, _, errno := syscall.RawSyscall6(syscall.SYS_PTRACE,
+		uintptr(ptracePokeDataReq), uintptr(pid), uintptr(addr),
+		uintptr(data), 0, 0)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// ptraceSingleStep resumes the tracee for exactly one instruction,
+// then stops it again with SIGTRAP.
+func ptraceSingleStep(pid int) error {
+	_, _, errno := syscall.RawSyscall6(syscall.SYS_PTRACE,
+		uintptr(ptraceSingleStepReq), uintptr(pid), 0, 0, 0, 0)
 	if errno != 0 {
 		return errno
 	}

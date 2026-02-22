@@ -49,11 +49,12 @@ func newStopReason(ws syscall.WaitStatus) StopReason {
 // Users must create one via Launch or Attach; direct construction is not possible
 // because all fields are unexported.
 type Process struct {
-	pid            int
-	terminateOnEnd bool
-	isAttached     bool
-	state          ProcessState
-	regs           *Registers
+	pid             int
+	terminateOnEnd  bool
+	isAttached      bool
+	state           ProcessState
+	regs            *Registers
+	breakpointSites breakpointSiteCollection
 }
 
 // Launch starts a new process under ptrace and returns a Process that
@@ -208,8 +209,137 @@ func (p *Process) GetPC() (uint64, error) {
 	return p.regs.Read(info).(uint64), nil
 }
 
-// Resume continues a stopped process.
+// SetPC writes the program counter (instruction pointer).
+func (p *Process) SetPC(addr uint64) error {
+	info, ok := RegisterInfoByName("rip")
+	if !ok {
+		return newError("rip register not found")
+	}
+	return p.regs.Write(info, addr)
+}
+
+// CreateBreakpointSite creates a new (disabled) breakpoint site at the given
+// address. The caller must call Enable() on the returned site to activate it.
+// Returns an error if a breakpoint already exists at the address.
+func (p *Process) CreateBreakpointSite(addr uint64) (*BreakpointSite, error) {
+	if p.breakpointSites.containsAddress(addr) {
+		return nil, newErrorf("breakpoint already exists at 0x%x", addr)
+	}
+	site := &BreakpointSite{
+		id:      nextBreakpointID(),
+		pid:     p.pid,
+		address: addr,
+	}
+	p.breakpointSites.push(site)
+	return site, nil
+}
+
+// BreakpointSites returns a snapshot of all breakpoint sites.
+func (p *Process) BreakpointSites() []*BreakpointSite {
+	result := make([]*BreakpointSite, p.breakpointSites.size())
+	copy(result, p.breakpointSites.sites)
+	return result
+}
+
+// BreakpointSiteByID returns the breakpoint site with the given ID.
+func (p *Process) BreakpointSiteByID(id int32) (*BreakpointSite, bool) {
+	return p.breakpointSites.getByID(id)
+}
+
+// RemoveBreakpointSite removes a breakpoint site by ID, disabling it first
+// if it is enabled.
+func (p *Process) RemoveBreakpointSite(id int32) error {
+	site, ok := p.breakpointSites.getByID(id)
+	if !ok {
+		return newErrorf("breakpoint %d not found", id)
+	}
+	if site.isEnabled {
+		if err := site.Disable(); err != nil {
+			return err
+		}
+	}
+	p.breakpointSites.removeByID(id)
+	return nil
+}
+
+// stepOverBreakpoint handles the case where the process is stopped at an
+// enabled breakpoint: disable it, single-step one instruction, re-enable it.
+func (p *Process) stepOverBreakpoint() error {
+	pc, err := p.GetPC()
+	if err != nil {
+		return err
+	}
+	site := p.breakpointSites.enabledAtAddress(pc)
+	if site == nil {
+		return nil
+	}
+	if err := site.Disable(); err != nil {
+		return err
+	}
+	if err := ptraceSingleStep(p.pid); err != nil {
+		// Re-enable on failure so state stays consistent.
+		site.Enable()
+		return newErrorf("single step failed: %v", err)
+	}
+	// Wait for the single-step stop.
+	var ws syscall.WaitStatus
+	if _, err := syscall.Wait4(p.pid, &ws, 0, nil); err != nil {
+		site.Enable()
+		return newErrorf("wait after single step failed: %v", err)
+	}
+	if err := site.Enable(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// StepInstruction executes a single machine instruction. If the process
+// is stopped at an enabled breakpoint, the breakpoint is temporarily
+// disabled for the step and then re-enabled.
+func (p *Process) StepInstruction() (StopReason, error) {
+	pc, err := p.GetPC()
+	if err != nil {
+		return StopReason{}, err
+	}
+
+	bpAtPC := p.breakpointSites.enabledAtAddress(pc)
+	if bpAtPC != nil {
+		if err := bpAtPC.Disable(); err != nil {
+			return StopReason{}, err
+		}
+	}
+
+	if err := ptraceSingleStep(p.pid); err != nil {
+		if bpAtPC != nil {
+			bpAtPC.Enable()
+		}
+		return StopReason{}, newErrorf("single step failed: %v", err)
+	}
+	p.state = ProcessRunning
+
+	reason, err := p.WaitOnSignal()
+	if err != nil {
+		if bpAtPC != nil {
+			bpAtPC.Enable()
+		}
+		return reason, err
+	}
+
+	if bpAtPC != nil {
+		if err := bpAtPC.Enable(); err != nil {
+			return reason, err
+		}
+	}
+
+	return reason, nil
+}
+
+// Resume continues a stopped process. If stopped at an enabled breakpoint,
+// it first steps over the breakpoint before continuing.
 func (p *Process) Resume() error {
+	if err := p.stepOverBreakpoint(); err != nil {
+		return err
+	}
 	if err := ptraceCont(p.pid); err != nil {
 		return newErrorf("could not resume: %v", err)
 	}
@@ -220,6 +350,11 @@ func (p *Process) Resume() error {
 // WaitOnSignal blocks until the process stops or terminates and returns
 // the reason for stopping. When the process is stopped and we are
 // attached, the register cache is refreshed automatically.
+//
+// If the stop is a SIGTRAP and an enabled breakpoint exists at PC-1,
+// the program counter is adjusted back to the breakpoint address. This
+// is necessary because x86-64 increments RIP past the 0xCC byte before
+// delivering the trap.
 func (p *Process) WaitOnSignal() (StopReason, error) {
 	var ws syscall.WaitStatus
 	if _, err := syscall.Wait4(p.pid, &ws, 0, nil); err != nil {
@@ -232,6 +367,19 @@ func (p *Process) WaitOnSignal() (StopReason, error) {
 	if p.isAttached && p.state == ProcessStopped && p.regs != nil {
 		if err := p.regs.readAll(); err != nil {
 			return reason, err
+		}
+
+		// If we stopped due to SIGTRAP and there is an enabled breakpoint
+		// at PC-1, adjust the PC back to the breakpoint address.
+		if reason.Info == uint8(syscall.SIGTRAP) {
+			pc, err := p.GetPC()
+			if err == nil {
+				if site := p.breakpointSites.enabledAtAddress(pc - 1); site != nil {
+					if err := p.SetPC(pc - 1); err != nil {
+						return reason, err
+					}
+				}
+			}
 		}
 	}
 

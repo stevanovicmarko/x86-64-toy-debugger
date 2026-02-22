@@ -18,10 +18,13 @@ codebase, extending it, or building your own debugger from scratch.
 7. [The Register Table](#7-the-register-table)
 8. [Reading and Writing Registers](#8-reading-and-writing-registers)
 9. [The `struct user` Memory Layout](#9-the-struct-user-memory-layout)
-10. [Platform Abstraction](#10-platform-abstraction)
-11. [Error Handling](#11-error-handling)
-12. [Testing Strategy](#12-testing-strategy)
-13. [File Reference](#13-file-reference)
+10. [Software Breakpoints](#10-software-breakpoints)
+11. [Memory Access (PEEKDATA / POKEDATA)](#11-memory-access-peekdata--pokedata)
+12. [Single Stepping](#12-single-stepping)
+13. [Platform Abstraction](#13-platform-abstraction)
+14. [Error Handling](#14-error-handling)
+15. [Testing Strategy](#15-testing-strategy)
+16. [File Reference](#16-file-reference)
 
 ---
 
@@ -75,6 +78,9 @@ tracee:
 | `PTRACE_GETFPREGS` | Tracer reads the tracee's floating-point registers |
 | `PTRACE_PEEKUSER` | Tracer reads one 8-byte word from the tracee's `struct user` |
 | `PTRACE_POKEUSER` | Tracer writes one 8-byte word into the tracee's `struct user` |
+| `PTRACE_PEEKDATA` | Tracer reads one 8-byte word from the tracee's address space |
+| `PTRACE_POKEDATA` | Tracer writes one 8-byte word into the tracee's address space |
+| `PTRACE_SINGLESTEP` | Tracer resumes the tracee for one instruction, then stops it |
 | `PTRACE_DETACH` | Tracer disconnects; tracee resumes normal execution |
 
 ### The per-thread rule
@@ -265,22 +271,24 @@ shell over the `debugger` API, not an independent system.
 ### Flow
 
 ```
-┌──────────────────────────────────────────────────┐
-│  1. Parse flags: -p <pid> or /path/to/prog       │
-│  2. Call debugger.Launch() or Attach()           │
-│  3. Initialize readline with (toydbg) prompt     │
-│  4. Loop:                                        │
-│     ├─ Read line, split into fields              │
-│     ├─ Match command:                            │
-│     │   "continue"  → Resume + Wait + print PC   │
-│     │   "register"  → read/write subcommands     │
-│     │   "help"      → print commands             │
-│     │   "quit"      → break                      │
-│     │   other       → print error                │
-│     └─ If process exited → break                 │
-│  5. defer proc.Close()                           │
-│  6. defer rl.Close()                             │
-└──────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│  1. Parse flags: -p <pid> or /path/to/prog           │
+│  2. Call debugger.Launch() or Attach()               │
+│  3. Initialize readline with (toydbg) prompt         │
+│  4. Loop:                                            │
+│     ├─ Read line, split into fields                  │
+│     ├─ Match command:                                │
+│     │   "continue"    → Resume + Wait + print PC     │
+│     │   "step"        → StepInstruction + print PC   │
+│     │   "breakpoint"  → set/list/enable/disable/del  │
+│     │   "register"    → read/write subcommands       │
+│     │   "help"        → print commands               │
+│     │   "quit"        → break                        │
+│     │   other         → print error                  │
+│     └─ If process exited → break                     │
+│  5. defer proc.Close()                               │
+│  6. defer rl.Close()                                 │
+└──────────────────────────────────────────────────────┘
 ```
 
 ### Commands
@@ -288,12 +296,19 @@ shell over the `debugger` API, not an independent system.
 | Command | Aliases | Action |
 |---------|---------|--------|
 | `continue` | `c` | Resume the tracee, block until it stops again, print the stop reason with PC |
+| `step` | `s` | Execute one machine instruction, print the stop reason with PC |
+| `breakpoint set <addr>` | `break set <addr>` | Set and enable a breakpoint at the given hex address |
+| `breakpoint list` | `break list` | List all breakpoints with ID, address, and status |
+| `breakpoint enable <id>` | `break enable <id>` | Enable a breakpoint by ID |
+| `breakpoint disable <id>` | `break disable <id>` | Disable a breakpoint by ID |
+| `breakpoint delete <id>` | `break delete <id>` | Delete a breakpoint by ID |
 | `register read` | `reg read` | Print all GPR values |
 | `register read all` | `reg read all` | Print all 125 register values |
 | `register read <name>` | `reg read <name>` | Print a single register |
 | `register write <name> <value>` | `reg write <name> <value>` | Write a value to a register |
 | `help` | `h`, empty line | Print the list of available commands |
 | `help register` | `help reg` | Print register subcommand help |
+| `help breakpoint` | `help break` | Print breakpoint subcommand help |
 | `quit` | `q`, `exit` | Exit the debugger |
 
 ### Input handling
@@ -581,7 +596,179 @@ different `Size` and `Format` values.
 
 ---
 
-## 10. Platform Abstraction
+## 10. Software Breakpoints
+
+**Source:** `debugger/breakpoint_site.go`, `debugger/process.go`
+
+Software breakpoints are the fundamental mechanism that lets a debugger stop
+a program at a specific instruction. Understanding how they work reveals an
+elegant interplay between CPU hardware, the kernel, and the debugger.
+
+### The int3 mechanism
+
+On x86-64, the opcode `0xCC` is a single-byte instruction called `int3`.
+When the CPU encounters it, the CPU:
+
+1. Raises a **trap exception** (interrupt 3).
+2. Increments RIP **past** the 0xCC byte (so RIP now points to the *next*
+   instruction).
+3. The kernel translates this trap into a **SIGTRAP** signal delivered to
+   the tracee.
+
+The debugger sets a breakpoint by **replacing** the first byte of the
+target instruction with `0xCC`. When the CPU reaches that address, it
+executes `int3` instead of the original instruction, causing the program
+to stop.
+
+### Setting a breakpoint
+
+```
+Before breakpoint:        After breakpoint:
+┌────────────────┐        ┌────────────────┐
+│ 48 c7 c0 01 …  │ ← original   │ CC c7 c0 01 …  │ ← 0xCC replaces first byte
+└────────────────┘        └────────────────┘
+  addr 0x401000             addr 0x401000
+```
+
+The `BreakpointSite.Enable()` method:
+1. Reads the 8-byte word at the target address via `PTRACE_PEEKDATA`.
+2. Saves the low byte (the original instruction byte) in `savedData`.
+3. Replaces the low byte with `0xCC`.
+4. Writes the modified word back via `PTRACE_POKEDATA`.
+
+### Hitting a breakpoint
+
+When the tracee hits the `0xCC`:
+1. CPU executes `int3`, raises trap, sets RIP = address + 1.
+2. Kernel delivers SIGTRAP to the tracer via `wait4()`.
+3. `WaitOnSignal()` reads registers and sees SIGTRAP.
+4. It checks: is there an enabled breakpoint at **PC - 1**?
+5. If yes, it adjusts PC back to the breakpoint address.
+
+The PC adjustment is critical — without it, the debugger would think the
+program is at the instruction *after* the breakpoint, and resuming would
+skip the original instruction entirely.
+
+### Resuming from a breakpoint (the step-over dance)
+
+When the user types `continue` while stopped at a breakpoint, `Resume()`
+cannot simply call `PTRACE_CONT` — the `0xCC` byte is still in memory,
+and the CPU would immediately hit it again. Instead, it performs a
+**step-over dance**:
+
+```
+1. Disable breakpoint  → restore original byte
+2. PTRACE_SINGLESTEP   → execute the original instruction
+3. wait4()             → wait for single-step stop
+4. Re-enable breakpoint → put 0xCC back
+5. PTRACE_CONT         → continue normal execution
+```
+
+### The BreakpointSite type
+
+```go
+type BreakpointSite struct {
+    id        int32   // unique ID (monotonically increasing)
+    pid       int     // tracee PID (for ptrace calls)
+    address   uint64  // where the breakpoint is set
+    isEnabled bool    // whether 0xCC is currently in memory
+    savedData byte    // the original byte that was replaced
+}
+```
+
+IDs are assigned via `sync/atomic.AddInt32`, ensuring uniqueness even if
+breakpoints were created from multiple goroutines (though the current
+debugger is single-threaded).
+
+### The breakpointSiteCollection
+
+Breakpoint sites are stored in a `breakpointSiteCollection` — a simple
+slice-backed collection with lookup methods. This keeps things concrete
+(no generics) while providing the operations needed:
+
+- `containsAddress` — reject duplicate breakpoints at the same address
+- `enabledAtAddress` — find the breakpoint to adjust PC after SIGTRAP
+- `getByID` / `getByAddress` — REPL lookup commands
+- `forEach` — iterate for listing
+
+### Design decisions
+
+- **Separate create from enable:** `CreateBreakpointSite` returns a
+  *disabled* site. The caller must explicitly call `Enable()`.
+  This allows setting up breakpoints without immediately modifying process memory.
+- **Duplicate rejection:** Only one breakpoint can exist at a given
+  address. Allowing duplicates would corrupt the `savedData` (the second
+  breakpoint would save `0xCC` instead of the original byte).
+
+---
+
+## 11. Memory Access (PEEKDATA / POKEDATA)
+
+**Source:** `debugger/ptrace_linux.go`
+
+`PTRACE_PEEKDATA` and `PTRACE_POKEDATA` read and write the tracee's
+**address space** (program memory). This is distinct from `PEEKUSER` /
+`POKEUSER`, which access the kernel's `struct user` (register state).
+
+```
+                    ┌─────────────────────┐
+PEEKUSER/POKEUSER → │   struct user        │ ← register state
+                    │   (kernel memory)    │
+                    └─────────────────────┘
+
+                    ┌─────────────────────┐
+PEEKDATA/POKEDATA → │   process memory     │ ← code + data
+                    │   (address space)    │
+                    └─────────────────────┘
+```
+
+Both operate on 8-byte (64-bit) words. To modify a single byte (as
+breakpoints need to do), the debugger:
+1. Reads the full 8-byte word containing the target byte.
+2. Modifies just the target byte using bit masking.
+3. Writes the full word back.
+
+On little-endian x86-64, the byte at address `A` is the **low byte**
+(bits 0–7) of the word read from address `A`. This is why `Enable()`
+masks with `& ^uint64(0xFF)` and ORs in `0xCC`.
+
+---
+
+## 12. Single Stepping
+
+**Source:** `debugger/process.go`
+
+`PTRACE_SINGLESTEP` resumes the tracee for exactly **one machine
+instruction**, then stops it again with SIGTRAP. This is implemented in
+hardware via the CPU's **trap flag** (TF, bit 8 of EFLAGS) — the kernel
+sets TF before resuming, and the CPU clears it after executing one
+instruction.
+
+### StepInstruction
+
+`Process.StepInstruction()` wraps single-stepping with breakpoint
+awareness:
+
+1. If stopped at an enabled breakpoint, **disable** it temporarily.
+2. Call `PTRACE_SINGLESTEP` to execute one instruction.
+3. Call `WaitOnSignal()` to wait for the single-step stop.
+4. If a breakpoint was disabled in step 1, **re-enable** it.
+
+This ensures that stepping over a breakpoint executes the original
+instruction (not `int3`) and leaves the breakpoint intact for future
+hits.
+
+### Interaction with Resume
+
+`Resume()` also uses single-stepping internally when stopped at a
+breakpoint — the `stepOverBreakpoint()` helper performs the same
+disable-step-reenable dance before calling `PTRACE_CONT`. The difference
+is that `StepInstruction` returns to the REPL after one instruction, while
+`Resume` continues until the next stop event.
+
+---
+
+## 13. Platform Abstraction
 
 **Source:** `debugger/ptrace_unsupported.go`, `debugger/registers_unsupported.go`
 
@@ -606,7 +793,7 @@ or a container with `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined`.
 
 ---
 
-## 11. Error Handling
+## 14. Error Handling
 
 **Source:** `debugger/error.go`
 
@@ -635,7 +822,7 @@ All internal error creation goes through `newError(msg)` and
 
 ---
 
-## 12. Testing Strategy
+## 15. Testing Strategy
 
 **Source:** `test/debugger_test.go`, `test/targets/`
 
@@ -654,8 +841,8 @@ Two minimal Go programs serve as tracees for basic lifecycle tests:
 | `end_immediately` | `test/targets/end_immediately/main.go` | Exits immediately (tests process exit handling) |
 | `run_endlessly` | `test/targets/run_endlessly/main.go` | Infinite loop (tests attach, resume, and signal delivery) |
 
-`TestMain()` compiles both Go targets with `go build` and both assembly
-targets with `gcc` into a temporary directory before any tests run.
+`TestMain()` compiles both Go targets with `go build` and all three
+assembly targets with `gcc` into a temporary directory before any tests run.
 
 ### Test categories
 
@@ -668,6 +855,8 @@ targets with `gcc` into a temporary directory before any tests run.
 | **Register I/O** | `rip` and `rsp` are non-zero after launch; sub-registers consistent with parent; write-then-read round-trips |
 | **Assembly register read** | Inferior sets known values in GPR, sub-GPR, MM, XMM, and ST registers; debugger reads them back |
 | **Assembly register write** | Debugger writes registers; inferior prints them via printf; test verifies output via pipe |
+| **Breakpoint collection** | Create, ID monotonicity, duplicate rejection, list, remove, enable/disable |
+| **Breakpoint end-to-end** | Set BP ahead of PC and verify stop; step instruction; step over breakpoint; continue from breakpoint to exit |
 
 ### Assembly test targets
 
@@ -681,19 +870,25 @@ register allocation), so these tests use hand-written x86-64 assembly.
 |--------|------|------|-------------|-------|
 | `reg_read` | `test/targets/reg_read.s` | No | `-nostdlib -no-pie` | `_start` |
 | `reg_write` | `test/targets/reg_write.s` | Yes | `-no-pie` | `main` |
+| `hello_toydbg` | `test/targets/hello_toydbg.s` | No | `-nostdlib -no-pie` | `_start` |
 
-Both targets use the **trap-resume-read pattern**: the assembly program
-executes `int3` (software breakpoint) at known points. Each `int3` delivers
-`SIGTRAP` to the tracer, creating a synchronization point where the test
-can read or write registers. Then the test resumes the inferior to the next
-trap.
+The register targets (`reg_read`, `reg_write`) use the **trap-resume-read
+pattern**: the assembly program executes `int3` (software breakpoint) at
+known points. Each `int3` delivers `SIGTRAP` to the tracer, creating a
+synchronization point where the test can read or write registers. Then
+the test resumes the inferior to the next trap.
 
 `reg_read` uses raw syscalls (`syscall` instruction) and no C library,
 since it only needs to set register values and trap. `reg_write` links
 with libc so it can call `printf` and `fflush` to print values to stdout,
 which the test captures via `os.Pipe()` passed through `LaunchOptions`.
 
-`TestMain` builds both assembly targets with `gcc` alongside the Go targets.
+`hello_toydbg` is a minimal write-and-exit program with no `int3`
+instructions — breakpoint tests set breakpoints programmatically via the
+`CreateBreakpointSite` API rather than embedding traps in the code.
+
+`TestMain` builds all three assembly targets with `gcc` alongside the Go
+targets.
 
 ### Process state verification
 
@@ -709,26 +904,28 @@ the *kernel* sees the process in the expected state.
 
 ---
 
-## 13. File Reference
+## 16. File Reference
 
 | File | Purpose |
 |------|---------|
-| `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, register, help, quit) |
+| `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, step, breakpoint, register, help, quit) |
 | `debugger/debugger.go` | Package documentation |
 | `debugger/error.go` | Custom error type and constructors |
 | `debugger/format.go` | `FormatRegisterValue` — display formatting for all register types |
 | `debugger/parse.go` | `ParseRegisterValue` — CLI string → typed value conversion |
-| `debugger/process.go` | Process lifecycle: Launch, LaunchWithOptions, Attach, Resume, WaitOnSignal, GetPC, Close |
+| `debugger/breakpoint_site.go` | BreakpointSite type (enable/disable via PEEKDATA/POKEDATA) and breakpointSiteCollection |
+| `debugger/process.go` | Process lifecycle: Launch, LaunchWithOptions, Attach, Resume, WaitOnSignal, GetPC, SetPC, breakpoint management, StepInstruction, Close |
 | `debugger/ptrace_linux.go` | Linux ptrace syscall wrappers |
 | `debugger/ptrace_unsupported.go` | Non-Linux stubs (return `ENOSYS`) |
 | `debugger/register_info.go` | Register metadata table (125 entries) and lookup functions |
 | `debugger/registers_linux.go` | Register cache: read/write via ptrace |
 | `debugger/registers_unsupported.go` | Non-Linux register stubs |
-| `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests) |
+| `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests, breakpoint tests) |
 | `test/targets/end_immediately/main.go` | Test target: exits immediately |
 | `test/targets/run_endlessly/main.go` | Test target: infinite loop |
 | `test/targets/reg_read.s` | Assembly test target: sets known register values and traps (no libc) |
 | `test/targets/reg_write.s` | Assembly test target: prints debugger-written register values via printf |
+| `test/targets/hello_toydbg.s` | Assembly test target: write + exit (no libc, non-PIE, used for breakpoint tests) |
 | `docs/sequence-diagram.mmd` | Mermaid sequence diagram of the attach-and-REPL lifecycle |
 | `Dockerfile` | Multi-stage build: compile + slim runtime image |
 

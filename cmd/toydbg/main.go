@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/chzyer/readline"
@@ -87,6 +88,19 @@ func main() {
 			if reason.Reason == debugger.ProcessExited || reason.Reason == debugger.ProcessTerminated {
 				return
 			}
+		case "breakpoint", "break":
+			handleBreakpoint(proc, fields[1:])
+		case "step", "s":
+			reason, err := proc.StepInstruction()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
+				continue
+			}
+			printStopReason(proc, reason)
+
+			if reason.Reason == debugger.ProcessExited || reason.Reason == debugger.ProcessTerminated {
+				return
+			}
 		case "register", "reg":
 			handleRegister(proc, fields[1:])
 		case "quit", "q", "exit":
@@ -113,9 +127,123 @@ func handleHelp(args []string) {
 			fmt.Println("  register read <name>       - read a single register")
 			fmt.Println("  register write <name> <value> - write a register")
 			return
+		case "breakpoint", "break":
+			fmt.Println("breakpoint subcommands:")
+			fmt.Println("  breakpoint set <hex-addr>  - set a breakpoint at address")
+			fmt.Println("  breakpoint list            - list all breakpoints")
+			fmt.Println("  breakpoint enable <id>     - enable a breakpoint")
+			fmt.Println("  breakpoint disable <id>    - disable a breakpoint")
+			fmt.Println("  breakpoint delete <id>     - delete a breakpoint")
+			return
 		}
 	}
-	fmt.Println("commands: continue (c), register (reg), quit (q), help (h)")
+	fmt.Println("commands: continue (c), step (s), breakpoint (break), register (reg), quit (q), help (h)")
+}
+
+func handleBreakpoint(proc *debugger.Process, args []string) {
+	if len(args) == 0 {
+		fmt.Println("usage: breakpoint <set|list|enable|disable|delete> [args...]")
+		fmt.Println("  type 'help breakpoint' for details")
+		return
+	}
+
+	switch args[0] {
+	case "set":
+		if len(args) < 2 {
+			fmt.Println("usage: breakpoint set <hex-addr>")
+			return
+		}
+		addr, err := strconv.ParseUint(strings.TrimPrefix(args[1], "0x"), 16, 64)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: invalid address %q: %v\n", args[1], err)
+			return
+		}
+		site, err := proc.CreateBreakpointSite(addr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
+			return
+		}
+		if err := site.Enable(); err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
+			return
+		}
+		fmt.Printf("breakpoint %d set at 0x%x\n", site.ID(), site.Address())
+
+	case "list":
+		sites := proc.BreakpointSites()
+		if len(sites) == 0 {
+			fmt.Println("no breakpoints")
+			return
+		}
+		for _, s := range sites {
+			status := "disabled"
+			if s.IsEnabled() {
+				status = "enabled"
+			}
+			fmt.Printf("  %d: 0x%x (%s)\n", s.ID(), s.Address(), status)
+		}
+
+	case "enable":
+		if len(args) < 2 {
+			fmt.Println("usage: breakpoint enable <id>")
+			return
+		}
+		id, err := strconv.ParseInt(args[1], 10, 32)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: invalid ID %q: %v\n", args[1], err)
+			return
+		}
+		site, ok := proc.BreakpointSiteByID(int32(id))
+		if !ok {
+			fmt.Fprintf(os.Stderr, "toydbg: breakpoint %d not found\n", id)
+			return
+		}
+		if err := site.Enable(); err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
+			return
+		}
+		fmt.Printf("breakpoint %d enabled\n", id)
+
+	case "disable":
+		if len(args) < 2 {
+			fmt.Println("usage: breakpoint disable <id>")
+			return
+		}
+		id, err := strconv.ParseInt(args[1], 10, 32)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: invalid ID %q: %v\n", args[1], err)
+			return
+		}
+		site, ok := proc.BreakpointSiteByID(int32(id))
+		if !ok {
+			fmt.Fprintf(os.Stderr, "toydbg: breakpoint %d not found\n", id)
+			return
+		}
+		if err := site.Disable(); err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
+			return
+		}
+		fmt.Printf("breakpoint %d disabled\n", id)
+
+	case "delete":
+		if len(args) < 2 {
+			fmt.Println("usage: breakpoint delete <id>")
+			return
+		}
+		id, err := strconv.ParseInt(args[1], 10, 32)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: invalid ID %q: %v\n", args[1], err)
+			return
+		}
+		if err := proc.RemoveBreakpointSite(int32(id)); err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
+			return
+		}
+		fmt.Printf("breakpoint %d deleted\n", id)
+
+	default:
+		fmt.Printf("unknown breakpoint subcommand: %q\n", args[0])
+	}
 }
 
 func handleRegister(proc *debugger.Process, args []string) {

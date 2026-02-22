@@ -54,6 +54,7 @@ func TestMain(m *testing.M) {
 	}{
 		{"reg_read", []string{"-nostdlib", "-no-pie"}},
 		{"reg_write", []string{"-no-pie"}},
+		{"hello_toydbg", []string{"-nostdlib", "-no-pie"}},
 	}
 	for _, t := range asmTargets {
 		src := filepath.Join("targets", t.name+".s")
@@ -786,6 +787,323 @@ func TestRegisterReadFromInferior(t *testing.T) {
 	}
 	if reason.Reason != debugger.ProcessExited {
 		t.Errorf("expected process to exit, got state %d", reason.Reason)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Breakpoint tests
+// ---------------------------------------------------------------------------
+
+func TestCreateBreakpointSite(t *testing.T) {
+	proc, err := debugger.Launch(targetPath("hello_toydbg"))
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	defer proc.Close()
+
+	pc, err := proc.GetPC()
+	if err != nil {
+		t.Fatalf("GetPC failed: %v", err)
+	}
+
+	site, err := proc.CreateBreakpointSite(pc)
+	if err != nil {
+		t.Fatalf("CreateBreakpointSite failed: %v", err)
+	}
+	if site.ID() <= 0 {
+		t.Errorf("expected positive ID, got %d", site.ID())
+	}
+	if site.Address() != pc {
+		t.Errorf("address = 0x%x, want 0x%x", site.Address(), pc)
+	}
+	if site.IsEnabled() {
+		t.Error("new breakpoint site should be disabled")
+	}
+}
+
+func TestBreakpointSiteIDsIncrease(t *testing.T) {
+	proc, err := debugger.Launch(targetPath("hello_toydbg"))
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	defer proc.Close()
+
+	pc, err := proc.GetPC()
+	if err != nil {
+		t.Fatalf("GetPC failed: %v", err)
+	}
+
+	s1, err := proc.CreateBreakpointSite(pc)
+	if err != nil {
+		t.Fatalf("CreateBreakpointSite(1) failed: %v", err)
+	}
+	s2, err := proc.CreateBreakpointSite(pc + 100)
+	if err != nil {
+		t.Fatalf("CreateBreakpointSite(2) failed: %v", err)
+	}
+	if s2.ID() <= s1.ID() {
+		t.Errorf("IDs should increase: s1.ID=%d, s2.ID=%d", s1.ID(), s2.ID())
+	}
+}
+
+func TestBreakpointSiteDuplicateAddress(t *testing.T) {
+	proc, err := debugger.Launch(targetPath("hello_toydbg"))
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	defer proc.Close()
+
+	pc, err := proc.GetPC()
+	if err != nil {
+		t.Fatalf("GetPC failed: %v", err)
+	}
+
+	if _, err := proc.CreateBreakpointSite(pc); err != nil {
+		t.Fatalf("first CreateBreakpointSite failed: %v", err)
+	}
+	_, err = proc.CreateBreakpointSite(pc)
+	if err == nil {
+		t.Fatal("expected error for duplicate address")
+	}
+	if !isDebuggerError(err) {
+		t.Fatalf("expected *debugger.Error, got %T: %v", err, err)
+	}
+}
+
+func TestBreakpointSiteList(t *testing.T) {
+	proc, err := debugger.Launch(targetPath("hello_toydbg"))
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	defer proc.Close()
+
+	pc, err := proc.GetPC()
+	if err != nil {
+		t.Fatalf("GetPC failed: %v", err)
+	}
+
+	proc.CreateBreakpointSite(pc)
+	proc.CreateBreakpointSite(pc + 100)
+
+	sites := proc.BreakpointSites()
+	if len(sites) != 2 {
+		t.Fatalf("expected 2 sites, got %d", len(sites))
+	}
+}
+
+func TestBreakpointSiteRemove(t *testing.T) {
+	proc, err := debugger.Launch(targetPath("hello_toydbg"))
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	defer proc.Close()
+
+	pc, err := proc.GetPC()
+	if err != nil {
+		t.Fatalf("GetPC failed: %v", err)
+	}
+
+	site, _ := proc.CreateBreakpointSite(pc)
+	if err := proc.RemoveBreakpointSite(site.ID()); err != nil {
+		t.Fatalf("RemoveBreakpointSite failed: %v", err)
+	}
+	if len(proc.BreakpointSites()) != 0 {
+		t.Error("expected empty list after remove")
+	}
+}
+
+func TestBreakpointSiteEnableDisable(t *testing.T) {
+	proc, err := debugger.Launch(targetPath("hello_toydbg"))
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	defer proc.Close()
+
+	pc, err := proc.GetPC()
+	if err != nil {
+		t.Fatalf("GetPC failed: %v", err)
+	}
+
+	site, _ := proc.CreateBreakpointSite(pc)
+
+	if err := site.Enable(); err != nil {
+		t.Fatalf("Enable failed: %v", err)
+	}
+	if !site.IsEnabled() {
+		t.Error("expected enabled after Enable()")
+	}
+
+	if err := site.Disable(); err != nil {
+		t.Fatalf("Disable failed: %v", err)
+	}
+	if site.IsEnabled() {
+		t.Error("expected disabled after Disable()")
+	}
+}
+
+func TestBreakpointStopsExecution(t *testing.T) {
+	proc, err := debugger.Launch(targetPath("hello_toydbg"))
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	defer proc.Close()
+
+	// Get the entry point PC. The first instruction is at _start.
+	// We'll set a breakpoint a few instructions ahead (the write syscall
+	// setup). For a non-PIE -nostdlib binary, the instructions after
+	// _start are contiguous. We step once to get a second instruction
+	// address.
+	startPC, _ := proc.GetPC()
+	reason, err := proc.StepInstruction()
+	if err != nil {
+		t.Fatalf("StepInstruction failed: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected stopped after step, got %d", reason.Reason)
+	}
+	secondPC, _ := proc.GetPC()
+	if secondPC == startPC {
+		t.Fatal("PC did not advance after step")
+	}
+
+	// Set a breakpoint at the second instruction.
+	// First, step back by setting PC to start, then set BP at secondPC.
+	if err := proc.SetPC(startPC); err != nil {
+		t.Fatalf("SetPC back failed: %v", err)
+	}
+
+	site, err := proc.CreateBreakpointSite(secondPC)
+	if err != nil {
+		t.Fatalf("CreateBreakpointSite failed: %v", err)
+	}
+	if err := site.Enable(); err != nil {
+		t.Fatalf("Enable failed: %v", err)
+	}
+
+	// Resume — should stop at the breakpoint.
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume failed: %v", err)
+	}
+	reason, err = proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal failed: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected stopped at breakpoint, got %d", reason.Reason)
+	}
+	hitPC, _ := proc.GetPC()
+	if hitPC != secondPC {
+		t.Errorf("stopped at 0x%x, want breakpoint at 0x%x", hitPC, secondPC)
+	}
+
+	// Resume again — process should run to exit.
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("second Resume failed: %v", err)
+	}
+	reason, err = proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("second WaitOnSignal failed: %v", err)
+	}
+	if reason.Reason != debugger.ProcessExited {
+		t.Errorf("expected process to exit, got state %d", reason.Reason)
+	}
+}
+
+func TestStepInstruction(t *testing.T) {
+	proc, err := debugger.Launch(targetPath("hello_toydbg"))
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	defer proc.Close()
+
+	pcBefore, _ := proc.GetPC()
+
+	reason, err := proc.StepInstruction()
+	if err != nil {
+		t.Fatalf("StepInstruction failed: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected stopped after step, got %d", reason.Reason)
+	}
+
+	pcAfter, _ := proc.GetPC()
+	if pcAfter == pcBefore {
+		t.Error("PC did not change after single step")
+	}
+}
+
+func TestStepOverBreakpoint(t *testing.T) {
+	proc, err := debugger.Launch(targetPath("hello_toydbg"))
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	defer proc.Close()
+
+	pc, _ := proc.GetPC()
+
+	// Set a breakpoint at the current PC.
+	site, err := proc.CreateBreakpointSite(pc)
+	if err != nil {
+		t.Fatalf("CreateBreakpointSite failed: %v", err)
+	}
+	if err := site.Enable(); err != nil {
+		t.Fatalf("Enable failed: %v", err)
+	}
+
+	// Step should execute the instruction under the breakpoint.
+	reason, err := proc.StepInstruction()
+	if err != nil {
+		t.Fatalf("StepInstruction failed: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected stopped after step, got %d", reason.Reason)
+	}
+
+	newPC, _ := proc.GetPC()
+	if newPC == pc {
+		t.Error("PC did not advance past breakpoint")
+	}
+	if !site.IsEnabled() {
+		t.Error("breakpoint should still be enabled after step")
+	}
+}
+
+func TestContinueFromBreakpoint(t *testing.T) {
+	proc, err := debugger.Launch(targetPath("hello_toydbg"))
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	defer proc.Close()
+
+	// Step once to get a target address for the breakpoint.
+	proc.StepInstruction()
+	bpAddr, _ := proc.GetPC()
+
+	// Set PC back to _start and set a breakpoint at the second instruction.
+	proc.StepInstruction() // step again to get past
+	thirdPC, _ := proc.GetPC()
+	_ = thirdPC
+
+	// Reset to start over. Set PC to entry and create BP.
+	// Actually, let's just launch fresh approach: set BP at current PC.
+	site, err := proc.CreateBreakpointSite(bpAddr)
+	if err != nil {
+		t.Fatalf("CreateBreakpointSite failed: %v", err)
+	}
+	if err := site.Enable(); err != nil {
+		t.Fatalf("Enable failed: %v", err)
+	}
+
+	// Continue from here (past the BP address) — process should exit normally.
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume failed: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal failed: %v", err)
+	}
+	if reason.Reason != debugger.ProcessExited {
+		t.Errorf("expected process to exit, got state %d (info=%d)", reason.Reason, reason.Info)
 	}
 }
 

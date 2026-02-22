@@ -83,3 +83,52 @@ sequenceDiagram
     U-->>D: types "register read all"
     Note over D: Iterate all 125 registers
     D->>U: print all register values
+
+    Note over D,T: ── Phase 4: Breakpoint set / hit / resume ──
+    U-->>D: types "breakpoint set 0x401000"
+    Note over D: CreateBreakpointSite(0x401000)
+    D->>K: PTRACE_PEEKDATA(pid, 0x401000)
+    K-->>D: returns original word (saved byte = low byte)
+    D->>K: PTRACE_POKEDATA(pid, 0x401000, word with 0xCC)
+    K-->>D: success
+    D->>U: print "breakpoint 1 set at 0x401000"
+
+    U-->>D: types "continue"
+    D->>K: PtraceCont(pid, 0)
+    Note over T: Tracee RESUMES execution
+    Note over T: Tracee hits 0xCC at 0x401000 → SIGTRAP
+    Note over T: Tracee STOPS, RIP = 0x401001 (past the 0xCC)
+    D->>K: wait4(pid)
+    K-->>D: returns WaitStatus (stopped by SIGTRAP)
+    D->>K: PtraceGetRegs / GETFPREGS / PeekUser
+    K-->>D: register values (RIP = 0x401001)
+    Note over D: SIGTRAP + enabled BP at PC-1 → adjust PC
+    D->>K: PTRACE_POKEUSER(pid, RIP offset, 0x401000)
+    K-->>D: success
+    D->>U: print "process stopped by signal 5 at 0x401000"
+
+    U-->>D: types "continue" (resume from breakpoint)
+    Note over D: PC at enabled BP → step-over dance
+    D->>K: PTRACE_PEEKDATA(pid, 0x401000) — disable BP
+    K-->>D: original word
+    D->>K: PTRACE_POKEDATA(pid, 0x401000, restored byte)
+    K-->>D: success
+    D->>K: PTRACE_SINGLESTEP(pid) — execute original instruction
+    Note over T: Tracee executes one instruction, STOPS
+    D->>K: wait4(pid)
+    K-->>D: returns WaitStatus (stopped by SIGTRAP)
+    D->>K: PTRACE_PEEKDATA + POKEDATA — re-enable BP (0xCC)
+    K-->>D: success
+    D->>K: PtraceCont(pid, 0) — continue normally
+    Note over T: Tracee RESUMES execution
+
+    Note over D,T: ── Phase 5: Step command ──
+    U-->>D: types "step"
+    D->>K: PTRACE_SINGLESTEP(pid)
+    Note over T: Tracee executes one instruction
+    Note over T: Tracee STOPS (SIGTRAP from single step)
+    D->>K: wait4(pid)
+    K-->>D: returns WaitStatus
+    D->>K: PtraceGetRegs / GETFPREGS / PeekUser
+    K-->>D: register values
+    D->>U: print "process stopped by signal 5 at 0x401007"

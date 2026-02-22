@@ -47,7 +47,7 @@ This is a Go port of a C++ x86-64 debugger from the book *Building a Debugger* b
 
 **Package layout:**
 
-- `debugger/` — public library. Exports process primitives: `Launch`, `LaunchWithOptions`, `Attach`, `Resume`, `WaitOnSignal`, `GetPC`.
+- `debugger/` — public library. Exports process primitives: `Launch`, `LaunchWithOptions`, `Attach`, `Resume`, `WaitOnSignal`, `GetPC`, `SetPC`, `CreateBreakpointSite`, `StepInstruction`.
 - `internal/` — private implementation details. Go compiler enforces this boundary.
 - `cmd/toydbg/` — CLI binary with interactive REPL (`(toydbg) ` prompt). Handles argument parsing and command dispatch.
 - `test/` — black-box integration tests that consume `debugger/` as an external package.
@@ -106,7 +106,7 @@ echo "c" | podman run --rm -i --cap-add=SYS_PTRACE --security-opt seccomp=unconf
 # Step 4: Container smoke-test — REPL help
 echo "help" | podman run --rm -i --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
   toydbg /bin/true
-# Expected: "commands: continue (c), register (reg), quit (q), help (h)"
+# Expected: "commands: continue (c), step (s), breakpoint (break), register (reg), quit (q), help (h)"
 ```
 
 > **Why is the container build mandatory?** The Dockerfile runs `go test ./...` inside the image, which compiles the assembly test targets with `gcc` and executes all tests including the ptrace-based register tests. A passing container build proves the full toolchain works: Go compiler, `gcc` for assembly, and ptrace syscalls. Native-only testing does not guarantee the container environment works.

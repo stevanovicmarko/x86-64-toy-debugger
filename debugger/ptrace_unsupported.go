@@ -39,3 +39,15 @@ func ptracePeekUser(_ int, _ uintptr) (uint64, error) {
 func ptracePokeUser(_ int, _ uintptr, _ uint64) error {
 	return syscall.ENOSYS
 }
+
+func ptracePeekData(_ int, _ uint64) (uint64, error) {
+	return 0, syscall.ENOSYS
+}
+
+func ptracePokeData(_ int, _ uint64, _ uint64) error {
+	return syscall.ENOSYS
+}
+
+func ptraceSingleStep(_ int) error {
+	return syscall.ENOSYS
+}
