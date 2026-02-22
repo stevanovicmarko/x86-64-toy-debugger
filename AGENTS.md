@@ -4,7 +4,7 @@ This file provides guidance to AI coding assistants working with this repository
 
 ## Project Overview
 
-A toy x86-64 debugger written in Go, inspired by the C++ project in *Building a Debugger* by No Starch Press. The debugger is Linux-only, can launch or attach to processes via ptrace and has an interactive REPL with the `continue` command. It is not intended for production use. It can be used on other operating systems by running it inside a container (Docker or Podman).
+A toy x86-64 debugger written in Go, inspired by the C++ project in *Building a Debugger* by No Starch Press. The debugger is Linux-only, can launch or attach to processes via ptrace and has an interactive REPL with commands for continuing execution, reading/writing registers, and more. It is not intended for production use. It can be used on other operating systems by running it inside a container (Docker or Podman).
 
 ## Commands
 
@@ -108,44 +108,36 @@ Alternatively, use **Docker Desktop** or **Podman** with the same container comm
 
 ## Agentic Workflow Requirement
 
-After any code change, you **must** build and run the debugger inside a Linux environment and verify it produces valid output before considering the task complete. A passing `go test ./...` on the host is **not** sufficient — ptrace behavior can only be tested inside a real Linux kernel.
+After any code change, you **must** verify the debugger works in **both** the native environment and the container before considering the task complete. The container build is **mandatory** — it is the canonical environment that proves all tests pass (including assembly targets that require `gcc`).
 
-### Step 0 — Detect the available Linux environment
+### Step 0 — Detect the available container runtime
 
 Run the following checks (in order) and use the **first** match:
 
-| Priority | Check | Environment |
-|----------|-------|-------------|
-| 1 | `uname -s` returns `Linux` (native or WSL2) | **Native Linux / WSL2** — build and run directly, no container needed. |
-| 2 | `command -v podman` succeeds | **Podman** |
-| 3 | `command -v docker` succeeds | **Docker** |
+| Priority | Check | Runtime |
+|----------|-------|---------|
+| 1 | `command -v podman` succeeds | **Podman** |
+| 2 | `command -v docker` succeeds | **Docker** |
 
-If none match, stop and inform the user that a Linux environment is required.
+If neither is available, stop and inform the user that a container runtime is required.
 
-### Step 1 — Build
-
-**Native Linux / WSL2:**
+### Step 1 — Native build and test (if on Linux / WSL2)
 
 ```bash
 go build ./cmd/toydbg && go test ./...
 ```
 
-**Podman / Docker** (substitute `docker` for `podman` if that is what was detected):
+### Step 2 — Container build (MANDATORY)
+
+The Dockerfile runs `go test ./...` inside the image, which compiles assembly test targets with `gcc` and executes all tests including ptrace-based register tests. A passing container build proves the full toolchain works.
+
+Substitute `docker` for `podman` if that is the available runtime.
 
 ```bash
 podman build -t toydbg .
 ```
 
-### Step 2 — Smoke-test: continue to exit
-
-**Native Linux / WSL2:**
-
-```bash
-echo "c" | ./toydbg /bin/true
-# Expected output: "process exited with code 0"
-```
-
-**Podman / Docker:**
+### Step 3 — Container smoke-test: continue to exit
 
 ```bash
 echo "c" | podman run --rm -i --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
@@ -153,30 +145,30 @@ echo "c" | podman run --rm -i --cap-add=SYS_PTRACE --security-opt seccomp=unconf
 # Expected output: "process exited with code 0"
 ```
 
-### Step 3 — Smoke-test: REPL help
-
-**Native Linux / WSL2:**
-
-```bash
-echo "help" | ./toydbg /bin/true
-# Expected output: "commands: continue (c), quit (q), help (h)"
-```
-
-**Podman / Docker:**
+### Step 4 — Container smoke-test: REPL help
 
 ```bash
 echo "help" | podman run --rm -i --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
   toydbg /bin/true
-# Expected output: "commands: continue (c), quit (q), help (h)"
+# Expected output: "commands: continue (c), register (reg), quit (q), help (h)"
 ```
 
-Do **not** skip these steps or assume the task is complete without them.
+> **Why is the container build mandatory?** Native-only testing does not guarantee the container environment works. The container is where `gcc` compiles assembly test targets, and where the Dockerfile's `RUN go test ./...` gate catches regressions in the full toolchain.
+
+Do **not** skip the container build or assume the task is complete without it.
 
 ## Key Files
 
-- `cmd/toydbg/main.go` — CLI entry point: argument parsing, attach logic, REPL, command dispatch.
-- `debugger/process.go` — process primitives: Launch, AttachPID, Resume, WaitOnSignal.
-- `debugger/debugger.go` — public library root.
-- `test/debugger_test.go` — integration tests.
+- `cmd/toydbg/main.go` — CLI entry point: argument parsing, REPL loop, command dispatch (continue, register read/write, help, quit).
+- `debugger/process.go` — process lifecycle: Launch, LaunchWithOptions, Attach, Resume, WaitOnSignal, GetPC, Close.
+- `debugger/format.go` — `FormatRegisterValue` — display formatting for all register types.
+- `debugger/parse.go` — `ParseRegisterValue` — CLI string → typed value conversion.
+- `debugger/register_info.go` — register metadata table (125 entries) and lookup functions.
+- `debugger/registers_linux.go` — register cache: read/write via ptrace.
+- `debugger/debugger.go` — public library root (package documentation).
+- `debugger/error.go` — custom error type and constructors.
+- `test/debugger_test.go` — integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests).
+- `test/targets/reg_read.s` — assembly test target: sets known register values and traps (no libc, built with gcc).
+- `test/targets/reg_write.s` — assembly test target: prints debugger-written register values via printf (built with gcc).
 - `docs/sequence-diagram.mmd` — Mermaid sequence diagram showing the debugger's attach-and-REPL lifecycle.
 - `docs/architecture.md` — Educational architecture guide (onion pattern: high-level concepts → implementation details). Must be updated alongside code changes.

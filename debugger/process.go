@@ -1,11 +1,18 @@
 package debugger
 
 import (
+	"io"
 	"os"
 	"os/exec"
 	"runtime"
 	"syscall"
 )
+
+// LaunchOptions configures optional behavior for LaunchWithOptions.
+type LaunchOptions struct {
+	Stdout io.Writer // If non-nil, the child's stdout is sent here instead of os.Stdout.
+	Stderr io.Writer // If non-nil, the child's stderr is sent here instead of os.Stderr.
+}
 
 // ProcessState represents the running state of a traced process.
 type ProcessState int
@@ -58,7 +65,14 @@ type Process struct {
 // required because Linux ptrace is per-thread: only the thread that
 // forked the tracee may issue subsequent ptrace requests for it.
 func Launch(program string, args ...string) (*Process, error) {
-	return launch(program, true, args)
+	return launchWithOpts(program, true, LaunchOptions{}, args)
+}
+
+// LaunchWithOptions starts a new process under ptrace with the given
+// options. It behaves like Launch but allows redirecting the child's
+// stdout/stderr — useful in tests that need to capture inferior output.
+func LaunchWithOptions(program string, opts LaunchOptions, args ...string) (*Process, error) {
+	return launchWithOpts(program, true, opts, args)
 }
 
 // LaunchNoDebug starts a new process without ptrace tracing and returns
@@ -66,17 +80,25 @@ func Launch(program string, args ...string) (*Process, error) {
 // begin tracing it later. This is primarily useful in tests that need
 // a running target to attach to separately.
 func LaunchNoDebug(program string, args ...string) (*Process, error) {
-	return launch(program, false, args)
+	return launchWithOpts(program, false, LaunchOptions{}, args)
 }
 
-func launch(program string, debug bool, args []string) (*Process, error) {
+func launchWithOpts(program string, debug bool, opts LaunchOptions, args []string) (*Process, error) {
 	if debug {
 		runtime.LockOSThread()
 	}
 
 	cmd := exec.Command(program, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	if opts.Stdout != nil {
+		cmd.Stdout = opts.Stdout
+	} else {
+		cmd.Stdout = os.Stdout
+	}
+	if opts.Stderr != nil {
+		cmd.Stderr = opts.Stderr
+	} else {
+		cmd.Stderr = os.Stderr
+	}
 	if debug {
 		cmd.SysProcAttr = &syscall.SysProcAttr{
 			Ptrace: true,
@@ -175,6 +197,15 @@ func (p *Process) State() ProcessState {
 // automatically by WaitOnSignal each time the process stops.
 func (p *Process) Registers() *Registers {
 	return p.regs
+}
+
+// GetPC returns the current program counter (instruction pointer).
+func (p *Process) GetPC() (uint64, error) {
+	info, ok := RegisterInfoByName("rip")
+	if !ok {
+		return 0, newError("rip register not found")
+	}
+	return p.regs.Read(info).(uint64), nil
 }
 
 // Resume continues a stopped process.

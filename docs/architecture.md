@@ -141,6 +141,23 @@ executing any instructions from the new program image.
 This exists for tests that need a running target to later `Attach` to — it
 avoids the circular problem of needing a PID before you can call `Attach`.
 
+### `LaunchWithOptions`
+
+`LaunchWithOptions` behaves like `Launch` but accepts a `LaunchOptions`
+struct that can redirect the child's stdout and stderr:
+
+```go
+type LaunchOptions struct {
+    Stdout io.Writer  // redirect child's stdout (nil = os.Stdout)
+    Stderr io.Writer  // redirect child's stderr (nil = os.Stderr)
+}
+```
+
+This is primarily used in tests that capture the inferior's output via an
+`os.Pipe()` — for example, the assembly write test launches the inferior
+with `Stdout: pipeWriter` so it can verify that the debugger's register
+writes are visible from the inferior's perspective.
+
 ---
 
 ## 4. Attaching to a Process
@@ -248,30 +265,35 @@ shell over the `debugger` API, not an independent system.
 ### Flow
 
 ```
-┌────────────────────────────────────────────┐
-│  1. Parse flags: -p <pid> or /path/to/prog │
-│  2. Call debugger.Launch() or Attach()     │
-│  3. Initialize readline with (toydbg)      │
-│     prompt                                 │
-│  4. Loop:                                  │
-│     ├─ Read line                           │
-│     ├─ Match command:                      │
-│     │   "continue" → Resume + Wait         │
-│     │   "help"     → print commands        │
-│     │   "quit"     → break                 │
-│     │   other      → print error           │
-│     └─ If process exited → break           │
-│  5. defer proc.Close()                     │
-│  6. defer rl.Close()                       │
-└────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│  1. Parse flags: -p <pid> or /path/to/prog       │
+│  2. Call debugger.Launch() or Attach()           │
+│  3. Initialize readline with (toydbg) prompt     │
+│  4. Loop:                                        │
+│     ├─ Read line, split into fields              │
+│     ├─ Match command:                            │
+│     │   "continue"  → Resume + Wait + print PC   │
+│     │   "register"  → read/write subcommands     │
+│     │   "help"      → print commands             │
+│     │   "quit"      → break                      │
+│     │   other       → print error                │
+│     └─ If process exited → break                 │
+│  5. defer proc.Close()                           │
+│  6. defer rl.Close()                             │
+└──────────────────────────────────────────────────┘
 ```
 
 ### Commands
 
 | Command | Aliases | Action |
 |---------|---------|--------|
-| `continue` | `c` | Resume the tracee, block until it stops again, print the stop reason |
+| `continue` | `c` | Resume the tracee, block until it stops again, print the stop reason with PC |
+| `register read` | `reg read` | Print all GPR values |
+| `register read all` | `reg read all` | Print all 125 register values |
+| `register read <name>` | `reg read <name>` | Print a single register |
+| `register write <name> <value>` | `reg write <name> <value>` | Write a value to a register |
 | `help` | `h`, empty line | Print the list of available commands |
+| `help register` | `help reg` | Print register subcommand help |
 | `quit` | `q`, `exit` | Exit the debugger |
 
 ### Input handling
@@ -440,6 +462,27 @@ The register cache is refreshed automatically by `WaitOnSignal()` every time
 the tracee stops. This means the cache is always consistent with the
 tracee's actual state when the user is at the REPL prompt.
 
+### `GetPC()`
+
+`Process.GetPC()` is a convenience method that reads the instruction pointer
+(`rip`). It looks up the register by name and returns the `uint64` value.
+This is used by the REPL to display the PC in stop-reason messages.
+
+### Format and Parse utilities
+
+Two platform-independent files provide string conversion for register values:
+
+- **`debugger/format.go`** — `FormatRegisterValue(info, val)` converts a
+  typed value to a display string. Unsigned integers become `0x%0Nx` (width
+  based on register size), floats use `%g`, and vectors use
+  `[0x01,0x02,...]` bracket notation.
+
+- **`debugger/parse.go`** — `ParseRegisterValue(info, s)` converts a user
+  string back to the typed value that `Write()` expects. It dispatches on
+  `RegisterFormat`: unsigned integers accept `0x` prefix (via `strconv.ParseUint`
+  with base 0), floats use `strconv.ParseFloat`, and vectors parse the
+  `[0x01,0x02,...]` bracket format.
+
 ---
 
 ## 9. The `struct user` Memory Layout
@@ -604,15 +647,15 @@ API. This ensures the API contract is correct and complete.
 
 ### Test targets
 
-Two minimal Go programs serve as tracees:
+Two minimal Go programs serve as tracees for basic lifecycle tests:
 
 | Target | Path | Behavior |
 |--------|------|----------|
 | `end_immediately` | `test/targets/end_immediately/main.go` | Exits immediately (tests process exit handling) |
 | `run_endlessly` | `test/targets/run_endlessly/main.go` | Infinite loop (tests attach, resume, and signal delivery) |
 
-`TestMain()` compiles both targets into a temporary directory before any
-tests run.
+`TestMain()` compiles both Go targets with `go build` and both assembly
+targets with `gcc` into a temporary directory before any tests run.
 
 ### Test categories
 
@@ -623,6 +666,34 @@ tests run.
 | **Resume** | Process transitions to running state (`'R'` or `'S'`); error after exit |
 | **Register metadata** | 125 registers; unique names; unique DWARF IDs; correct offsets |
 | **Register I/O** | `rip` and `rsp` are non-zero after launch; sub-registers consistent with parent; write-then-read round-trips |
+| **Assembly register read** | Inferior sets known values in GPR, sub-GPR, MM, XMM, and ST registers; debugger reads them back |
+| **Assembly register write** | Debugger writes registers; inferior prints them via printf; test verifies output via pipe |
+
+### Assembly test targets
+
+Some register behaviors can only be tested from the inferior's perspective —
+for example, verifying that a debugger write to `rsi` is visible when the
+inferior uses that value in a `printf` call. Go programs cannot control
+which values land in specific registers (the compiler and runtime manage
+register allocation), so these tests use hand-written x86-64 assembly.
+
+| Target | Path | Libc | Build flags | Entry |
+|--------|------|------|-------------|-------|
+| `reg_read` | `test/targets/reg_read.s` | No | `-nostdlib -no-pie` | `_start` |
+| `reg_write` | `test/targets/reg_write.s` | Yes | `-no-pie` | `main` |
+
+Both targets use the **trap-resume-read pattern**: the assembly program
+executes `int3` (software breakpoint) at known points. Each `int3` delivers
+`SIGTRAP` to the tracer, creating a synchronization point where the test
+can read or write registers. Then the test resumes the inferior to the next
+trap.
+
+`reg_read` uses raw syscalls (`syscall` instruction) and no C library,
+since it only needs to set register values and trap. `reg_write` links
+with libc so it can call `printf` and `fflush` to print values to stdout,
+which the test captures via `os.Pipe()` passed through `LaunchOptions`.
+
+`TestMain` builds both assembly targets with `gcc` alongside the Go targets.
 
 ### Process state verification
 
@@ -640,22 +711,26 @@ the *kernel* sees the process in the expected state.
 
 ## 13. File Reference
 
-| File | Lines | Purpose |
-|------|-------|---------|
-| `cmd/toydbg/main.go` | 112 | CLI entry point: argument parsing, REPL loop, command dispatch |
-| `debugger/debugger.go` | 3 | Package documentation |
-| `debugger/error.go` | 24 | Custom error type and constructors |
-| `debugger/process.go` | 238 | Process lifecycle: Launch, Attach, Resume, WaitOnSignal, Close |
-| `debugger/ptrace_linux.go` | 110 | Linux ptrace syscall wrappers |
-| `debugger/ptrace_unsupported.go` | 42 | Non-Linux stubs (return `ENOSYS`) |
-| `debugger/register_info.go` | 321 | Register metadata table (125 entries) and lookup functions |
-| `debugger/registers_linux.go` | 284 | Register cache: read/write via ptrace |
-| `debugger/registers_unsupported.go` | 22 | Non-Linux register stubs |
-| `test/debugger_test.go` | 486 | Integration tests |
-| `test/targets/end_immediately/main.go` | ~5 | Test target: exits immediately |
-| `test/targets/run_endlessly/main.go` | ~5 | Test target: infinite loop |
-| `docs/sequence-diagram.mmd` | 65 | Mermaid sequence diagram of the attach-and-REPL lifecycle |
-| `Dockerfile` | ~20 | Multi-stage build: compile + slim runtime image |
+| File | Purpose |
+|------|---------|
+| `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, register, help, quit) |
+| `debugger/debugger.go` | Package documentation |
+| `debugger/error.go` | Custom error type and constructors |
+| `debugger/format.go` | `FormatRegisterValue` — display formatting for all register types |
+| `debugger/parse.go` | `ParseRegisterValue` — CLI string → typed value conversion |
+| `debugger/process.go` | Process lifecycle: Launch, LaunchWithOptions, Attach, Resume, WaitOnSignal, GetPC, Close |
+| `debugger/ptrace_linux.go` | Linux ptrace syscall wrappers |
+| `debugger/ptrace_unsupported.go` | Non-Linux stubs (return `ENOSYS`) |
+| `debugger/register_info.go` | Register metadata table (125 entries) and lookup functions |
+| `debugger/registers_linux.go` | Register cache: read/write via ptrace |
+| `debugger/registers_unsupported.go` | Non-Linux register stubs |
+| `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests) |
+| `test/targets/end_immediately/main.go` | Test target: exits immediately |
+| `test/targets/run_endlessly/main.go` | Test target: infinite loop |
+| `test/targets/reg_read.s` | Assembly test target: sets known register values and traps (no libc) |
+| `test/targets/reg_write.s` | Assembly test target: prints debugger-written register values via printf |
+| `docs/sequence-diagram.mmd` | Mermaid sequence diagram of the attach-and-REPL lifecycle |
+| `Dockerfile` | Multi-stage build: compile + slim runtime image |
 
 ---
 

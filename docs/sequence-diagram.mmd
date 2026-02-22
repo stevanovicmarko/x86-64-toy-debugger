@@ -57,8 +57,29 @@ sequenceDiagram
     K-->>D: register values
     Note over D: Registers cached in Process.regs
 
-    D->>U: print stop reason
+    D->>U: print stop reason (with PC address)
     D->>U: print prompt "(toydbg) "
     Note over D: Debugger BLOCKED on readline again
     Note over T: Tracee STOPPED again
     Note over D,T: ── cycle repeats ──
+
+    Note over D,T: ── Phase 3: Register commands ──
+    U-->>D: types "register read rax"
+    Note over D: Lookup "rax" in register table
+    Note over D: Read from cached register state
+    D->>U: print "rax          0x00000000cafebabe"
+
+    U-->>D: types "register write rax 0xdeadbeef"
+    Note over D: Parse "0xdeadbeef" → uint64
+    Note over D: Update local register cache
+    D->>K: PTRACE_POKEUSER(pid, offset, value)
+    K-->>D: success
+    D->>U: print "rax          0x00000000deadbeef"
+
+    U-->>D: types "register read" (no args)
+    Note over D: Iterate GPRs in register table
+    D->>U: print all 25 GPR values
+
+    U-->>D: types "register read all"
+    Note over D: Iterate all 125 registers
+    D->>U: print all register values

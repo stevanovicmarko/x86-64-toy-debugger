@@ -7,8 +7,10 @@
 package test
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,6 +43,26 @@ func TestMain(m *testing.M) {
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "build target %s: %v\n", target, err)
+			os.Exit(1)
+		}
+	}
+
+	// Build assembly test targets with gcc.
+	asmTargets := []struct {
+		name  string
+		flags []string
+	}{
+		{"reg_read", []string{"-nostdlib", "-no-pie"}},
+		{"reg_write", []string{"-no-pie"}},
+	}
+	for _, t := range asmTargets {
+		src := filepath.Join("targets", t.name+".s")
+		out := filepath.Join(targetDir, t.name)
+		args := append([]string{"-o", out, src}, t.flags...)
+		cmd := exec.Command("gcc", args...)
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "build asm target %s: %v\n", t.name, err)
 			os.Exit(1)
 		}
 	}
@@ -670,5 +692,183 @@ func TestWriteTypeMismatchReturnsError(t *testing.T) {
 	}
 	if !isDebuggerError(err) {
 		t.Fatalf("expected *debugger.Error, got %T: %v", err, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Assembly-based register tests (trap-resume-read pattern)
+// ---------------------------------------------------------------------------
+
+// resumeAndWait resumes the process and waits for the next stop.
+// It fails the test if the process exits or is terminated instead of stopping.
+func resumeAndWait(t *testing.T, proc *debugger.Process) {
+	t.Helper()
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume failed: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal failed: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected ProcessStopped, got %d (info=%d)", reason.Reason, reason.Info)
+	}
+}
+
+func TestRegisterReadFromInferior(t *testing.T) {
+	proc, err := debugger.Launch(targetPath("reg_read"))
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	defer proc.Close()
+
+	regs := proc.Registers()
+
+	// ── Trap 1: r13 == 0xcafecafe ────────────────────────────────
+	resumeAndWait(t, proc)
+	r13Info, _ := debugger.RegisterInfoByName("r13")
+	r13 := regs.Read(r13Info).(uint64)
+	if r13 != 0xcafecafe {
+		t.Errorf("trap 1: r13 = %#x, want 0xcafecafe", r13)
+	}
+
+	// ── Trap 2: r13b == 42 ───────────────────────────────────────
+	resumeAndWait(t, proc)
+	r13bInfo, _ := debugger.RegisterInfoByName("r13b")
+	r13b := regs.Read(r13bInfo).(uint8)
+	if r13b != 42 {
+		t.Errorf("trap 2: r13b = %d, want 42", r13b)
+	}
+
+	// ── Trap 3: mm0 contains 0xba5eba11 in low bytes ─────────────
+	resumeAndWait(t, proc)
+	mm0Info, _ := debugger.RegisterInfoByName("mm0")
+	mm0 := regs.Read(mm0Info).([8]byte)
+	mm0Val := binary.LittleEndian.Uint64(mm0[:])
+	if mm0Val != 0xba5eba11 {
+		t.Errorf("trap 3: mm0 = %#x, want 0xba5eba11", mm0Val)
+	}
+
+	// ── Trap 4: xmm0 contains double 64.125 ─────────────────────
+	resumeAndWait(t, proc)
+	xmm0Info, _ := debugger.RegisterInfoByName("xmm0")
+	xmm0 := regs.Read(xmm0Info).([16]byte)
+	xmm0Bits := binary.LittleEndian.Uint64(xmm0[:8])
+	xmm0Float := math.Float64frombits(xmm0Bits)
+	if xmm0Float != 64.125 {
+		t.Errorf("trap 4: xmm0 as double = %g, want 64.125", xmm0Float)
+	}
+
+	// ── Trap 5: st0 contains 64.125 ─────────────────────────────
+	resumeAndWait(t, proc)
+	st0Info, _ := debugger.RegisterInfoByName("st0")
+	st0 := regs.Read(st0Info).([16]byte)
+	// x87 80-bit extended precision for 64.125:
+	// The value should be non-zero in the first 10 bytes.
+	allZero := true
+	for _, b := range st0[:10] {
+		if b != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		t.Error("trap 5: st0 is all zeros, expected 64.125")
+	}
+
+	// Resume to exit.
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("final Resume failed: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("final WaitOnSignal failed: %v", err)
+	}
+	if reason.Reason != debugger.ProcessExited {
+		t.Errorf("expected process to exit, got state %d", reason.Reason)
+	}
+}
+
+func TestRegisterWriteToInferior(t *testing.T) {
+	// Create a pipe to capture the inferior's stdout.
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe failed: %v", err)
+	}
+	defer pr.Close()
+
+	proc, err := debugger.LaunchWithOptions(targetPath("reg_write"),
+		debugger.LaunchOptions{Stdout: pw})
+	if err != nil {
+		pw.Close()
+		t.Fatalf("LaunchWithOptions failed: %v", err)
+	}
+	defer proc.Close()
+	// Close the write end in the parent so reads see EOF when the child exits.
+	pw.Close()
+
+	regs := proc.Registers()
+
+	// Helper to read from the pipe until we get some output.
+	readOutput := func() string {
+		buf := make([]byte, 256)
+		n, _ := pr.Read(buf)
+		return string(buf[:n])
+	}
+
+	// ── Trap 1: Write rsi = 0xcafecafe ───────────────────────────
+	resumeAndWait(t, proc)
+	rsiInfo, _ := debugger.RegisterInfoByName("rsi")
+	if err := regs.Write(rsiInfo, uint64(0xcafecafe)); err != nil {
+		t.Fatalf("write rsi failed: %v", err)
+	}
+
+	// Resume to Trap 2 — inferior prints rsi and hits next int3.
+	resumeAndWait(t, proc)
+	out := readOutput()
+	if !strings.Contains(out, "0xcafecafe") {
+		t.Errorf("trap 1→2: inferior printed %q, want 0xcafecafe", out)
+	}
+
+	// ── Trap 2: Write mm0 = 0xba5eba11 ──────────────────────────
+	mm0Info, _ := debugger.RegisterInfoByName("mm0")
+	var mm0Val [8]byte
+	binary.LittleEndian.PutUint64(mm0Val[:], 0xba5eba11)
+	if err := regs.Write(mm0Info, mm0Val); err != nil {
+		t.Fatalf("write mm0 failed: %v", err)
+	}
+
+	// Resume to Trap 3 — inferior prints mm0 and hits next int3.
+	resumeAndWait(t, proc)
+	out = readOutput()
+	if !strings.Contains(out, "0xba5eba11") {
+		t.Errorf("trap 2→3: inferior printed %q, want 0xba5eba11", out)
+	}
+
+	// ── Trap 3: Write xmm0 = double 42.24 ───────────────────────
+	xmm0Info, _ := debugger.RegisterInfoByName("xmm0")
+	var xmm0Val [16]byte
+	binary.LittleEndian.PutUint64(xmm0Val[:8], math.Float64bits(42.24))
+	if err := regs.Write(xmm0Info, xmm0Val); err != nil {
+		t.Fatalf("write xmm0 failed: %v", err)
+	}
+
+	// Resume to Trap 4 — inferior prints xmm0 as float.
+	resumeAndWait(t, proc)
+	out = readOutput()
+	if !strings.Contains(out, "42.24") {
+		t.Errorf("trap 3→4: inferior printed %q, want 42.24", out)
+	}
+
+	// Resume to exit.
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("final Resume failed: %v", err)
+	}
+	reason, err2 := proc.WaitOnSignal()
+	if err2 != nil {
+		t.Fatalf("final WaitOnSignal failed: %v", err2)
+	}
+	if reason.Reason != debugger.ProcessExited {
+		t.Errorf("expected process to exit, got state %d", reason.Reason)
 	}
 }

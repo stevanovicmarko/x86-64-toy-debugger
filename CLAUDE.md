@@ -43,11 +43,11 @@ podman run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
 
 ## Architecture
 
-This is a Go port of a C++ x86-64 debugger from the book *Building a Debugger* by No Starch Press. The debugger can launch or attach to processes via ptrace and provides an interactive REPL with the `continue` command.
+This is a Go port of a C++ x86-64 debugger from the book *Building a Debugger* by No Starch Press. The debugger can launch or attach to processes via ptrace and provides an interactive REPL with commands for continuing execution, reading/writing registers, and more.
 
 **Package layout:**
 
-- `debugger/` — public library. Exports process primitives: `Launch`, `AttachPID`, `Resume`, `WaitOnSignal`.
+- `debugger/` — public library. Exports process primitives: `Launch`, `LaunchWithOptions`, `Attach`, `Resume`, `WaitOnSignal`, `GetPC`.
 - `internal/` — private implementation details. Go compiler enforces this boundary.
 - `cmd/toydbg/` — CLI binary with interactive REPL (`(toydbg) ` prompt). Handles argument parsing and command dispatch.
 - `test/` — black-box integration tests that consume `debugger/` as an external package.
@@ -74,52 +74,41 @@ Use **WSL2**, which provides a real Linux kernel with full ptrace support. Build
 
 ## Verification Rule
 
-After any code change, **always** build and run the debugger inside a Linux environment and verify it produces valid output. A passing `go test ./...` on the host is **not** sufficient — ptrace behavior can only be tested inside a real Linux kernel.
+After any code change, you **must** verify the debugger works in **both** the native environment and the container. The container build is **mandatory** — it is the canonical environment that proves all tests pass (including assembly targets that require `gcc`).
 
-### Detect the available Linux environment
+### Detect the available container runtime
 
 Run these checks in order and use the **first** match:
 
-| Priority | Check | Environment |
-|----------|-------|-------------|
-| 1 | `uname -s` returns `Linux` (native or WSL2) | **Native Linux / WSL2** — build and run directly. |
-| 2 | `command -v podman` succeeds | **Podman** |
-| 3 | `command -v docker` succeeds | **Docker** |
+| Priority | Check | Runtime |
+|----------|-------|---------|
+| 1 | `command -v podman` succeeds | **Podman** |
+| 2 | `command -v docker` succeeds | **Docker** |
 
-If none match, stop and inform the user that a Linux environment is required.
+If neither is available, stop and inform the user that a container runtime is required.
 
 ### Required verification steps
 
-**Native Linux / WSL2:**
+All steps below are **mandatory**. Substitute `docker` for `podman` if that is the available runtime.
 
 ```bash
-# 1. Build and test
+# Step 1: Native build and test (if on Linux / WSL2)
 go build ./cmd/toydbg && go test ./...
 
-# 2. Smoke-test: continue to exit
-echo "c" | ./toydbg /bin/true
-# Expected: "process exited with code 0"
-
-# 3. Smoke-test: REPL help
-echo "help" | ./toydbg /bin/true
-# Expected: "commands: continue (c), quit (q), help (h)"
-```
-
-**Podman / Docker** (substitute `docker` for `podman` if that is what was detected):
-
-```bash
-# 1. Build image (includes go build + go test)
+# Step 2: Container build (MANDATORY — runs go build + go test inside the container)
 podman build -t toydbg .
 
-# 2. Smoke-test: continue to exit
+# Step 3: Container smoke-test — continue to exit
 echo "c" | podman run --rm -i --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
   toydbg /bin/true
 # Expected: "process exited with code 0"
 
-# 3. Smoke-test: REPL help
+# Step 4: Container smoke-test — REPL help
 echo "help" | podman run --rm -i --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
   toydbg /bin/true
-# Expected: "commands: continue (c), quit (q), help (h)"
+# Expected: "commands: continue (c), register (reg), quit (q), help (h)"
 ```
 
-Do **not** skip these steps or assume the task is complete without them.
+> **Why is the container build mandatory?** The Dockerfile runs `go test ./...` inside the image, which compiles the assembly test targets with `gcc` and executes all tests including the ptrace-based register tests. A passing container build proves the full toolchain works: Go compiler, `gcc` for assembly, and ptrace syscalls. Native-only testing does not guarantee the container environment works.
+
+Do **not** skip the container build or assume the task is complete without it.
