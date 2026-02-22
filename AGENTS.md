@@ -67,6 +67,7 @@ podman run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
 - **Error handling** follows Go idioms: return `error` values, don't panic.
 - Run `go mod tidy` after adding or removing imports.
 - **Sequence diagram:** The file [`docs/sequence-diagram.mmd`](docs/sequence-diagram.mmd) is the canonical Mermaid sequence diagram documenting the debugger's attach-and-REPL lifecycle (User, Debugger, Kernel, Tracee). When adding new debugger features or changing the attach/resume/wait flow, update the diagram to reflect the new interactions. Every agentic coding flow that modifies the debugger's control flow **must** update this diagram and commit it alongside the code changes.
+- **Architecture doc:** The file [`docs/architecture.md`](docs/architecture.md) is the educational architecture guide for the entire codebase. It follows an **onion teaching pattern** — outermost layers (package layout, what ptrace is) come first, peeling inward toward implementation details (byte offsets, encoding strategies). When adding new features, changing existing behavior, or introducing new packages/files, update the relevant sections of `architecture.md`. New sections must follow the same onion pattern: start with *why* and the mental model, then explain *how* with diagrams and code examples, then cover edge cases and implementation details. Every agentic coding flow that modifies the debugger **must** update this document and commit it alongside the code changes.
 
 ## Platform-Specific Setup
 
@@ -178,3 +179,4 @@ Do **not** skip these steps or assume the task is complete without them.
 - `debugger/debugger.go` — public library root.
 - `test/debugger_test.go` — integration tests.
 - `docs/sequence-diagram.mmd` — Mermaid sequence diagram showing the debugger's attach-and-REPL lifecycle.
+- `docs/architecture.md` — Educational architecture guide (onion pattern: high-level concepts → implementation details). Must be updated alongside code changes.

@@ -1,6 +1,7 @@
 # toydbg
 
 A toy x86-64 debugger written in Go, inspired by the C++ project in [*Building a Debugger*](https://nostarch.com/building-a-debugger) by No Starch Press.
+Yes, its mostly implemented by AI, but it still requires a lot of human guidance to get right. Things such as the ptrace syscalls, the register table, and the process state machine are all very tricky to get right and AI. Knowing to use PTRACE_SEIZE + PTRACE_INTERRUPT instead of PTRACE_ATTACH is something that AI would not know without human guidance.
 
 ## Prerequisites
 
@@ -88,9 +89,10 @@ docs/            Documentation and diagrams
 
 The `debugger` package is the sole public API surface. Both the CLI and tests consume it; neither reaches into `internal/` directly.
 
-## Sequence Diagram
+## Documentation
 
-A Mermaid sequence diagram at [`docs/sequence-diagram.mmd`](docs/sequence-diagram.mmd) documents the debugger's attach-and-REPL lifecycle — showing how the User, Debugger, Kernel, and Tracee interact through ptrace attach, wait, continue, and signal delivery.
+- **[Architecture Guide](docs/architecture.md)** — educational deep-dive into how the debugger works: ptrace mechanics, the register table, process lifecycle, `struct user` memory layout, and more.
+- **[Sequence Diagram](docs/sequence-diagram.mmd)** — Mermaid sequence diagram of the attach-and-REPL lifecycle (User, Debugger, Kernel, Tracee).
 
 ## License
 
