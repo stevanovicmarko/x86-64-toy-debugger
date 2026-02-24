@@ -1,6 +1,7 @@
 package debugger
 
 import (
+	"encoding/binary"
 	"io"
 	"os"
 	"os/exec"
@@ -384,6 +385,78 @@ func (p *Process) WaitOnSignal() (StopReason, error) {
 	}
 
 	return reason, nil
+}
+
+// ReadMemory reads `amount` bytes from the tracee's address space starting
+// at `addr`. It uses process_vm_readv for efficient bulk reads.
+func (p *Process) ReadMemory(addr uint64, amount int) ([]byte, error) {
+	return processVMReadv(p.pid, addr, amount)
+}
+
+// WriteMemory writes `data` to the tracee's address space starting at
+// `addr`. It uses PTRACE_POKEDATA one word at a time. Partial words at
+// the start and end are handled via read-modify-write to preserve
+// surrounding bytes.
+func (p *Process) WriteMemory(addr uint64, data []byte) error {
+	const wordSize = 8
+	remaining := len(data)
+	offset := 0
+
+	for remaining > 0 {
+		curAddr := addr + uint64(offset)
+		aligned := curAddr & ^uint64(wordSize - 1)
+
+		if curAddr != aligned || remaining < wordSize {
+			// Partial word: read the existing word, patch our bytes in.
+			existing, err := ptracePeekData(p.pid, aligned)
+			if err != nil {
+				return newErrorf("memory write: peek at 0x%x failed: %v", aligned, err)
+			}
+			var word [wordSize]byte
+			binary.LittleEndian.PutUint64(word[:], existing)
+
+			byteOff := int(curAddr - aligned)
+			n := wordSize - byteOff
+			if n > remaining {
+				n = remaining
+			}
+			copy(word[byteOff:byteOff+n], data[offset:offset+n])
+
+			val := binary.LittleEndian.Uint64(word[:])
+			if err := ptracePokeData(p.pid, aligned, val); err != nil {
+				return newErrorf("memory write: poke at 0x%x failed: %v", aligned, err)
+			}
+			offset += n
+			remaining -= n
+		} else {
+			// Full aligned word.
+			val := binary.LittleEndian.Uint64(data[offset : offset+wordSize])
+			if err := ptracePokeData(p.pid, curAddr, val); err != nil {
+				return newErrorf("memory write: poke at 0x%x failed: %v", curAddr, err)
+			}
+			offset += wordSize
+			remaining -= wordSize
+		}
+	}
+	return nil
+}
+
+// ReadMemoryWithoutTraps reads memory and patches out int3 (0xCC) bytes
+// from any enabled breakpoints in the read region. This returns the
+// "original" memory contents as they would appear without breakpoints,
+// which is essential for disassembly.
+func (p *Process) ReadMemoryWithoutTraps(addr uint64, amount int) ([]byte, error) {
+	data, err := p.ReadMemory(addr, amount)
+	if err != nil {
+		return nil, err
+	}
+
+	// Find enabled breakpoints in [addr, addr+amount) and patch out 0xCC.
+	for _, site := range p.breakpointSites.getInRegion(addr, addr+uint64(len(data))) {
+		idx := site.address - addr
+		data[idx] = site.savedData
+	}
+	return data, nil
 }
 
 // Close detaches from the process and optionally terminates it.

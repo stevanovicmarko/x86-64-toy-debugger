@@ -55,6 +55,7 @@ func TestMain(m *testing.M) {
 		{"reg_read", []string{"-nostdlib", "-no-pie"}},
 		{"reg_write", []string{"-no-pie"}},
 		{"hello_toydbg", []string{"-nostdlib", "-no-pie"}},
+		{"memory", []string{"-nostdlib", "-no-pie"}},
 	}
 	for _, t := range asmTargets {
 		src := filepath.Join("targets", t.name+".s")
@@ -1104,6 +1105,108 @@ func TestContinueFromBreakpoint(t *testing.T) {
 	}
 	if reason.Reason != debugger.ProcessExited {
 		t.Errorf("expected process to exit, got state %d (info=%d)", reason.Reason, reason.Info)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Memory read/write tests
+// ---------------------------------------------------------------------------
+
+func TestReadMemory(t *testing.T) {
+	// Create a pipe to capture the inferior's stdout (it writes the
+	// address of the known value to stdout).
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe failed: %v", err)
+	}
+	defer pr.Close()
+
+	proc, err := debugger.LaunchWithOptions(targetPath("memory"),
+		debugger.LaunchOptions{Stdout: pw})
+	if err != nil {
+		pw.Close()
+		t.Fatalf("LaunchWithOptions failed: %v", err)
+	}
+	defer proc.Close()
+	pw.Close()
+
+	// Resume to trap 1 — inferior has stored 0xcafecafe and written its address.
+	resumeAndWait(t, proc)
+
+	// Read the 8-byte address from the pipe.
+	addrBuf := make([]byte, 8)
+	if _, err := pr.Read(addrBuf); err != nil {
+		t.Fatalf("read address from pipe: %v", err)
+	}
+	addr := binary.LittleEndian.Uint64(addrBuf)
+
+	// Read 8 bytes at that address.
+	data, err := proc.ReadMemory(addr, 8)
+	if err != nil {
+		t.Fatalf("ReadMemory failed: %v", err)
+	}
+	val := binary.LittleEndian.Uint64(data)
+	if val != 0xcafecafe {
+		t.Errorf("ReadMemory: got 0x%x, want 0xcafecafe", val)
+	}
+}
+
+func TestWriteMemory(t *testing.T) {
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe failed: %v", err)
+	}
+	defer pr.Close()
+
+	proc, err := debugger.LaunchWithOptions(targetPath("memory"),
+		debugger.LaunchOptions{Stdout: pw})
+	if err != nil {
+		pw.Close()
+		t.Fatalf("LaunchWithOptions failed: %v", err)
+	}
+	defer proc.Close()
+	pw.Close()
+
+	// Resume to trap 1 (skip the read phase).
+	resumeAndWait(t, proc)
+	// Drain the first address from the pipe.
+	drain := make([]byte, 8)
+	pr.Read(drain)
+
+	// Resume to trap 2 — inferior has zeroed the buffer and written its address.
+	resumeAndWait(t, proc)
+
+	// Read the buffer address from the pipe.
+	addrBuf := make([]byte, 8)
+	if _, err := pr.Read(addrBuf); err != nil {
+		t.Fatalf("read address from pipe: %v", err)
+	}
+	bufAddr := binary.LittleEndian.Uint64(addrBuf)
+
+	// Write "Hello, toydbg!" into the buffer.
+	msg := []byte("Hello, toydbg!")
+	if err := proc.WriteMemory(bufAddr, msg); err != nil {
+		t.Fatalf("WriteMemory failed: %v", err)
+	}
+
+	// Resume — inferior prints the buffer contents and exits.
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume failed: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal failed: %v", err)
+	}
+	if reason.Reason != debugger.ProcessExited {
+		t.Fatalf("expected process to exit, got state %d", reason.Reason)
+	}
+
+	// Read the printed buffer from the pipe.
+	outBuf := make([]byte, 256)
+	n, _ := pr.Read(outBuf)
+	out := string(outBuf[:n])
+	if !strings.Contains(out, "Hello, toydbg!") {
+		t.Errorf("inferior output %q does not contain expected message", out)
 	}
 }
 

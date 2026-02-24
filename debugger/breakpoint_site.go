@@ -148,6 +148,18 @@ func (c *breakpointSiteCollection) removeByAddress(addr uint64) bool {
 	return false
 }
 
+// getInRegion returns all enabled breakpoint sites whose address falls
+// within [low, high).
+func (c *breakpointSiteCollection) getInRegion(low, high uint64) []*BreakpointSite {
+	var result []*BreakpointSite
+	for _, s := range c.sites {
+		if s.isEnabled && s.InRange(low, high) {
+			result = append(result, s)
+		}
+	}
+	return result
+}
+
 func (c *breakpointSiteCollection) forEach(fn func(*BreakpointSite)) {
 	for _, s := range c.sites {
 		fn(s)

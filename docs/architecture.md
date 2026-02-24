@@ -21,10 +21,12 @@ codebase, extending it, or building your own debugger from scratch.
 10. [Software Breakpoints](#10-software-breakpoints)
 11. [Memory Access (PEEKDATA / POKEDATA)](#11-memory-access-peekdata--pokedata)
 12. [Single Stepping](#12-single-stepping)
-13. [Platform Abstraction](#13-platform-abstraction)
-14. [Error Handling](#14-error-handling)
-15. [Testing Strategy](#15-testing-strategy)
-16. [File Reference](#16-file-reference)
+13. [Bulk Memory Operations](#13-bulk-memory-operations)
+14. [Disassembly](#14-disassembly)
+15. [Platform Abstraction](#15-platform-abstraction)
+16. [Error Handling](#16-error-handling)
+17. [Testing Strategy](#17-testing-strategy)
+18. [File Reference](#18-file-reference)
 
 ---
 
@@ -224,15 +226,15 @@ A traced process moves through four states:
                         ▼
               ┌──── STOPPED ◀──────────┐
               │         │              │
-         Resume()       │         WaitOnSignal()
-              │         │       (stopped by signal)
+      Resume()│         │              │ WaitOnSignal()
+              │         │              │ (stopped by signal)
               ▼         │              │
            RUNNING ─────┘──────────────┘
               │
               │  WaitOnSignal()
               │  (process exits or is killed)
               ▼
-        EXITED  or  TERMINATED
+       EXITED or TERMINATED
 ```
 
 - **`ProcessStopped`** — The tracee is frozen. The debugger can read/write
@@ -306,9 +308,16 @@ shell over the `debugger` API, not an independent system.
 | `register read all` | `reg read all` | Print all 125 register values |
 | `register read <name>` | `reg read <name>` | Print a single register |
 | `register write <name> <value>` | `reg write <name> <value>` | Write a value to a register |
+| `memory read <addr>` | `mem read <addr>` | Read 32 bytes at address, print hex dump |
+| `memory read <addr> <n>` | `mem read <addr> <n>` | Read n bytes at address |
+| `memory write <addr> [0xff,...]` | `mem write <addr> [...]` | Write bytes at address |
+| `disassemble` | `disas` | Disassemble 5 instructions at current PC |
+| `disassemble -c <n> -a <addr>` | `disas -c <n> -a <addr>` | Disassemble n instructions at address |
 | `help` | `h`, empty line | Print the list of available commands |
 | `help register` | `help reg` | Print register subcommand help |
 | `help breakpoint` | `help break` | Print breakpoint subcommand help |
+| `help memory` | `help mem` | Print memory subcommand help |
+| `help disassemble` | `help disas` | Print disassemble options help |
 | `quit` | `q`, `exit` | Exit the debugger |
 
 ### Input handling
@@ -394,6 +403,207 @@ bytes come first in memory, so reading fewer bytes from the same offset
 naturally gives you the low portion of the register. The exception is `ah`,
 which reads the *second* byte (`offset + 1`) to get the high byte of the
 16-bit `ax` register.
+
+### Complete register map
+
+The following tables list every entry in `registerInfos` with its resolved
+byte offset inside `struct user`. The **ID** column is the slice index
+(auto-assigned by `init()`).
+
+#### 64-bit GPRs (IDs 0–24)
+
+| ID | Name | DWARF | Size | Offset | Notes |
+|----|------|-------|------|--------|-------|
+| 0 | `rax` | 0 | 8 | 80 | Accumulator / return value |
+| 1 | `rdx` | 1 | 8 | 96 | 3rd arg / 128-bit multiply hi |
+| 2 | `rcx` | 2 | 8 | 88 | 4th arg / loop counter |
+| 3 | `rbx` | 3 | 8 | 40 | Callee-saved |
+| 4 | `rsi` | 4 | 8 | 104 | 2nd arg (source index) |
+| 5 | `rdi` | 5 | 8 | 112 | 1st arg (dest index) |
+| 6 | `rbp` | 6 | 8 | 32 | Frame pointer (callee-saved) |
+| 7 | `rsp` | 7 | 8 | 152 | Stack pointer |
+| 8 | `r8` | 8 | 8 | 72 | 5th arg |
+| 9 | `r9` | 9 | 8 | 64 | 6th arg |
+| 10 | `r10` | 10 | 8 | 56 | Caller-saved |
+| 11 | `r11` | 11 | 8 | 48 | Caller-saved |
+| 12 | `r12` | 12 | 8 | 24 | Callee-saved |
+| 13 | `r13` | 13 | 8 | 16 | Callee-saved |
+| 14 | `r14` | 14 | 8 | 8 | Callee-saved |
+| 15 | `r15` | 15 | 8 | 0 | Callee-saved |
+| 16 | `rip` | 16 | 8 | 128 | Instruction pointer |
+| 17 | `eflags` | 49 | 8 | 144 | CPU flags |
+| 18 | `cs` | 51 | 8 | 136 | Code segment |
+| 19 | `fs` | 54 | 8 | 200 | TLS segment |
+| 20 | `gs` | 55 | 8 | 208 | TLS segment |
+| 21 | `ss` | 52 | 8 | 160 | Stack segment |
+| 22 | `ds` | 53 | 8 | 184 | Data segment |
+| 23 | `es` | 50 | 8 | 192 | Extra segment |
+| 24 | `orig_rax` | -1 | 8 | 120 | Syscall number (ptrace-only) |
+
+> **Note:** The DWARF-to-offset mapping is *not* sequential — the kernel's
+> `user_regs_struct` stores registers in a different order than the DWARF
+> numbering. For example, DWARF 0 (`rax`) is at offset 80, while the struct
+> starts with `r15` at offset 0.
+
+#### 32-bit sub-GPRs (IDs 25–40)
+
+All share the same offset as their 64-bit parent (little-endian: low 4 bytes).
+
+| ID | Name | Size | Offset | Parent |
+|----|------|------|--------|--------|
+| 25 | `eax` | 4 | 80 | `rax` |
+| 26 | `edx` | 4 | 96 | `rdx` |
+| 27 | `ecx` | 4 | 88 | `rcx` |
+| 28 | `ebx` | 4 | 40 | `rbx` |
+| 29 | `esi` | 4 | 104 | `rsi` |
+| 30 | `edi` | 4 | 112 | `rdi` |
+| 31 | `ebp` | 4 | 32 | `rbp` |
+| 32 | `esp` | 4 | 152 | `rsp` |
+| 33 | `r8d` | 4 | 72 | `r8` |
+| 34 | `r9d` | 4 | 64 | `r9` |
+| 35 | `r10d` | 4 | 56 | `r10` |
+| 36 | `r11d` | 4 | 48 | `r11` |
+| 37 | `r12d` | 4 | 24 | `r12` |
+| 38 | `r13d` | 4 | 16 | `r13` |
+| 39 | `r14d` | 4 | 8 | `r14` |
+| 40 | `r15d` | 4 | 0 | `r15` |
+
+#### 16-bit sub-GPRs (IDs 41–56)
+
+| ID | Name | Size | Offset | Parent |
+|----|------|------|--------|--------|
+| 41 | `ax` | 2 | 80 | `rax` |
+| 42 | `dx` | 2 | 96 | `rdx` |
+| 43 | `cx` | 2 | 88 | `rcx` |
+| 44 | `bx` | 2 | 40 | `rbx` |
+| 45 | `si` | 2 | 104 | `rsi` |
+| 46 | `di` | 2 | 112 | `rdi` |
+| 47 | `bp` | 2 | 32 | `rbp` |
+| 48 | `sp` | 2 | 152 | `rsp` |
+| 49 | `r8w` | 2 | 72 | `r8` |
+| 50 | `r9w` | 2 | 64 | `r9` |
+| 51 | `r10w` | 2 | 56 | `r10` |
+| 52 | `r11w` | 2 | 48 | `r11` |
+| 53 | `r12w` | 2 | 24 | `r12` |
+| 54 | `r13w` | 2 | 16 | `r13` |
+| 55 | `r14w` | 2 | 8 | `r14` |
+| 56 | `r15w` | 2 | 0 | `r15` |
+
+#### 8-bit sub-GPRs (IDs 57–76)
+
+High-byte registers (`ah`, `bh`, `ch`, `dh`) use `offset + 1` to reach
+bits 8–15 of the 16-bit register — an encoding inherited from the 8086.
+Low-byte registers share the base offset.
+
+| ID | Name | Size | Offset | Parent | Notes |
+|----|------|------|--------|--------|-------|
+| 57 | `ah` | 1 | 81 | `rax` | High byte of `ax` |
+| 58 | `bh` | 1 | 41 | `rbx` | High byte of `bx` |
+| 59 | `ch` | 1 | 89 | `rcx` | High byte of `cx` |
+| 60 | `dh` | 1 | 97 | `rdx` | High byte of `dx` |
+| 61 | `al` | 1 | 80 | `rax` | Low byte |
+| 62 | `bl` | 1 | 40 | `rbx` | Low byte |
+| 63 | `cl` | 1 | 88 | `rcx` | Low byte |
+| 64 | `dl` | 1 | 96 | `rdx` | Low byte |
+| 65 | `sil` | 1 | 104 | `rsi` | Low byte (REX prefix) |
+| 66 | `dil` | 1 | 112 | `rdi` | Low byte (REX prefix) |
+| 67 | `bpl` | 1 | 32 | `rbp` | Low byte (REX prefix) |
+| 68 | `spl` | 1 | 152 | `rsp` | Low byte (REX prefix) |
+| 69 | `r8b` | 1 | 72 | `r8` | Low byte |
+| 70 | `r9b` | 1 | 64 | `r9` | Low byte |
+| 71 | `r10b` | 1 | 56 | `r10` | Low byte |
+| 72 | `r11b` | 1 | 48 | `r11` | Low byte |
+| 73 | `r12b` | 1 | 24 | `r12` | Low byte |
+| 74 | `r13b` | 1 | 16 | `r13` | Low byte |
+| 75 | `r14b` | 1 | 8 | `r14` | Low byte |
+| 76 | `r15b` | 1 | 0 | `r15` | Low byte |
+
+> **Note:** `sil`, `dil`, `bpl`, and `spl` only exist in 64-bit mode (they
+> require a REX prefix). In 32-bit mode, those encodings map to `ah`, `ch`,
+> `dh`, `bh` instead — a classic x86 encoding quirk.
+
+#### FP control/status (IDs 77–84)
+
+All offsets are relative to `struct user` (base 224 = `user_fpregs_struct`).
+
+| ID | Name | DWARF | Size | Offset | Description |
+|----|------|-------|------|--------|-------------|
+| 77 | `fcw` | 65 | 2 | 224 | FP control word |
+| 78 | `fsw` | 66 | 2 | 226 | FP status word |
+| 79 | `ftw` | -1 | 2 | 228 | FP tag word |
+| 80 | `fop` | -1 | 2 | 230 | FP opcode |
+| 81 | `frip` | -1 | 8 | 232 | FP instruction pointer |
+| 82 | `frdp` | -1 | 8 | 240 | FP data pointer |
+| 83 | `mxcsr` | 64 | 4 | 248 | SSE control/status |
+| 84 | `mxcsrmask` | -1 | 4 | 252 | SSE control mask |
+
+#### ST registers — x87 stack (IDs 85–92)
+
+80-bit extended precision, stored as 16-byte slots (6 bytes padding each).
+Format: `LongDouble`.
+
+| ID | Name | DWARF | Size | Offset |
+|----|------|-------|------|--------|
+| 85 | `st0` | 33 | 16 | 256 |
+| 86 | `st1` | 34 | 16 | 272 |
+| 87 | `st2` | 35 | 16 | 288 |
+| 88 | `st3` | 36 | 16 | 304 |
+| 89 | `st4` | 37 | 16 | 320 |
+| 90 | `st5` | 38 | 16 | 336 |
+| 91 | `st6` | 39 | 16 | 352 |
+| 92 | `st7` | 40 | 16 | 368 |
+
+#### MM registers — MMX (IDs 93–100)
+
+64-bit values aliasing the same storage as ST registers (same offsets, smaller
+size). Format: `Vector`.
+
+| ID | Name | DWARF | Size | Offset | Aliases |
+|----|------|-------|------|--------|---------|
+| 93 | `mm0` | 41 | 8 | 256 | `st0` storage |
+| 94 | `mm1` | 42 | 8 | 272 | `st1` storage |
+| 95 | `mm2` | 43 | 8 | 288 | `st2` storage |
+| 96 | `mm3` | 44 | 8 | 304 | `st3` storage |
+| 97 | `mm4` | 45 | 8 | 320 | `st4` storage |
+| 98 | `mm5` | 46 | 8 | 336 | `st5` storage |
+| 99 | `mm6` | 47 | 8 | 352 | `st6` storage |
+| 100 | `mm7` | 48 | 8 | 368 | `st7` storage |
+
+#### XMM registers — SSE (IDs 101–116)
+
+128-bit vector registers. Format: `Vector`.
+
+| ID | Name | DWARF | Size | Offset |
+|----|------|-------|------|--------|
+| 101 | `xmm0` | 17 | 16 | 384 |
+| 102 | `xmm1` | 18 | 16 | 400 |
+| 103 | `xmm2` | 19 | 16 | 416 |
+| 104 | `xmm3` | 20 | 16 | 432 |
+| 105 | `xmm4` | 21 | 16 | 448 |
+| 106 | `xmm5` | 22 | 16 | 464 |
+| 107 | `xmm6` | 23 | 16 | 480 |
+| 108 | `xmm7` | 24 | 16 | 496 |
+| 109 | `xmm8` | 25 | 16 | 512 |
+| 110 | `xmm9` | 26 | 16 | 528 |
+| 111 | `xmm10` | 27 | 16 | 544 |
+| 112 | `xmm11` | 28 | 16 | 560 |
+| 113 | `xmm12` | 29 | 16 | 576 |
+| 114 | `xmm13` | 30 | 16 | 592 |
+| 115 | `xmm14` | 31 | 16 | 608 |
+| 116 | `xmm15` | 32 | 16 | 624 |
+
+#### Debug registers (IDs 117–124)
+
+| ID | Name | Size | Offset | Purpose |
+|----|------|------|--------|---------|
+| 117 | `dr0` | 8 | 848 | Hardware breakpoint address |
+| 118 | `dr1` | 8 | 856 | Hardware breakpoint address |
+| 119 | `dr2` | 8 | 864 | Hardware breakpoint address |
+| 120 | `dr3` | 8 | 872 | Hardware breakpoint address |
+| 121 | `dr4` | 8 | 880 | Reserved (alias for dr6) |
+| 122 | `dr5` | 8 | 888 | Reserved (alias for dr7) |
+| 123 | `dr6` | 8 | 896 | Debug status |
+| 124 | `dr7` | 8 | 904 | Debug control |
 
 ### Lookup functions
 
@@ -623,11 +833,11 @@ to stop.
 ### Setting a breakpoint
 
 ```
-Before breakpoint:        After breakpoint:
-┌────────────────┐        ┌────────────────┐
+Before breakpoint:              After breakpoint:
+┌────────────────┐              ┌────────────────┐
 │ 48 c7 c0 01 …  │ ← original   │ CC c7 c0 01 …  │ ← 0xCC replaces first byte
-└────────────────┘        └────────────────┘
-  addr 0x401000             addr 0x401000
+└────────────────┘              └────────────────┘
+  addr 0x401000                   addr 0x401000
 ```
 
 The `BreakpointSite.Enable()` method:
@@ -712,13 +922,13 @@ slice-backed collection with lookup methods. This keeps things concrete
 
 ```
                     ┌─────────────────────┐
-PEEKUSER/POKEUSER → │   struct user        │ ← register state
-                    │   (kernel memory)    │
+PEEKUSER/POKEUSER → │   struct user       │ ← register state
+                    │   (kernel memory)   │
                     └─────────────────────┘
 
                     ┌─────────────────────┐
-PEEKDATA/POKEDATA → │   process memory     │ ← code + data
-                    │   (address space)    │
+PEEKDATA/POKEDATA → │   process memory    │ ← code + data
+                    │   (address space)   │
                     └─────────────────────┘
 ```
 
@@ -768,7 +978,119 @@ is that `StepInstruction` returns to the REPL after one instruction, while
 
 ---
 
-## 13. Platform Abstraction
+## 13. Bulk Memory Operations
+
+**Source:** `debugger/process.go`, `debugger/memory_linux.go`
+
+While `PTRACE_PEEKDATA` / `PTRACE_POKEDATA` work on individual 8-byte
+words, debuggers frequently need to read or write larger regions — for
+example, reading enough bytes to disassemble several instructions, or
+writing a string into the tracee's memory.
+
+### ReadMemory — efficient bulk reads with process_vm_readv
+
+`Process.ReadMemory(addr, amount)` uses the `process_vm_readv(2)` syscall
+instead of repeated `PTRACE_PEEKDATA` calls. This syscall transfers data
+directly between address spaces in a single call, avoiding the per-word
+overhead of ptrace.
+
+```
+Debugger                          Kernel
+────────                          ──────
+process_vm_readv(pid,             copies 'amount' bytes
+  local_iov, remote_iov)  ──▶    directly from tracee
+                           ◀──    to debugger buffer
+```
+
+The implementation splits the remote address range into page-aligned
+`iovec` chunks (4096 bytes each). This is important because
+`process_vm_readv` handles each iovec independently — if one page is
+unmapped, the syscall returns a short read rather than failing with
+`EFAULT`. Without page alignment, a read that spans a mapped-to-unmapped
+boundary could fail entirely.
+
+### WriteMemory — word-at-a-time with read-modify-write
+
+`Process.WriteMemory(addr, data)` uses `PTRACE_POKEDATA` one word at a
+time. For partial words at the start and end of the write region, it
+performs a read-modify-write cycle: read the existing 8-byte word, patch
+in the new bytes, write it back.
+
+```
+Writing 3 bytes at address 0x1005 (not 8-byte aligned):
+
+  Aligned word at 0x1000: [aa bb cc dd ee ff gg hh]
+                                       ↑↑ ↑↑ ↑↑
+                                       new bytes go here (offsets 5-7)
+
+  1. PEEKDATA(0x1000) → read existing word
+  2. Patch bytes 5, 6, 7 with new data
+  3. POKEDATA(0x1000, patched_word)
+```
+
+### ReadMemoryWithoutTraps — breakpoint-aware reads
+
+`Process.ReadMemoryWithoutTraps(addr, amount)` reads memory and then
+patches out `0xCC` bytes from any enabled breakpoints in the read region.
+This restores the original instruction bytes, which is essential for
+disassembly — without it, the disassembler would see `int3` instructions
+at every breakpoint location instead of the real code.
+
+The method uses `breakpointSiteCollection.getInRegion(low, high)` to
+find all enabled breakpoints in the address range, then replaces the
+`0xCC` byte with the breakpoint's `savedData` (the original byte).
+
+---
+
+## 14. Disassembly
+
+**Source:** `debugger/disassembler.go`
+
+The disassembler decodes raw machine code from the tracee's memory into
+human-readable assembly text. It uses the pure-Go `golang.org/x/arch/x86/x86asm`
+package — no CGo or external tools required.
+
+### The Disassembler type
+
+```go
+type Disassembler struct {
+    proc *Process  // the traced process to read memory from
+}
+
+type Instruction struct {
+    Address uint64  // virtual address of the instruction
+    Text    string  // human-readable disassembly (AT&T syntax)
+}
+```
+
+### How disassembly works
+
+1. **Read bytes:** Fetch `nInstructions × 15` bytes via
+   `ReadMemoryWithoutTraps`. The factor of 15 comes from x86-64's
+   maximum instruction length — this guarantees enough data to decode the
+   requested number of instructions.
+
+2. **Decode loop:** Call `x86asm.Decode(data, 64)` repeatedly. Each call
+   returns one instruction and its byte length. Advance the offset by
+   the instruction length.
+
+3. **Format:** Convert each decoded instruction to AT&T syntax using
+   `x86asm.GNUSyntax`. This matches the convention used by GDB and
+   objdump on Linux.
+
+4. **Error recovery:** If a byte sequence cannot be decoded, emit a
+   `.byte 0xNN` pseudo-instruction and advance by one byte.
+
+### Auto-disassembly on stop
+
+The REPL's `handleStop` function automatically disassembles 5 instructions
+at the current PC whenever the process stops (after `continue` or `step`).
+This provides immediate context about what instruction the program is about
+to execute — similar to GDB's `display/i $pc` behavior.
+
+---
+
+## 15. Platform Abstraction
 
 **Source:** `debugger/ptrace_unsupported.go`, `debugger/registers_unsupported.go`
 
@@ -793,7 +1115,7 @@ or a container with `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined`.
 
 ---
 
-## 14. Error Handling
+## 16. Error Handling
 
 **Source:** `debugger/error.go`
 
@@ -822,7 +1144,7 @@ All internal error creation goes through `newError(msg)` and
 
 ---
 
-## 15. Testing Strategy
+## 17. Testing Strategy
 
 **Source:** `test/debugger_test.go`, `test/targets/`
 
@@ -857,6 +1179,8 @@ assembly targets with `gcc` into a temporary directory before any tests run.
 | **Assembly register write** | Debugger writes registers; inferior prints them via printf; test verifies output via pipe |
 | **Breakpoint collection** | Create, ID monotonicity, duplicate rejection, list, remove, enable/disable |
 | **Breakpoint end-to-end** | Set BP ahead of PC and verify stop; step instruction; step over breakpoint; continue from breakpoint to exit |
+| **Memory read** | Inferior stores known value, writes address to stdout; debugger reads memory at that address and verifies the value |
+| **Memory write** | Debugger writes a string into inferior's buffer; inferior prints buffer contents; test verifies output |
 
 ### Assembly test targets
 
@@ -871,6 +1195,7 @@ register allocation), so these tests use hand-written x86-64 assembly.
 | `reg_read` | `test/targets/reg_read.s` | No | `-nostdlib -no-pie` | `_start` |
 | `reg_write` | `test/targets/reg_write.s` | Yes | `-no-pie` | `main` |
 | `hello_toydbg` | `test/targets/hello_toydbg.s` | No | `-nostdlib -no-pie` | `_start` |
+| `memory` | `test/targets/memory.s` | No | `-nostdlib -no-pie` | `_start` |
 
 The register targets (`reg_read`, `reg_write`) use the **trap-resume-read
 pattern**: the assembly program executes `int3` (software breakpoint) at
@@ -887,7 +1212,14 @@ which the test captures via `os.Pipe()` passed through `LaunchOptions`.
 instructions — breakpoint tests set breakpoints programmatically via the
 `CreateBreakpointSite` API rather than embedding traps in the code.
 
-`TestMain` builds all three assembly targets with `gcc` alongside the Go
+`memory` uses the same trap-resume-interact pattern to test bulk memory
+operations. It stores a known value (`0xcafecafe`) in a stack variable,
+writes the address to stdout, and traps — the test uses `ReadMemory` to
+verify the value. For the write test, it provides a zeroed buffer, traps,
+and the test writes a string into it via `WriteMemory`; after resuming,
+the inferior prints the buffer contents so the test can verify the write.
+
+`TestMain` builds all four assembly targets with `gcc` alongside the Go
 targets.
 
 ### Process state verification
@@ -904,28 +1236,32 @@ the *kernel* sees the process in the expected state.
 
 ---
 
-## 16. File Reference
+## 18. File Reference
 
 | File | Purpose |
 |------|---------|
-| `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, step, breakpoint, register, help, quit) |
+| `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, step, breakpoint, register, memory, disassemble, help, quit) |
 | `debugger/debugger.go` | Package documentation |
 | `debugger/error.go` | Custom error type and constructors |
 | `debugger/format.go` | `FormatRegisterValue` — display formatting for all register types |
 | `debugger/parse.go` | `ParseRegisterValue` — CLI string → typed value conversion |
 | `debugger/breakpoint_site.go` | BreakpointSite type (enable/disable via PEEKDATA/POKEDATA) and breakpointSiteCollection |
-| `debugger/process.go` | Process lifecycle: Launch, LaunchWithOptions, Attach, Resume, WaitOnSignal, GetPC, SetPC, breakpoint management, StepInstruction, Close |
+| `debugger/process.go` | Process lifecycle: Launch, LaunchWithOptions, Attach, Resume, WaitOnSignal, GetPC, SetPC, breakpoint management, StepInstruction, ReadMemory, WriteMemory, ReadMemoryWithoutTraps, Close |
+| `debugger/memory_linux.go` | Linux `process_vm_readv` wrapper for bulk memory reads |
+| `debugger/memory_unsupported.go` | Non-Linux memory read stub |
+| `debugger/disassembler.go` | Disassembler type: decodes x86-64 instructions via `x86asm` into AT&T syntax |
 | `debugger/ptrace_linux.go` | Linux ptrace syscall wrappers |
 | `debugger/ptrace_unsupported.go` | Non-Linux stubs (return `ENOSYS`) |
 | `debugger/register_info.go` | Register metadata table (125 entries) and lookup functions |
 | `debugger/registers_linux.go` | Register cache: read/write via ptrace |
 | `debugger/registers_unsupported.go` | Non-Linux register stubs |
-| `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests, breakpoint tests) |
+| `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests, breakpoint tests, memory read/write tests) |
 | `test/targets/end_immediately/main.go` | Test target: exits immediately |
 | `test/targets/run_endlessly/main.go` | Test target: infinite loop |
 | `test/targets/reg_read.s` | Assembly test target: sets known register values and traps (no libc) |
 | `test/targets/reg_write.s` | Assembly test target: prints debugger-written register values via printf |
 | `test/targets/hello_toydbg.s` | Assembly test target: write + exit (no libc, non-PIE, used for breakpoint tests) |
+| `test/targets/memory.s` | Assembly test target: stores known values and provides buffers for memory read/write tests |
 | `docs/sequence-diagram.mmd` | Mermaid sequence diagram of the attach-and-REPL lifecycle |
 | `Dockerfile` | Multi-stage build: compile + slim runtime image |
 
@@ -933,8 +1269,7 @@ the *kernel* sees the process in the expected state.
 
 ## Further Reading
 
-- [*Building a Debugger*](https://nostarch.com/building-a-debugger) — the
-  book this project ports from C++ to Go.
+- [*Building a Debugger*](https://nostarch.com/building-a-debugger) — Best book on hands-on debugger construction.
 - [`ptrace(2)` man page](https://man7.org/linux/man-pages/man2/ptrace.2.html) —
   the definitive reference for ptrace operations.
 - [DWARF Debugging Standard](https://dwarfstd.org/) — the debug information

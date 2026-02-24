@@ -83,7 +83,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
 				return
 			}
-			printStopReason(proc, reason)
+			handleStop(proc, reason)
 
 			if reason.Reason == debugger.ProcessExited || reason.Reason == debugger.ProcessTerminated {
 				return
@@ -96,13 +96,17 @@ func main() {
 				fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
 				continue
 			}
-			printStopReason(proc, reason)
+			handleStop(proc, reason)
 
 			if reason.Reason == debugger.ProcessExited || reason.Reason == debugger.ProcessTerminated {
 				return
 			}
 		case "register", "reg":
 			handleRegister(proc, fields[1:])
+		case "memory", "mem":
+			handleMemory(proc, fields[1:])
+		case "disassemble", "disas":
+			handleDisassemble(proc, fields[1:])
 		case "quit", "q", "exit":
 			return
 		default:
@@ -135,9 +139,22 @@ func handleHelp(args []string) {
 			fmt.Println("  breakpoint disable <id>    - disable a breakpoint")
 			fmt.Println("  breakpoint delete <id>     - delete a breakpoint")
 			return
+		case "memory", "mem":
+			fmt.Println("memory subcommands:")
+			fmt.Println("  memory read <address>       - read 32 bytes at address")
+			fmt.Println("  memory read <address> <n>   - read n bytes at address")
+			fmt.Println("  memory write <address> [0xff,0x01,...] - write bytes at address")
+			return
+		case "disassemble", "disas":
+			fmt.Println("disassemble options:")
+			fmt.Println("  disassemble                - disassemble 5 instructions at PC")
+			fmt.Println("  disassemble -c <n>         - disassemble n instructions at PC")
+			fmt.Println("  disassemble -a <address>   - disassemble 5 instructions at address")
+			fmt.Println("  disassemble -c <n> -a <address> - disassemble n instructions at address")
+			return
 		}
 	}
-	fmt.Println("commands: continue (c), step (s), breakpoint (break), register (reg), quit (q), help (h)")
+	fmt.Println("commands: continue (c), step (s), breakpoint (break), register (reg), memory (mem), disassemble (disas), quit (q), help (h)")
 }
 
 func handleBreakpoint(proc *debugger.Process, args []string) {
@@ -350,5 +367,160 @@ func printStopReason(proc *debugger.Process, reason debugger.StopReason) {
 		fmt.Println("process running")
 	default:
 		fmt.Println("process status changed")
+	}
+}
+
+// handleStop prints the stop reason and, when the process is stopped,
+// auto-disassembles a few instructions at the current PC.
+func handleStop(proc *debugger.Process, reason debugger.StopReason) {
+	printStopReason(proc, reason)
+	if reason.Reason == debugger.ProcessStopped {
+		printDisassembly(proc, 5, nil)
+	}
+}
+
+func handleMemory(proc *debugger.Process, args []string) {
+	if len(args) == 0 {
+		fmt.Println("usage: memory <read|write> [args...]")
+		fmt.Println("  type 'help memory' for details")
+		return
+	}
+
+	switch args[0] {
+	case "read":
+		if len(args) < 2 {
+			fmt.Println("usage: memory read <address> [n]")
+			return
+		}
+		addr, err := strconv.ParseUint(strings.TrimPrefix(args[1], "0x"), 16, 64)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: invalid address %q: %v\n", args[1], err)
+			return
+		}
+		amount := 32
+		if len(args) >= 3 {
+			n, err := strconv.Atoi(args[2])
+			if err != nil || n <= 0 {
+				fmt.Fprintf(os.Stderr, "toydbg: invalid byte count %q\n", args[2])
+				return
+			}
+			amount = n
+		}
+		data, err := proc.ReadMemory(addr, amount)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: memory read failed: %v\n", err)
+			return
+		}
+		// Print in rows of 16 bytes.
+		for i := 0; i < len(data); i += 16 {
+			fmt.Printf("  0x%x: ", addr+uint64(i))
+			end := i + 16
+			if end > len(data) {
+				end = len(data)
+			}
+			for j := i; j < end; j++ {
+				fmt.Printf("%02x ", data[j])
+			}
+			fmt.Println()
+		}
+
+	case "write":
+		if len(args) < 3 {
+			fmt.Println("usage: memory write <address> [0xff,0x01,...]")
+			return
+		}
+		addr, err := strconv.ParseUint(strings.TrimPrefix(args[1], "0x"), 16, 64)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: invalid address %q: %v\n", args[1], err)
+			return
+		}
+		data, err := parseByteList(args[2])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
+			return
+		}
+		if err := proc.WriteMemory(addr, data); err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: memory write failed: %v\n", err)
+			return
+		}
+		fmt.Printf("wrote %d bytes at 0x%x\n", len(data), addr)
+
+	default:
+		fmt.Printf("unknown memory subcommand: %q\n", args[0])
+	}
+}
+
+// parseByteList parses a bracket-delimited comma-separated list of hex
+// bytes: "[0xff,0x01,0x02]".
+func parseByteList(s string) ([]byte, error) {
+	s = strings.TrimPrefix(s, "[")
+	s = strings.TrimSuffix(s, "]")
+	parts := strings.Split(s, ",")
+	var result []byte
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		val, err := strconv.ParseUint(strings.TrimPrefix(p, "0x"), 16, 8)
+		if err != nil {
+			return nil, fmt.Errorf("invalid byte %q: %v", p, err)
+		}
+		result = append(result, byte(val))
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("empty byte list")
+	}
+	return result, nil
+}
+
+func handleDisassemble(proc *debugger.Process, args []string) {
+	count := 5
+	var addr *uint64
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-c":
+			if i+1 >= len(args) {
+				fmt.Println("usage: disassemble [-c count] [-a address]")
+				return
+			}
+			i++
+			n, err := strconv.Atoi(args[i])
+			if err != nil || n <= 0 {
+				fmt.Fprintf(os.Stderr, "toydbg: invalid count %q\n", args[i])
+				return
+			}
+			count = n
+		case "-a":
+			if i+1 >= len(args) {
+				fmt.Println("usage: disassemble [-c count] [-a address]")
+				return
+			}
+			i++
+			a, err := strconv.ParseUint(strings.TrimPrefix(args[i], "0x"), 16, 64)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "toydbg: invalid address %q: %v\n", args[i], err)
+				return
+			}
+			addr = &a
+		default:
+			fmt.Fprintf(os.Stderr, "toydbg: unknown disassemble flag %q\n", args[i])
+			return
+		}
+	}
+
+	printDisassembly(proc, count, addr)
+}
+
+func printDisassembly(proc *debugger.Process, count int, addr *uint64) {
+	disasm := debugger.NewDisassembler(proc)
+	instructions, err := disasm.Disassemble(count, addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "toydbg: disassemble failed: %v\n", err)
+		return
+	}
+	for _, inst := range instructions {
+		fmt.Printf("  0x%x: %s\n", inst.Address, inst.Text)
 	}
 }

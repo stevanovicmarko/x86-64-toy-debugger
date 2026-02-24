@@ -43,7 +43,7 @@ podman run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
 
 ## Architecture
 
-This is a Go port of a C++ x86-64 debugger from the book *Building a Debugger* by No Starch Press. The debugger can launch or attach to processes via ptrace and provides an interactive REPL with commands for continuing execution, reading/writing registers, and more.
+This is a Go project, inspired by the C++ project *Building a Debugger* by No Starch Press. The debugger can launch or attach to processes via ptrace and provides an interactive REPL with commands for continuing execution, reading/writing registers, and more.
 
 **Package layout:**
 

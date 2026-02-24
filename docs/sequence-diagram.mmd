@@ -132,3 +132,41 @@ sequenceDiagram
     D->>K: PtraceGetRegs / GETFPREGS / PeekUser
     K-->>D: register values
     D->>U: print "process stopped by signal 5 at 0x401007"
+    Note over D: Auto-disassemble at PC (see Phase 7)
+
+    Note over D,T: ── Phase 6: Memory commands ──
+    U-->>D: types "memory read 0x401000"
+    D->>K: process_vm_readv(pid, 0x401000, 32)
+    K-->>D: returns 32 bytes of tracee memory
+    D->>U: print hex dump (rows of 16 bytes)
+
+    U-->>D: types "memory read 0x401000 64"
+    D->>K: process_vm_readv(pid, 0x401000, 64)
+    K-->>D: returns 64 bytes
+    D->>U: print hex dump
+
+    U-->>D: types "memory write 0x7ffd1234 [0x48,0x65,0x6c]"
+    Note over D: Parse byte list → [0x48, 0x65, 0x6c]
+    D->>K: PTRACE_PEEKDATA(pid, aligned_addr) — read-modify-write
+    K-->>D: returns existing word
+    D->>K: PTRACE_POKEDATA(pid, aligned_addr, modified_word)
+    K-->>D: success
+    D->>U: print "wrote 3 bytes at 0x7ffd1234"
+
+    Note over D,T: ── Phase 7: Disassemble command ──
+    U-->>D: types "disassemble"
+    Note over D: Default: 5 instructions at current PC
+    D->>K: process_vm_readv(pid, PC, 75) — read 5×15 bytes
+    K-->>D: returns raw bytes
+    Note over D: Patch out 0xCC from enabled breakpoints
+    Note over D: Decode instructions with x86asm.Decode (64-bit mode)
+    Note over D: Format each with GNUSyntax (AT&T syntax)
+    D->>U: print "  0x401000: movq $0x1,%rax"
+    D->>U: print "  0x401007: movq $0x1,%rdi"
+    D->>U: print "  ..."
+
+    U-->>D: types "disassemble -c 10 -a 0x401000"
+    D->>K: process_vm_readv(pid, 0x401000, 150)
+    K-->>D: returns raw bytes
+    Note over D: Decode 10 instructions
+    D->>U: print 10 disassembled instructions
