@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"os/exec"
@@ -47,24 +48,26 @@ func TestMain(m *testing.M) {
 		}
 	}
 
-	// Build assembly test targets with gcc.
-	asmTargets := []struct {
+	// Build native test targets (assembly and C) with gcc.
+	gccTargets := []struct {
 		name  string
+		src   string
 		flags []string
 	}{
-		{"reg_read", []string{"-nostdlib", "-no-pie"}},
-		{"reg_write", []string{"-no-pie"}},
-		{"hello_toydbg", []string{"-nostdlib", "-no-pie"}},
-		{"memory", []string{"-nostdlib", "-no-pie"}},
+		{"reg_read", "reg_read.s", []string{"-nostdlib", "-no-pie"}},
+		{"reg_write", "reg_write.s", []string{"-no-pie"}},
+		{"hello_toydbg", "hello_toydbg.s", []string{"-nostdlib", "-no-pie"}},
+		{"memory", "memory.s", []string{"-nostdlib", "-no-pie"}},
+		{"anti_debugger", "anti_debugger.c", []string{"-no-pie"}},
 	}
-	for _, t := range asmTargets {
-		src := filepath.Join("targets", t.name+".s")
+	for _, t := range gccTargets {
+		src := filepath.Join("targets", t.src)
 		out := filepath.Join(targetDir, t.name)
 		args := append([]string{"-o", out, src}, t.flags...)
 		cmd := exec.Command("gcc", args...)
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
-			fmt.Fprintf(os.Stderr, "build asm target %s: %v\n", t.name, err)
+			fmt.Fprintf(os.Stderr, "build gcc target %s: %v\n", t.name, err)
 			os.Exit(1)
 		}
 	}
@@ -807,7 +810,7 @@ func TestCreateBreakpointSite(t *testing.T) {
 		t.Fatalf("GetPC failed: %v", err)
 	}
 
-	site, err := proc.CreateBreakpointSite(pc)
+	site, err := proc.CreateBreakpointSite(pc, false, false)
 	if err != nil {
 		t.Fatalf("CreateBreakpointSite failed: %v", err)
 	}
@@ -834,11 +837,11 @@ func TestBreakpointSiteIDsIncrease(t *testing.T) {
 		t.Fatalf("GetPC failed: %v", err)
 	}
 
-	s1, err := proc.CreateBreakpointSite(pc)
+	s1, err := proc.CreateBreakpointSite(pc, false, false)
 	if err != nil {
 		t.Fatalf("CreateBreakpointSite(1) failed: %v", err)
 	}
-	s2, err := proc.CreateBreakpointSite(pc + 100)
+	s2, err := proc.CreateBreakpointSite(pc+100, false, false)
 	if err != nil {
 		t.Fatalf("CreateBreakpointSite(2) failed: %v", err)
 	}
@@ -859,10 +862,10 @@ func TestBreakpointSiteDuplicateAddress(t *testing.T) {
 		t.Fatalf("GetPC failed: %v", err)
 	}
 
-	if _, err := proc.CreateBreakpointSite(pc); err != nil {
+	if _, err := proc.CreateBreakpointSite(pc, false, false); err != nil {
 		t.Fatalf("first CreateBreakpointSite failed: %v", err)
 	}
-	_, err = proc.CreateBreakpointSite(pc)
+	_, err = proc.CreateBreakpointSite(pc, false, false)
 	if err == nil {
 		t.Fatal("expected error for duplicate address")
 	}
@@ -883,8 +886,8 @@ func TestBreakpointSiteList(t *testing.T) {
 		t.Fatalf("GetPC failed: %v", err)
 	}
 
-	proc.CreateBreakpointSite(pc)
-	proc.CreateBreakpointSite(pc + 100)
+	proc.CreateBreakpointSite(pc, false, false)
+	proc.CreateBreakpointSite(pc+100, false, false)
 
 	sites := proc.BreakpointSites()
 	if len(sites) != 2 {
@@ -904,7 +907,7 @@ func TestBreakpointSiteRemove(t *testing.T) {
 		t.Fatalf("GetPC failed: %v", err)
 	}
 
-	site, _ := proc.CreateBreakpointSite(pc)
+	site, _ := proc.CreateBreakpointSite(pc, false, false)
 	if err := proc.RemoveBreakpointSite(site.ID()); err != nil {
 		t.Fatalf("RemoveBreakpointSite failed: %v", err)
 	}
@@ -925,7 +928,7 @@ func TestBreakpointSiteEnableDisable(t *testing.T) {
 		t.Fatalf("GetPC failed: %v", err)
 	}
 
-	site, _ := proc.CreateBreakpointSite(pc)
+	site, _ := proc.CreateBreakpointSite(pc, false, false)
 
 	if err := site.Enable(); err != nil {
 		t.Fatalf("Enable failed: %v", err)
@@ -973,7 +976,7 @@ func TestBreakpointStopsExecution(t *testing.T) {
 		t.Fatalf("SetPC back failed: %v", err)
 	}
 
-	site, err := proc.CreateBreakpointSite(secondPC)
+	site, err := proc.CreateBreakpointSite(secondPC, false, false)
 	if err != nil {
 		t.Fatalf("CreateBreakpointSite failed: %v", err)
 	}
@@ -1043,7 +1046,7 @@ func TestStepOverBreakpoint(t *testing.T) {
 	pc, _ := proc.GetPC()
 
 	// Set a breakpoint at the current PC.
-	site, err := proc.CreateBreakpointSite(pc)
+	site, err := proc.CreateBreakpointSite(pc, false, false)
 	if err != nil {
 		t.Fatalf("CreateBreakpointSite failed: %v", err)
 	}
@@ -1087,7 +1090,7 @@ func TestContinueFromBreakpoint(t *testing.T) {
 
 	// Reset to start over. Set PC to entry and create BP.
 	// Actually, let's just launch fresh approach: set BP at current PC.
-	site, err := proc.CreateBreakpointSite(bpAddr)
+	site, err := proc.CreateBreakpointSite(bpAddr, false, false)
 	if err != nil {
 		t.Fatalf("CreateBreakpointSite failed: %v", err)
 	}
@@ -1291,5 +1294,236 @@ func TestRegisterWriteToInferior(t *testing.T) {
 	}
 	if reason.Reason != debugger.ProcessExited {
 		t.Errorf("expected process to exit, got state %d", reason.Reason)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Hardware breakpoint tests
+// ---------------------------------------------------------------------------
+
+// TestHardwareBreakpointEvadesChecksum verifies that a hardware breakpoint
+// at a function address does not alter the function's bytes, allowing the
+// anti-debugger checksum to pass. A software breakpoint at the same address
+// would inject 0xCC and be detected.
+func TestHardwareBreakpointEvadesChecksum(t *testing.T) {
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe failed: %v", err)
+	}
+	defer pr.Close()
+
+	proc, err := debugger.LaunchWithOptions(targetPath("anti_debugger"),
+		debugger.LaunchOptions{Stdout: pw})
+	if err != nil {
+		pw.Close()
+		t.Fatalf("LaunchWithOptions failed: %v", err)
+	}
+	defer proc.Close()
+	pw.Close()
+
+	// Resume to trap 1 — the inferior has written the function address
+	// and computed the clean checksum.
+	resumeAndWait(t, proc)
+
+	// Read the 8-byte function address from the pipe.
+	addrBuf := make([]byte, 8)
+	if _, err := io.ReadFull(pr, addrBuf); err != nil {
+		t.Fatalf("read function address from pipe: %v", err)
+	}
+	funcAddr := binary.LittleEndian.Uint64(addrBuf)
+	t.Logf("an_innocent_function at 0x%x", funcAddr)
+
+	// ── Round 1: software breakpoint → should be detected ────────
+	site, err := proc.CreateBreakpointSite(funcAddr, false, false)
+	if err != nil {
+		t.Fatalf("CreateBreakpointSite (software) failed: %v", err)
+	}
+	if err := site.Enable(); err != nil {
+		t.Fatalf("Enable software BP failed: %v", err)
+	}
+
+	// Resume — the inferior checksums the function, detects the 0xCC,
+	// prints "pepperoni", and traps again.
+	resumeAndWait(t, proc)
+
+	out := make([]byte, 256)
+	n, _ := pr.Read(out)
+	output := string(out[:n])
+	if !strings.Contains(output, "pepperoni") {
+		t.Errorf("expected 'pepperoni' (detected tampering), got %q", output)
+	}
+
+	// Delete the software breakpoint.
+	if err := proc.RemoveBreakpointSite(site.ID()); err != nil {
+		t.Fatalf("RemoveBreakpointSite failed: %v", err)
+	}
+
+	// ── Round 2: hardware breakpoint → should be invisible ───────
+	hwSite, err := proc.CreateBreakpointSite(funcAddr, true, false)
+	if err != nil {
+		t.Fatalf("CreateBreakpointSite (hardware) failed: %v", err)
+	}
+	if err := hwSite.Enable(); err != nil {
+		t.Fatalf("Enable hardware BP failed: %v", err)
+	}
+
+	// Resume — the checksum matches, the inferior calls the function,
+	// which triggers the hardware breakpoint.
+	resumeAndWait(t, proc)
+
+	pc, _ := proc.GetPC()
+	if pc != funcAddr {
+		t.Errorf("hardware BP hit at 0x%x, want 0x%x", pc, funcAddr)
+	}
+
+	// Disable the hardware breakpoint and continue through the function.
+	if err := hwSite.Disable(); err != nil {
+		t.Fatalf("Disable hardware BP failed: %v", err)
+	}
+
+	// Resume — the function runs, prints "pineapple", and hits the
+	// final int3.
+	resumeAndWait(t, proc)
+
+	out2 := make([]byte, 256)
+	n2, _ := pr.Read(out2)
+	output2 := string(out2[:n2])
+	if !strings.Contains(output2, "pineapple") {
+		t.Errorf("expected 'pineapple' (no tampering), got %q", output2)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Watchpoint tests
+// ---------------------------------------------------------------------------
+
+// TestWatchpointDetectsWrite verifies that a write watchpoint triggers
+// when the tracee writes to the watched address.
+func TestWatchpointDetectsWrite(t *testing.T) {
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe failed: %v", err)
+	}
+	defer pr.Close()
+
+	proc, err := debugger.LaunchWithOptions(targetPath("memory"),
+		debugger.LaunchOptions{Stdout: pw})
+	if err != nil {
+		pw.Close()
+		t.Fatalf("LaunchWithOptions failed: %v", err)
+	}
+	defer proc.Close()
+	pw.Close()
+
+	// Resume to trap 1 — the inferior has stored 0xcafecafe and written
+	// its address to stdout.
+	resumeAndWait(t, proc)
+
+	// Read the address from the pipe.
+	addrBuf := make([]byte, 8)
+	if _, err := io.ReadFull(pr, addrBuf); err != nil {
+		t.Fatalf("read address from pipe: %v", err)
+	}
+	watchAddr := binary.LittleEndian.Uint64(addrBuf)
+	t.Logf("watching address 0x%x", watchAddr)
+
+	// The inferior will next zero this region (the 32-byte buffer
+	// at a different address). Let's continue to trap 2 first.
+	resumeAndWait(t, proc)
+
+	// Drain the second address.
+	drain := make([]byte, 8)
+	pr.Read(drain)
+	bufAddr := binary.LittleEndian.Uint64(drain)
+	t.Logf("buffer address 0x%x", bufAddr)
+
+	// Set a write watchpoint on the buffer address (8-byte aligned).
+	// The buffer is at rsp+0, which should be 8-byte aligned.
+	wp, err := proc.CreateWatchpoint(bufAddr, debugger.StoppointModeWrite, 8)
+	if err != nil {
+		t.Fatalf("CreateWatchpoint failed: %v", err)
+	}
+	if wp.ID() <= 0 {
+		t.Errorf("expected positive watchpoint ID, got %d", wp.ID())
+	}
+	if !wp.IsEnabled() {
+		t.Error("watchpoint should be enabled after creation")
+	}
+
+	// Write some data to the buffer so the inferior has something to print.
+	msg := []byte("Hello, toydbg!")
+	if err := proc.WriteMemory(bufAddr, msg); err != nil {
+		t.Fatalf("WriteMemory failed: %v", err)
+	}
+
+	// Clean up watchpoint before resuming (the inferior is about to
+	// write to stdout which may touch this memory area).
+	if err := proc.RemoveWatchpoint(wp.ID()); err != nil {
+		t.Fatalf("RemoveWatchpoint failed: %v", err)
+	}
+
+	// Resume — the inferior prints the buffer and exits.
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume failed: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal failed: %v", err)
+	}
+	if reason.Reason != debugger.ProcessExited {
+		t.Fatalf("expected process to exit, got state %d", reason.Reason)
+	}
+}
+
+// TestWatchpointAlignment verifies that unaligned watchpoint addresses
+// are rejected.
+func TestWatchpointAlignment(t *testing.T) {
+	proc, err := debugger.Launch(targetPath("run_endlessly"))
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	defer proc.Close()
+
+	// Address 0x1001 is not 4-byte aligned.
+	_, err = proc.CreateWatchpoint(0x1001, debugger.StoppointModeWrite, 4)
+	if err == nil {
+		t.Fatal("expected error for unaligned watchpoint address")
+	}
+	if !isDebuggerError(err) {
+		t.Fatalf("expected *debugger.Error, got %T: %v", err, err)
+	}
+}
+
+// TestWatchpointListAndRemove verifies the watchpoint CRUD operations.
+func TestWatchpointListAndRemove(t *testing.T) {
+	proc, err := debugger.Launch(targetPath("run_endlessly"))
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	defer proc.Close()
+
+	wp, err := proc.CreateWatchpoint(0x1000, debugger.StoppointModeWrite, 8)
+	if err != nil {
+		t.Fatalf("CreateWatchpoint failed: %v", err)
+	}
+
+	wps := proc.Watchpoints()
+	if len(wps) != 1 {
+		t.Fatalf("expected 1 watchpoint, got %d", len(wps))
+	}
+
+	found, ok := proc.WatchpointByID(wp.ID())
+	if !ok {
+		t.Fatal("WatchpointByID returned false")
+	}
+	if found.Address() != 0x1000 {
+		t.Errorf("address = 0x%x, want 0x1000", found.Address())
+	}
+
+	if err := proc.RemoveWatchpoint(wp.ID()); err != nil {
+		t.Fatalf("RemoveWatchpoint failed: %v", err)
+	}
+	if len(proc.Watchpoints()) != 0 {
+		t.Error("expected empty watchpoint list after remove")
 	}
 }

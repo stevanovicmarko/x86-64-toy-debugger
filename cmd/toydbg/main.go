@@ -105,6 +105,8 @@ func main() {
 			handleRegister(proc, fields[1:])
 		case "memory", "mem":
 			handleMemory(proc, fields[1:])
+		case "watchpoint", "watch":
+			handleWatchpoint(proc, fields[1:])
 		case "disassemble", "disas":
 			handleDisassemble(proc, fields[1:])
 		case "quit", "q", "exit":
@@ -133,11 +135,22 @@ func handleHelp(args []string) {
 			return
 		case "breakpoint", "break":
 			fmt.Println("breakpoint subcommands:")
-			fmt.Println("  breakpoint set <hex-addr>  - set a breakpoint at address")
-			fmt.Println("  breakpoint list            - list all breakpoints")
-			fmt.Println("  breakpoint enable <id>     - enable a breakpoint")
-			fmt.Println("  breakpoint disable <id>    - disable a breakpoint")
-			fmt.Println("  breakpoint delete <id>     - delete a breakpoint")
+			fmt.Println("  breakpoint set <hex-addr>      - set a software breakpoint")
+			fmt.Println("  breakpoint set -h <hex-addr>   - set a hardware breakpoint")
+			fmt.Println("  breakpoint list                - list all breakpoints")
+			fmt.Println("  breakpoint enable <id>         - enable a breakpoint")
+			fmt.Println("  breakpoint disable <id>        - disable a breakpoint")
+			fmt.Println("  breakpoint delete <id>         - delete a breakpoint")
+			return
+		case "watchpoint", "watch":
+			fmt.Println("watchpoint subcommands:")
+			fmt.Println("  watchpoint set <hex-addr> <mode> <size>  - set a watchpoint")
+			fmt.Println("    modes: write, rw (read-write)")
+			fmt.Println("    sizes: 1, 2, 4, 8")
+			fmt.Println("  watchpoint list                          - list all watchpoints")
+			fmt.Println("  watchpoint enable <id>                   - enable a watchpoint")
+			fmt.Println("  watchpoint disable <id>                  - disable a watchpoint")
+			fmt.Println("  watchpoint delete <id>                   - delete a watchpoint")
 			return
 		case "memory", "mem":
 			fmt.Println("memory subcommands:")
@@ -154,7 +167,7 @@ func handleHelp(args []string) {
 			return
 		}
 	}
-	fmt.Println("commands: continue (c), step (s), breakpoint (break), register (reg), memory (mem), disassemble (disas), quit (q), help (h)")
+	fmt.Println("commands: continue (c), step (s), breakpoint (break), watchpoint (watch), register (reg), memory (mem), disassemble (disas), quit (q), help (h)")
 }
 
 func handleBreakpoint(proc *debugger.Process, args []string) {
@@ -166,16 +179,22 @@ func handleBreakpoint(proc *debugger.Process, args []string) {
 
 	switch args[0] {
 	case "set":
-		if len(args) < 2 {
-			fmt.Println("usage: breakpoint set <hex-addr>")
+		hardware := false
+		addrArgs := args[1:]
+		if len(addrArgs) > 0 && addrArgs[0] == "-h" {
+			hardware = true
+			addrArgs = addrArgs[1:]
+		}
+		if len(addrArgs) < 1 {
+			fmt.Println("usage: breakpoint set [-h] <hex-addr>")
 			return
 		}
-		addr, err := strconv.ParseUint(strings.TrimPrefix(args[1], "0x"), 16, 64)
+		addr, err := strconv.ParseUint(strings.TrimPrefix(addrArgs[0], "0x"), 16, 64)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "toydbg: invalid address %q: %v\n", args[1], err)
+			fmt.Fprintf(os.Stderr, "toydbg: invalid address %q: %v\n", addrArgs[0], err)
 			return
 		}
-		site, err := proc.CreateBreakpointSite(addr)
+		site, err := proc.CreateBreakpointSite(addr, hardware, false)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
 			return
@@ -184,7 +203,11 @@ func handleBreakpoint(proc *debugger.Process, args []string) {
 			fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
 			return
 		}
-		fmt.Printf("breakpoint %d set at 0x%x\n", site.ID(), site.Address())
+		kind := "software"
+		if hardware {
+			kind = "hardware"
+		}
+		fmt.Printf("%s breakpoint %d set at 0x%x\n", kind, site.ID(), site.Address())
 
 	case "list":
 		sites := proc.BreakpointSites()
@@ -197,7 +220,11 @@ func handleBreakpoint(proc *debugger.Process, args []string) {
 			if s.IsEnabled() {
 				status = "enabled"
 			}
-			fmt.Printf("  %d: 0x%x (%s)\n", s.ID(), s.Address(), status)
+			kind := "sw"
+			if s.IsHardware() {
+				kind = "hw"
+			}
+			fmt.Printf("  %d: 0x%x [%s] (%s)\n", s.ID(), s.Address(), kind, status)
 		}
 
 	case "enable":
@@ -260,6 +287,129 @@ func handleBreakpoint(proc *debugger.Process, args []string) {
 
 	default:
 		fmt.Printf("unknown breakpoint subcommand: %q\n", args[0])
+	}
+}
+
+func handleWatchpoint(proc *debugger.Process, args []string) {
+	if len(args) == 0 {
+		fmt.Println("usage: watchpoint <set|list|enable|disable|delete> [args...]")
+		fmt.Println("  type 'help watchpoint' for details")
+		return
+	}
+
+	switch args[0] {
+	case "set":
+		if len(args) < 4 {
+			fmt.Println("usage: watchpoint set <hex-addr> <write|rw> <1|2|4|8>")
+			return
+		}
+		addr, err := strconv.ParseUint(strings.TrimPrefix(args[1], "0x"), 16, 64)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: invalid address %q: %v\n", args[1], err)
+			return
+		}
+		var mode debugger.StoppointMode
+		switch args[2] {
+		case "write", "w":
+			mode = debugger.StoppointModeWrite
+		case "rw", "readwrite":
+			mode = debugger.StoppointModeReadWrite
+		default:
+			fmt.Fprintf(os.Stderr, "toydbg: invalid mode %q (use 'write' or 'rw')\n", args[2])
+			return
+		}
+		size, err := strconv.Atoi(args[3])
+		if err != nil || (size != 1 && size != 2 && size != 4 && size != 8) {
+			fmt.Fprintf(os.Stderr, "toydbg: invalid size %q (must be 1, 2, 4, or 8)\n", args[3])
+			return
+		}
+		wp, err := proc.CreateWatchpoint(addr, mode, size)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
+			return
+		}
+		fmt.Printf("watchpoint %d set at 0x%x (mode=%s, size=%d)\n",
+			wp.ID(), wp.Address(), args[2], wp.Size())
+
+	case "list":
+		wps := proc.Watchpoints()
+		if len(wps) == 0 {
+			fmt.Println("no watchpoints")
+			return
+		}
+		for _, wp := range wps {
+			status := "disabled"
+			if wp.IsEnabled() {
+				status = "enabled"
+			}
+			modeStr := "write"
+			if wp.Mode() == debugger.StoppointModeReadWrite {
+				modeStr = "rw"
+			}
+			fmt.Printf("  %d: 0x%x (mode=%s, size=%d, %s)\n",
+				wp.ID(), wp.Address(), modeStr, wp.Size(), status)
+		}
+
+	case "enable":
+		if len(args) < 2 {
+			fmt.Println("usage: watchpoint enable <id>")
+			return
+		}
+		id, err := strconv.ParseInt(args[1], 10, 32)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: invalid ID %q: %v\n", args[1], err)
+			return
+		}
+		wp, ok := proc.WatchpointByID(int32(id))
+		if !ok {
+			fmt.Fprintf(os.Stderr, "toydbg: watchpoint %d not found\n", id)
+			return
+		}
+		if err := wp.Enable(); err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
+			return
+		}
+		fmt.Printf("watchpoint %d enabled\n", id)
+
+	case "disable":
+		if len(args) < 2 {
+			fmt.Println("usage: watchpoint disable <id>")
+			return
+		}
+		id, err := strconv.ParseInt(args[1], 10, 32)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: invalid ID %q: %v\n", args[1], err)
+			return
+		}
+		wp, ok := proc.WatchpointByID(int32(id))
+		if !ok {
+			fmt.Fprintf(os.Stderr, "toydbg: watchpoint %d not found\n", id)
+			return
+		}
+		if err := wp.Disable(); err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
+			return
+		}
+		fmt.Printf("watchpoint %d disabled\n", id)
+
+	case "delete":
+		if len(args) < 2 {
+			fmt.Println("usage: watchpoint delete <id>")
+			return
+		}
+		id, err := strconv.ParseInt(args[1], 10, 32)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: invalid ID %q: %v\n", args[1], err)
+			return
+		}
+		if err := proc.RemoveWatchpoint(int32(id)); err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
+			return
+		}
+		fmt.Printf("watchpoint %d deleted\n", id)
+
+	default:
+		fmt.Printf("unknown watchpoint subcommand: %q\n", args[0])
 	}
 }
 

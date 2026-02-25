@@ -5,15 +5,24 @@ import "sync/atomic"
 // breakpointIDCounter is the global counter for assigning unique IDs.
 var breakpointIDCounter int32
 
-// BreakpointSite represents a software breakpoint at a specific address.
-// It stores the original byte that was overwritten by the int3 (0xCC)
-// instruction so it can be restored when the breakpoint is disabled.
+// BreakpointSite represents a breakpoint at a specific address.
+//
+// Software breakpoints work by overwriting the first byte of an instruction
+// with 0xCC (int3). The original byte is saved so it can be restored.
+//
+// Hardware breakpoints use x86-64 debug registers (DR0–DR3) and are
+// invisible to the tracee's memory — making them undetectable by
+// anti-debugging code that checksums its own instructions.
 type BreakpointSite struct {
-	id        int32
-	pid       int
-	address   uint64
-	isEnabled bool
-	savedData byte
+	id                    int32
+	pid                   int
+	proc                  *Process
+	address               uint64
+	isEnabled             bool
+	savedData             byte
+	isHardware            bool
+	isInternal            bool
+	hardwareRegisterIndex int
 }
 
 // ID returns the unique identifier for this breakpoint site.
@@ -31,6 +40,19 @@ func (b *BreakpointSite) IsEnabled() bool {
 	return b.isEnabled
 }
 
+// IsHardware returns true if this breakpoint uses a debug register
+// instead of int3 injection.
+func (b *BreakpointSite) IsHardware() bool {
+	return b.isHardware
+}
+
+// IsInternal returns true if this breakpoint was created internally
+// by the debugger (e.g., for step-over logic) and should be hidden
+// from the user.
+func (b *BreakpointSite) IsInternal() bool {
+	return b.isInternal
+}
+
 // AtAddress reports whether this breakpoint is at the given address.
 func (b *BreakpointSite) AtAddress(addr uint64) bool {
 	return b.address == addr
@@ -42,10 +64,21 @@ func (b *BreakpointSite) InRange(low, high uint64) bool {
 	return b.address >= low && b.address < high
 }
 
-// Enable activates the breakpoint by overwriting the first byte of the
-// instruction at the breakpoint address with 0xCC (int3). The original
-// byte is saved so it can be restored by Disable.
+// Enable activates the breakpoint. For software breakpoints, this
+// overwrites the first byte at the address with 0xCC (int3). For
+// hardware breakpoints, this programs a debug register via
+// Process.SetHardwareBreakpoint.
 func (b *BreakpointSite) Enable() error {
+	if b.isHardware {
+		idx, err := b.proc.SetHardwareBreakpoint(b.address)
+		if err != nil {
+			return err
+		}
+		b.hardwareRegisterIndex = idx
+		b.isEnabled = true
+		return nil
+	}
+
 	data, err := ptracePeekData(b.pid, b.address)
 	if err != nil {
 		return newErrorf("breakpoint enable: peek failed at 0x%x: %v", b.address, err)
@@ -59,9 +92,18 @@ func (b *BreakpointSite) Enable() error {
 	return nil
 }
 
-// Disable deactivates the breakpoint by restoring the original byte that
-// was overwritten by Enable.
+// Disable deactivates the breakpoint. For software breakpoints, this
+// restores the original byte. For hardware breakpoints, this clears
+// the debug register.
 func (b *BreakpointSite) Disable() error {
+	if b.isHardware {
+		if err := b.proc.ClearHardwareStoppoint(b.hardwareRegisterIndex); err != nil {
+			return err
+		}
+		b.isEnabled = false
+		return nil
+	}
+
 	data, err := ptracePeekData(b.pid, b.address)
 	if err != nil {
 		return newErrorf("breakpoint disable: peek failed at 0x%x: %v", b.address, err)
@@ -110,6 +152,18 @@ func (c *breakpointSiteCollection) enabledAtAddress(addr uint64) *BreakpointSite
 	return nil
 }
 
+// enabledSoftwareAtAddress returns the enabled *software* breakpoint at
+// the given address, or nil. Hardware breakpoints are excluded because
+// they don't inject 0xCC and require different PC adjustment logic.
+func (c *breakpointSiteCollection) enabledSoftwareAtAddress(addr uint64) *BreakpointSite {
+	for _, s := range c.sites {
+		if s.address == addr && s.isEnabled && !s.isHardware {
+			return s
+		}
+	}
+	return nil
+}
+
 func (c *breakpointSiteCollection) getByID(id int32) (*BreakpointSite, bool) {
 	for _, s := range c.sites {
 		if s.id == id {
@@ -148,12 +202,13 @@ func (c *breakpointSiteCollection) removeByAddress(addr uint64) bool {
 	return false
 }
 
-// getInRegion returns all enabled breakpoint sites whose address falls
-// within [low, high).
+// getInRegion returns all enabled *software* breakpoint sites whose
+// address falls within [low, high). Hardware breakpoints are excluded
+// because they don't modify the tracee's memory.
 func (c *breakpointSiteCollection) getInRegion(low, high uint64) []*BreakpointSite {
 	var result []*BreakpointSite
 	for _, s := range c.sites {
-		if s.isEnabled && s.InRange(low, high) {
+		if s.isEnabled && !s.isHardware && s.InRange(low, high) {
 			result = append(result, s)
 		}
 	}

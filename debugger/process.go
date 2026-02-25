@@ -56,6 +56,7 @@ type Process struct {
 	state           ProcessState
 	regs            *Registers
 	breakpointSites breakpointSiteCollection
+	watchpoints     watchpointCollection
 }
 
 // Launch starts a new process under ptrace and returns a Process that
@@ -222,23 +223,44 @@ func (p *Process) SetPC(addr uint64) error {
 // CreateBreakpointSite creates a new (disabled) breakpoint site at the given
 // address. The caller must call Enable() on the returned site to activate it.
 // Returns an error if a breakpoint already exists at the address.
-func (p *Process) CreateBreakpointSite(addr uint64) (*BreakpointSite, error) {
+//
+// If hardware is true, the breakpoint will use a debug register (DR0–DR3)
+// instead of int3 injection. Hardware breakpoints are invisible to the
+// tracee's memory.
+//
+// If internal is true, the breakpoint is assigned ID -1 and is hidden from
+// user-facing listings. Internal breakpoints are used by the debugger itself
+// (e.g., for step-over logic).
+func (p *Process) CreateBreakpointSite(addr uint64, hardware, internal bool) (*BreakpointSite, error) {
 	if p.breakpointSites.containsAddress(addr) {
 		return nil, newErrorf("breakpoint already exists at 0x%x", addr)
 	}
+	id := nextBreakpointID()
+	if internal {
+		id = -1
+	}
 	site := &BreakpointSite{
-		id:      nextBreakpointID(),
-		pid:     p.pid,
-		address: addr,
+		id:                    id,
+		pid:                   p.pid,
+		proc:                  p,
+		address:               addr,
+		isHardware:            hardware,
+		isInternal:            internal,
+		hardwareRegisterIndex: -1,
 	}
 	p.breakpointSites.push(site)
 	return site, nil
 }
 
-// BreakpointSites returns a snapshot of all breakpoint sites.
+// BreakpointSites returns a snapshot of all user-visible breakpoint sites.
+// Internal breakpoints (used by the debugger itself) are excluded.
 func (p *Process) BreakpointSites() []*BreakpointSite {
-	result := make([]*BreakpointSite, p.breakpointSites.size())
-	copy(result, p.breakpointSites.sites)
+	var result []*BreakpointSite
+	for _, s := range p.breakpointSites.sites {
+		if !s.isInternal {
+			result = append(result, s)
+		}
+	}
 	return result
 }
 
@@ -370,12 +392,14 @@ func (p *Process) WaitOnSignal() (StopReason, error) {
 			return reason, err
 		}
 
-		// If we stopped due to SIGTRAP and there is an enabled breakpoint
-		// at PC-1, adjust the PC back to the breakpoint address.
+		// If we stopped due to SIGTRAP and there is an enabled *software*
+		// breakpoint at PC-1, adjust the PC back to the breakpoint address.
+		// Hardware breakpoints stop AT the instruction (PC is already
+		// correct), so we only adjust for software breakpoints.
 		if reason.Info == uint8(syscall.SIGTRAP) {
 			pc, err := p.GetPC()
 			if err == nil {
-				if site := p.breakpointSites.enabledAtAddress(pc - 1); site != nil {
+				if site := p.breakpointSites.enabledSoftwareAtAddress(pc - 1); site != nil {
 					if err := p.SetPC(pc - 1); err != nil {
 						return reason, err
 					}
@@ -457,6 +481,207 @@ func (p *Process) ReadMemoryWithoutTraps(addr uint64, amount int) ([]byte, error
 		data[idx] = site.savedData
 	}
 	return data, nil
+}
+
+// ---------------------------------------------------------------------------
+// Hardware stoppoints (debug registers)
+// ---------------------------------------------------------------------------
+
+// SetHardwareBreakpoint programs a free debug register to break on
+// instruction execution at addr. It returns the debug register index
+// (0–3) used, or an error if all slots are occupied.
+func (p *Process) SetHardwareBreakpoint(addr uint64) (int, error) {
+	return p.setHardwareStoppoint(addr, StoppointModeExecute, 1)
+}
+
+// ClearHardwareStoppoint clears the debug register at the given index
+// (0–3) and disables its DR7 enable/condition bits.
+func (p *Process) ClearHardwareStoppoint(index int) error {
+	if index < 0 || index > 3 {
+		return newErrorf("invalid debug register index %d", index)
+	}
+
+	// Read current DR7.
+	dr7Info, _ := RegisterInfoByName("dr7")
+	control := p.regs.Read(dr7Info).(uint64)
+
+	// Clear the local enable bit for this register (bit 2*index).
+	control &^= 1 << (2 * uint(index))
+
+	// Clear the condition (RW) and length (LEN) bits (4 bits at 16+4*index).
+	control &^= 0xF << (16 + 4*uint(index))
+
+	if err := p.regs.Write(dr7Info, control); err != nil {
+		return newErrorf("clear hardware stoppoint: write DR7 failed: %v", err)
+	}
+
+	// Clear the address register.
+	drName := [4]string{"dr0", "dr1", "dr2", "dr3"}
+	drInfo, _ := RegisterInfoByName(drName[index])
+	if err := p.regs.Write(drInfo, uint64(0)); err != nil {
+		return newErrorf("clear hardware stoppoint: write %s failed: %v", drName[index], err)
+	}
+
+	return nil
+}
+
+// setHardwareStoppoint is the core implementation for programming a
+// debug register. It finds a free slot, writes the address to DR0–DR3,
+// and configures DR7 with the mode and size.
+func (p *Process) setHardwareStoppoint(addr uint64, mode StoppointMode, size int) (int, error) {
+	// Read current DR7 control register.
+	dr7Info, _ := RegisterInfoByName("dr7")
+	control := p.regs.Read(dr7Info).(uint64)
+
+	// Find a free debug register.
+	index, err := findFreeStoppointRegister(control)
+	if err != nil {
+		return -1, err
+	}
+
+	// Encode mode and size.
+	modeEnc := encodeHardwareStoppointMode(mode)
+	sizeEnc, err := encodeHardwareStoppointSize(size)
+	if err != nil {
+		return -1, err
+	}
+
+	// Write the address to DR<index>.
+	drNames := [4]string{"dr0", "dr1", "dr2", "dr3"}
+	drInfo, _ := RegisterInfoByName(drNames[index])
+	if err := p.regs.Write(drInfo, addr); err != nil {
+		return -1, newErrorf("set hardware stoppoint: write %s failed: %v", drNames[index], err)
+	}
+
+	// Set the local enable bit (bit 2*index).
+	control |= 1 << (2 * uint(index))
+
+	// Set condition (RW) and length (LEN) in the upper half of DR7.
+	// Bits 16+4*index..16+4*index+1 = condition (RW)
+	// Bits 18+4*index..18+4*index+1 = length (LEN)
+	shift := 16 + 4*uint(index)
+	control &^= 0xF << shift // clear the 4 bits first
+	control |= (modeEnc | (sizeEnc << 2)) << shift
+
+	if err := p.regs.Write(dr7Info, control); err != nil {
+		return -1, newErrorf("set hardware stoppoint: write DR7 failed: %v", err)
+	}
+
+	return index, nil
+}
+
+// findFreeStoppointRegister scans the DR7 control register for an
+// unused debug register slot (0–3). A slot is free if its local enable
+// bit is clear.
+func findFreeStoppointRegister(control uint64) (int, error) {
+	for i := 0; i < 4; i++ {
+		if control&(1<<(2*uint(i))) == 0 {
+			return i, nil
+		}
+	}
+	return -1, newError("no free debug registers (all 4 hardware breakpoint slots are in use)")
+}
+
+// encodeHardwareStoppointMode maps a StoppointMode to the 2-bit DR7
+// condition field encoding.
+func encodeHardwareStoppointMode(mode StoppointMode) uint64 {
+	switch mode {
+	case StoppointModeExecute:
+		return 0b00
+	case StoppointModeWrite:
+		return 0b01
+	case StoppointModeReadWrite:
+		return 0b11
+	default:
+		return 0b00
+	}
+}
+
+// encodeHardwareStoppointSize maps a byte size (1, 2, 4, 8) to the
+// 2-bit DR7 length field encoding.
+func encodeHardwareStoppointSize(size int) (uint64, error) {
+	switch size {
+	case 1:
+		return 0b00, nil
+	case 2:
+		return 0b01, nil
+	case 4:
+		return 0b11, nil
+	case 8:
+		return 0b10, nil
+	default:
+		return 0, newErrorf("unsupported hardware stoppoint size %d (must be 1, 2, 4, or 8)", size)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Watchpoints
+// ---------------------------------------------------------------------------
+
+// SetWatchpoint programs a debug register to trigger on data access at
+// addr with the given mode and size. Returns the debug register index.
+func (p *Process) SetWatchpoint(addr uint64, mode StoppointMode, size int) (int, error) {
+	if mode == StoppointModeExecute {
+		return -1, newError("use SetHardwareBreakpoint for execution watchpoints")
+	}
+	return p.setHardwareStoppoint(addr, mode, size)
+}
+
+// CreateWatchpoint creates a new watchpoint at the given address.
+// The watchpoint is immediately enabled. The address must be aligned
+// to the given size.
+func (p *Process) CreateWatchpoint(addr uint64, mode StoppointMode, size int) (*Watchpoint, error) {
+	if addr&uint64(size-1) != 0 {
+		return nil, newErrorf("watchpoint address 0x%x is not %d-byte aligned", addr, size)
+	}
+	if p.watchpoints.containsAddress(addr) {
+		return nil, newErrorf("watchpoint already exists at 0x%x", addr)
+	}
+
+	idx, err := p.SetWatchpoint(addr, mode, size)
+	if err != nil {
+		return nil, err
+	}
+
+	wp := &Watchpoint{
+		id:                    nextWatchpointID(),
+		proc:                  p,
+		address:               addr,
+		mode:                  mode,
+		size:                  size,
+		isEnabled:             true,
+		hardwareRegisterIndex: idx,
+	}
+	p.watchpoints.push(wp)
+	return wp, nil
+}
+
+// Watchpoints returns a snapshot of all watchpoints.
+func (p *Process) Watchpoints() []*Watchpoint {
+	result := make([]*Watchpoint, p.watchpoints.size())
+	copy(result, p.watchpoints.points)
+	return result
+}
+
+// WatchpointByID returns the watchpoint with the given ID.
+func (p *Process) WatchpointByID(id int32) (*Watchpoint, bool) {
+	return p.watchpoints.getByID(id)
+}
+
+// RemoveWatchpoint removes a watchpoint by ID, disabling it first
+// if it is enabled.
+func (p *Process) RemoveWatchpoint(id int32) error {
+	wp, ok := p.watchpoints.getByID(id)
+	if !ok {
+		return newErrorf("watchpoint %d not found", id)
+	}
+	if wp.isEnabled {
+		if err := wp.Disable(); err != nil {
+			return err
+		}
+	}
+	p.watchpoints.removeByID(id)
+	return nil
 }
 
 // Close detaches from the process and optionally terminates it.

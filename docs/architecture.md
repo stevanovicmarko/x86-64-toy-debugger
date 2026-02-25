@@ -23,10 +23,12 @@ codebase, extending it, or building your own debugger from scratch.
 12. [Single Stepping](#12-single-stepping)
 13. [Bulk Memory Operations](#13-bulk-memory-operations)
 14. [Disassembly](#14-disassembly)
-15. [Platform Abstraction](#15-platform-abstraction)
-16. [Error Handling](#16-error-handling)
-17. [Testing Strategy](#17-testing-strategy)
-18. [File Reference](#18-file-reference)
+15. [Hardware Breakpoints](#15-hardware-breakpoints)
+16. [Watchpoints](#16-watchpoints)
+17. [Platform Abstraction](#17-platform-abstraction)
+18. [Error Handling](#18-error-handling)
+19. [Testing Strategy](#19-testing-strategy)
+20. [File Reference](#20-file-reference)
 
 ---
 
@@ -283,7 +285,10 @@ shell over the `debugger` API, not an independent system.
 │     │   "continue"    → Resume + Wait + print PC     │
 │     │   "step"        → StepInstruction + print PC   │
 │     │   "breakpoint"  → set/list/enable/disable/del  │
+│     │   "watchpoint"  → set/list/enable/disable/del  │
 │     │   "register"    → read/write subcommands       │
+│     │   "memory"      → read/write subcommands       │
+│     │   "disassemble" → decode instructions at PC    │
 │     │   "help"        → print commands               │
 │     │   "quit"        → break                        │
 │     │   other         → print error                  │
@@ -299,11 +304,17 @@ shell over the `debugger` API, not an independent system.
 |---------|---------|--------|
 | `continue` | `c` | Resume the tracee, block until it stops again, print the stop reason with PC |
 | `step` | `s` | Execute one machine instruction, print the stop reason with PC |
-| `breakpoint set <addr>` | `break set <addr>` | Set and enable a breakpoint at the given hex address |
-| `breakpoint list` | `break list` | List all breakpoints with ID, address, and status |
+| `breakpoint set <addr>` | `break set <addr>` | Set and enable a software breakpoint at the given hex address |
+| `breakpoint set -h <addr>` | `break set -h <addr>` | Set and enable a hardware breakpoint (uses debug register, invisible to tracee) |
+| `breakpoint list` | `break list` | List all breakpoints with ID, address, type [hw/sw], and status |
 | `breakpoint enable <id>` | `break enable <id>` | Enable a breakpoint by ID |
 | `breakpoint disable <id>` | `break disable <id>` | Disable a breakpoint by ID |
 | `breakpoint delete <id>` | `break delete <id>` | Delete a breakpoint by ID |
+| `watchpoint set <addr> <mode> <size>` | `watch set ...` | Set a data watchpoint (mode: `write` or `rw`; size: 1, 2, 4, 8) |
+| `watchpoint list` | `watch list` | List all watchpoints with ID, address, mode, size, and status |
+| `watchpoint enable <id>` | `watch enable <id>` | Enable a watchpoint by ID |
+| `watchpoint disable <id>` | `watch disable <id>` | Disable a watchpoint by ID |
+| `watchpoint delete <id>` | `watch delete <id>` | Delete a watchpoint by ID |
 | `register read` | `reg read` | Print all GPR values |
 | `register read all` | `reg read all` | Print all 125 register values |
 | `register read <name>` | `reg read <name>` | Print a single register |
@@ -316,6 +327,7 @@ shell over the `debugger` API, not an independent system.
 | `help` | `h`, empty line | Print the list of available commands |
 | `help register` | `help reg` | Print register subcommand help |
 | `help breakpoint` | `help break` | Print breakpoint subcommand help |
+| `help watchpoint` | `help watch` | Print watchpoint subcommand help |
 | `help memory` | `help mem` | Print memory subcommand help |
 | `help disassemble` | `help disas` | Print disassemble options help |
 | `quit` | `q`, `exit` | Exit the debugger |
@@ -1090,7 +1102,158 @@ to execute — similar to GDB's `display/i $pc` behavior.
 
 ---
 
-## 15. Platform Abstraction
+## 15. Hardware Breakpoints
+
+**Source:** `debugger/breakpoint_site.go`, `debugger/process.go`, `debugger/stoppoint_mode.go`
+
+### Why hardware breakpoints?
+
+Software breakpoints (section 10) inject a `0xCC` byte into the tracee's code.
+This works well, but it *modifies memory*. Anti-debugging techniques can detect
+this by checksumming their own instructions — if a byte changes, a debugger is
+present. Hardware breakpoints avoid this entirely by using the CPU's built-in
+debug registers, which are invisible to the tracee.
+
+### The debug registers
+
+x86-64 provides eight debug registers (DR0–DR7):
+
+```
+DR0–DR3  Address registers   — hold the breakpoint/watchpoint address
+DR4–DR5  Reserved            — aliased to DR6/DR7 in some modes
+DR6      Status register     — tells which debug register triggered
+DR7      Control register    — enable bits, access mode, address size
+```
+
+Only four simultaneous hardware breakpoints/watchpoints are possible (DR0–DR3).
+This is a CPU limitation — software breakpoints have no such cap.
+
+### DR7 bit layout
+
+DR7 is the heart of hardware breakpoint programming. Each of the four slots
+gets a local-enable bit and a 4-bit condition+length field:
+
+```
+Bits 0,2,4,6    Local enable for DR0–DR3 (1 = active)
+Bits 1,3,5,7    Global enable (not used in user-mode debugging)
+Bits 16–17      Condition (RW0): 00=execute, 01=write, 11=read/write
+Bits 18–19      Length (LEN0):   00=1 byte, 01=2 bytes, 11=4 bytes, 10=8 bytes
+Bits 20–23      RW1 + LEN1 (same pattern for DR1)
+Bits 24–27      RW2 + LEN2
+Bits 28–31      RW3 + LEN3
+```
+
+### Programming a hardware breakpoint
+
+The `setHardwareStoppoint` method in `process.go`:
+
+1. Reads the current DR7 value from the register cache
+2. Calls `findFreeStoppointRegister` — scans DR7 local-enable bits to find an unused slot
+3. Writes the target address to the corresponding DR0–DR3 register via `PTRACE_POKEUSER`
+4. Sets the local-enable bit and encodes the mode/size into DR7
+5. Writes DR7 back via `PTRACE_POKEUSER`
+
+### Breakpoint hit behavior
+
+When a hardware breakpoint fires, the CPU raises a `#DB` exception
+(debug exception), which Linux delivers as `SIGTRAP` — the same signal as
+a software breakpoint. However, there is a critical difference:
+
+| | Software BP | Hardware BP |
+|---|---|---|
+| **RIP on stop** | Past the `0xCC` (PC = addr + 1) | AT the instruction (PC = addr) |
+| **PC adjustment** | Subtract 1 to point back at the BP | None needed |
+| **Memory modified** | Yes (0xCC injected) | No |
+
+The `WaitOnSignal` method handles this by using `enabledSoftwareAtAddress(pc - 1)`
+instead of `enabledAtAddress(pc - 1)`. Hardware breakpoints are excluded from
+the PC-1 check, so no adjustment occurs when they fire.
+
+### REPL usage
+
+```
+(toydbg) breakpoint set -h 0x401000    # hardware breakpoint
+(toydbg) breakpoint set 0x401000       # software breakpoint (default)
+(toydbg) breakpoint list               # shows [hw] or [sw] tag
+```
+
+---
+
+## 16. Watchpoints
+
+**Source:** `debugger/watchpoint.go`, `debugger/process.go`, `debugger/stoppoint_mode.go`
+
+### What is a watchpoint?
+
+A watchpoint triggers when a specific memory address is *accessed* (read or
+written), rather than when an instruction is *executed*. This is invaluable
+for debugging data corruption — set a watchpoint on a variable and the
+debugger stops the instant something modifies it.
+
+### Shared mechanism with hardware breakpoints
+
+Watchpoints use the same debug registers (DR0–DR3) and DR7 control bits as
+hardware breakpoints. The only difference is the **condition field** in DR7:
+
+| Mode | DR7 condition bits | Triggers on |
+|------|-------------------|-------------|
+| Execute | `00` | Instruction execution |
+| Write | `01` | Data writes only |
+| Read/Write | `11` | Data reads and writes |
+
+Because they share the four debug register slots, the total number of
+hardware breakpoints + watchpoints combined cannot exceed four.
+
+### The `StoppointMode` enum
+
+```go
+type StoppointMode int
+const (
+    StoppointModeExecute   StoppointMode = iota  // hardware breakpoint
+    StoppointModeWrite                            // write watchpoint
+    StoppointModeReadWrite                        // access watchpoint
+)
+```
+
+### The `Watchpoint` type
+
+Watchpoints are a separate type from `BreakpointSite` because they have
+different semantics: a size (1/2/4/8 bytes), an access mode, and an
+alignment requirement (the address must be aligned to the size).
+
+```go
+type Watchpoint struct {
+    id, proc, address, mode, size, isEnabled, hardwareRegisterIndex
+}
+```
+
+The `watchpointCollection` mirrors the `breakpointSiteCollection` pattern.
+
+### Alignment requirement
+
+Hardware watchpoints require the address to be naturally aligned:
+
+```
+size=1  →  any address
+size=2  →  address & 1 == 0
+size=4  →  address & 3 == 0
+size=8  →  address & 7 == 0
+```
+
+`CreateWatchpoint` validates this with `addr & uint64(size-1) != 0`.
+
+### REPL usage
+
+```
+(toydbg) watchpoint set 0x7ffd5000 write 8    # 8-byte write watchpoint
+(toydbg) watchpoint set 0x7ffd5000 rw 4       # 4-byte read/write watchpoint
+(toydbg) watchpoint list
+(toydbg) watchpoint delete 1
+```
+
+---
+
+## 17. Platform Abstraction
 
 **Source:** `debugger/ptrace_unsupported.go`, `debugger/registers_unsupported.go`
 
@@ -1115,7 +1278,7 @@ or a container with `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined`.
 
 ---
 
-## 16. Error Handling
+## 18. Error Handling
 
 **Source:** `debugger/error.go`
 
@@ -1144,7 +1307,7 @@ All internal error creation goes through `newError(msg)` and
 
 ---
 
-## 17. Testing Strategy
+## 19. Testing Strategy
 
 **Source:** `test/debugger_test.go`, `test/targets/`
 
@@ -1181,14 +1344,17 @@ assembly targets with `gcc` into a temporary directory before any tests run.
 | **Breakpoint end-to-end** | Set BP ahead of PC and verify stop; step instruction; step over breakpoint; continue from breakpoint to exit |
 | **Memory read** | Inferior stores known value, writes address to stdout; debugger reads memory at that address and verifies the value |
 | **Memory write** | Debugger writes a string into inferior's buffer; inferior prints buffer contents; test verifies output |
+| **Hardware breakpoint** | Software BP at a function is detected by anti-debugger checksum (prints "pepperoni"); hardware BP at the same address evades the checksum (prints "pineapple"); verifies PC lands exactly at the breakpoint address |
+| **Watchpoint** | Write watchpoint creation, alignment validation, CRUD operations (list, get by ID, remove); verifies watchpoint enable/disable cycle through debug registers |
 
-### Assembly test targets
+### Native test targets (assembly and C)
 
 Some register behaviors can only be tested from the inferior's perspective —
 for example, verifying that a debugger write to `rsi` is visible when the
 inferior uses that value in a `printf` call. Go programs cannot control
 which values land in specific registers (the compiler and runtime manage
 register allocation), so these tests use hand-written x86-64 assembly.
+The `anti_debugger` target uses C to test hardware breakpoint invisibility.
 
 | Target | Path | Libc | Build flags | Entry |
 |--------|------|------|-------------|-------|
@@ -1196,6 +1362,7 @@ register allocation), so these tests use hand-written x86-64 assembly.
 | `reg_write` | `test/targets/reg_write.s` | Yes | `-no-pie` | `main` |
 | `hello_toydbg` | `test/targets/hello_toydbg.s` | No | `-nostdlib -no-pie` | `_start` |
 | `memory` | `test/targets/memory.s` | No | `-nostdlib -no-pie` | `_start` |
+| `anti_debugger` | `test/targets/anti_debugger.c` | Yes | `-no-pie` | `main` |
 
 The register targets (`reg_read`, `reg_write`) use the **trap-resume-read
 pattern**: the assembly program executes `int3` (software breakpoint) at
@@ -1219,7 +1386,15 @@ verify the value. For the write test, it provides a zeroed buffer, traps,
 and the test writes a string into it via `WriteMemory`; after resuming,
 the inferior prints the buffer contents so the test can verify the write.
 
-`TestMain` builds all four assembly targets with `gcc` alongside the Go
+`anti_debugger` is a C program that demonstrates why hardware breakpoints
+exist. It computes a checksum of its own `an_innocent_function` body. When
+a software breakpoint injects `0xCC` into the function, the checksum
+changes and the program prints "pepperoni" (detected tampering). A hardware
+breakpoint at the same address is invisible to memory — the checksum matches
+and the program calls the function, printing "pineapple". The test uses
+both breakpoint types in sequence to verify this distinction.
+
+`TestMain` builds all five native targets with `gcc` alongside the Go
 targets.
 
 ### Process state verification
@@ -1236,17 +1411,19 @@ the *kernel* sees the process in the expected state.
 
 ---
 
-## 18. File Reference
+## 20. File Reference
 
 | File | Purpose |
 |------|---------|
-| `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, step, breakpoint, register, memory, disassemble, help, quit) |
+| `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, step, breakpoint, watchpoint, register, memory, disassemble, help, quit) |
 | `debugger/debugger.go` | Package documentation |
 | `debugger/error.go` | Custom error type and constructors |
 | `debugger/format.go` | `FormatRegisterValue` — display formatting for all register types |
 | `debugger/parse.go` | `ParseRegisterValue` — CLI string → typed value conversion |
-| `debugger/breakpoint_site.go` | BreakpointSite type (enable/disable via PEEKDATA/POKEDATA) and breakpointSiteCollection |
-| `debugger/process.go` | Process lifecycle: Launch, LaunchWithOptions, Attach, Resume, WaitOnSignal, GetPC, SetPC, breakpoint management, StepInstruction, ReadMemory, WriteMemory, ReadMemoryWithoutTraps, Close |
+| `debugger/breakpoint_site.go` | BreakpointSite type (software and hardware, enable/disable) and breakpointSiteCollection |
+| `debugger/watchpoint.go` | Watchpoint type (data read/write triggers via debug registers) and watchpointCollection |
+| `debugger/stoppoint_mode.go` | StoppointMode enum (Execute, Write, ReadWrite) — shared by hardware breakpoints and watchpoints |
+| `debugger/process.go` | Process lifecycle: Launch, LaunchWithOptions, Attach, Resume, WaitOnSignal, GetPC, SetPC, breakpoint management, hardware stoppoint methods, watchpoint management, StepInstruction, ReadMemory, WriteMemory, ReadMemoryWithoutTraps, Close |
 | `debugger/memory_linux.go` | Linux `process_vm_readv` wrapper for bulk memory reads |
 | `debugger/memory_unsupported.go` | Non-Linux memory read stub |
 | `debugger/disassembler.go` | Disassembler type: decodes x86-64 instructions via `x86asm` into AT&T syntax |
@@ -1255,13 +1432,15 @@ the *kernel* sees the process in the expected state.
 | `debugger/register_info.go` | Register metadata table (125 entries) and lookup functions |
 | `debugger/registers_linux.go` | Register cache: read/write via ptrace |
 | `debugger/registers_unsupported.go` | Non-Linux register stubs |
-| `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests, breakpoint tests, memory read/write tests) |
+| `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests, breakpoint tests, hardware breakpoint tests, watchpoint tests, memory read/write tests) |
 | `test/targets/end_immediately/main.go` | Test target: exits immediately |
 | `test/targets/run_endlessly/main.go` | Test target: infinite loop |
 | `test/targets/reg_read.s` | Assembly test target: sets known register values and traps (no libc) |
 | `test/targets/reg_write.s` | Assembly test target: prints debugger-written register values via printf |
 | `test/targets/hello_toydbg.s` | Assembly test target: write + exit (no libc, non-PIE, used for breakpoint tests) |
 | `test/targets/memory.s` | Assembly test target: stores known values and provides buffers for memory read/write tests |
+| `test/targets/anti_debugger.c` | C test target: checksums its own function to detect software breakpoints (tests hardware breakpoint invisibility) |
+| `doc.go` | Module-root package declaration |
 | `docs/sequence-diagram.mmd` | Mermaid sequence diagram of the attach-and-REPL lifecycle |
 | `Dockerfile` | Multi-stage build: compile + slim runtime image |
 

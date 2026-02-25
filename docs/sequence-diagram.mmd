@@ -170,3 +170,48 @@ sequenceDiagram
     K-->>D: returns raw bytes
     Note over D: Decode 10 instructions
     D->>U: print 10 disassembled instructions
+
+    Note over D,T: ── Phase 8: Hardware breakpoint set / hit ──
+    U-->>D: types "breakpoint set -h 0x401000"
+    Note over D: CreateBreakpointSite(0x401000, hardware=true)
+    Note over D: Find free debug register (DR0–DR3)
+    D->>K: PTRACE_POKEUSER(pid, DR0 offset, 0x401000) — set address
+    K-->>D: success
+    D->>K: PTRACE_POKEUSER(pid, DR7 offset, control bits) — enable + mode
+    K-->>D: success
+    D->>U: print "hardware breakpoint 2 set at 0x401000"
+    Note over D: No memory modification (tracee bytes untouched)
+
+    U-->>D: types "continue"
+    D->>K: PtraceCont(pid, 0)
+    Note over T: Tracee RESUMES execution
+    Note over T: CPU hits DR0 match at 0x401000 → #DB exception
+    Note over T: Tracee STOPS, RIP = 0x401000 (AT the instruction)
+    D->>K: wait4(pid)
+    K-->>D: returns WaitStatus (stopped by SIGTRAP)
+    D->>K: PtraceGetRegs / GETFPREGS / PeekUser
+    K-->>D: register values (RIP = 0x401000)
+    Note over D: SIGTRAP but no software BP at PC-1 → no PC adjustment
+    D->>U: print "process stopped by signal 5 at 0x401000"
+
+    Note over D,T: ── Phase 9: Watchpoint set / hit ──
+    U-->>D: types "watchpoint set 0x7ffd5000 write 8"
+    Note over D: CreateWatchpoint(addr, ModeWrite, size=8)
+    Note over D: Check 8-byte alignment: 0x7ffd5000 & 7 == 0 ✓
+    Note over D: Find free debug register (DR1)
+    D->>K: PTRACE_POKEUSER(pid, DR1 offset, 0x7ffd5000)
+    K-->>D: success
+    D->>K: PTRACE_POKEUSER(pid, DR7 offset, control bits) — write mode, 8-byte
+    K-->>D: success
+    D->>U: print "watchpoint 1 set at 0x7ffd5000 (mode=write, size=8)"
+
+    U-->>D: types "continue"
+    D->>K: PtraceCont(pid, 0)
+    Note over T: Tracee RESUMES execution
+    Note over T: Tracee writes to 0x7ffd5000 → #DB exception
+    Note over T: Tracee STOPS (SIGTRAP from debug exception)
+    D->>K: wait4(pid)
+    K-->>D: returns WaitStatus (stopped by SIGTRAP)
+    D->>K: PtraceGetRegs / GETFPREGS / PeekUser
+    K-->>D: register values
+    D->>U: print "process stopped by signal 5 at <PC>"
