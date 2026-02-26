@@ -105,7 +105,7 @@ sequenceDiagram
     Note over D: SIGTRAP + enabled BP at PC-1 → adjust PC
     D->>K: PTRACE_POKEUSER(pid, RIP offset, 0x401000)
     K-->>D: success
-    D->>U: print "process stopped by signal 5 at 0x401000"
+    D->>U: print "process stopped by SIGTRAP at 0x401000"
 
     U-->>D: types "continue" (resume from breakpoint)
     Note over D: PC at enabled BP → step-over dance
@@ -131,7 +131,7 @@ sequenceDiagram
     K-->>D: returns WaitStatus
     D->>K: PtraceGetRegs / GETFPREGS / PeekUser
     K-->>D: register values
-    D->>U: print "process stopped by signal 5 at 0x401007"
+    D->>U: print "process stopped by SIGTRAP at 0x401007"
     Note over D: Auto-disassemble at PC (see Phase 7)
 
     Note over D,T: ── Phase 6: Memory commands ──
@@ -192,7 +192,7 @@ sequenceDiagram
     D->>K: PtraceGetRegs / GETFPREGS / PeekUser
     K-->>D: register values (RIP = 0x401000)
     Note over D: SIGTRAP but no software BP at PC-1 → no PC adjustment
-    D->>U: print "process stopped by signal 5 at 0x401000"
+    D->>U: print "process stopped by SIGTRAP at 0x401000"
 
     Note over D,T: ── Phase 9: Watchpoint set / hit ──
     U-->>D: types "watchpoint set 0x7ffd5000 write 8"
@@ -244,7 +244,7 @@ sequenceDiagram
     Note over D: si_code=TRAP_TRACE(2)   → TrapSingleStep
     Note over D: si_code=TRAP_HWBKPT(4)  → TrapHardwareBreak
     D->>U: print "process stopped by SIGTRAP at 0x401000 (breakpoint 1)"
-    Note over D: Instead of: "process stopped by signal 5 at 0x401000"
+    Note over D: Before: "process stopped by SIGTRAP at 0x401000" (no detail)
 
     Note over D,T: ── Phase 12: Syscall catchpoints ──
     U-->>D: types "catchpoint syscall write"

@@ -328,17 +328,21 @@ shell over the `debugger` API, not an independent system.
 | `memory write <addr> [0xff,...]` | `mem write <addr> [...]` | Write bytes at address |
 | `disassemble` | `disas` | Disassemble 5 instructions at current PC |
 | `disassemble -c <n> -a <addr>` | `disas -c <n> -a <addr>` | Disassemble n instructions at address |
+| `catchpoint syscall` | `catch syscall` | Catch all syscalls (entry and exit) |
+| `catchpoint syscall none` | `catch syscall none` | Stop catching syscalls |
+| `catchpoint syscall <list>` | `catch syscall <list>` | Catch specific syscalls by name or number (comma-separated) |
 | `help` | `h`, empty line | Print the list of available commands |
 | `help register` | `help reg` | Print register subcommand help |
 | `help breakpoint` | `help break` | Print breakpoint subcommand help |
 | `help watchpoint` | `help watch` | Print watchpoint subcommand help |
 | `help memory` | `help mem` | Print memory subcommand help |
 | `help disassemble` | `help disas` | Print disassemble options help |
+| `help catchpoint` | `help catch` | Print catchpoint subcommand help |
 | `quit` | `q`, `exit` | Exit the debugger |
 
 ### Input handling
 
-- **Ctrl+C** (`readline.ErrInterrupt`) — ignored, loops back to prompt.
+- **Ctrl+C** — sends `SIGSTOP` to the inferior (see [Section 19](#19-signal-handling-and-process-groups)). If the tracee is running, this interrupts it and drops back to the prompt. If already at the prompt, readline absorbs the interrupt.
 - **Ctrl+D** (`io.EOF`) — exits gracefully.
 - The `readline` library provides line editing, history, and signal handling.
 
