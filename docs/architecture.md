@@ -27,8 +27,12 @@ codebase, extending it, or building your own debugger from scratch.
 16. [Watchpoints](#16-watchpoints)
 17. [Platform Abstraction](#17-platform-abstraction)
 18. [Error Handling](#18-error-handling)
-19. [Testing Strategy](#19-testing-strategy)
-20. [File Reference](#20-file-reference)
+19. [Signal Handling and Process Groups](#19-signal-handling-and-process-groups)
+20. [Enhanced Stop Reasons (TrapType)](#20-enhanced-stop-reasons-traptype)
+21. [Syscall Catchpoints](#21-syscall-catchpoints)
+22. [Watchpoint Data Tracking](#22-watchpoint-data-tracking)
+23. [Testing Strategy](#23-testing-strategy)
+24. [File Reference](#24-file-reference)
 
 ---
 
@@ -1307,7 +1311,211 @@ All internal error creation goes through `newError(msg)` and
 
 ---
 
-## 19. Testing Strategy
+## 19. Signal Handling and Process Groups
+
+**Source:** `debugger/process.go` (Setpgid), `cmd/toydbg/main.go` (SIGINT handler)
+
+### The problem
+
+When the user presses Ctrl+C, the terminal sends `SIGINT` to every process in
+the *foreground process group*. Without intervention, both the debugger and the
+inferior receive SIGINT — killing them both. A real debugger should intercept
+Ctrl+C and *stop* the inferior gracefully instead.
+
+### Process group isolation
+
+The solution has two parts:
+
+1. **Setpgid in the child.** During `Launch`, the `SysProcAttr` includes
+   `Setpgid: true`, which calls `setpgid(0, 0)` in the child before exec.
+   This puts the inferior in its own process group, so terminal-generated
+   signals only reach the debugger.
+
+2. **SIGINT handler in the debugger.** The REPL installs a goroutine that
+   listens on `os/signal.Notify(SIGINT)`. When Ctrl+C arrives, the handler
+   sends `SIGSTOP` to the inferior via `kill(pid, SIGSTOP)`. The inferior
+   stops, `wait4` unblocks, and the debugger drops back to the prompt.
+
+```
+Terminal                Debugger (PG 1)        Inferior (PG 2)
+  │                         │                       │
+  │── SIGINT ──────────────►│                       │
+  │                         │── kill(pid, SIGSTOP) ─►│
+  │                         │                       │ STOPS
+  │                         │◄── wait4 unblocks ────│
+  │                         │                       │
+  │◄── "(toydbg) " ────────│                       │
+```
+
+### Why SIGSTOP instead of SIGINT?
+
+SIGSTOP cannot be caught, blocked, or ignored — it is guaranteed to stop the
+process. SIGINT can be caught by the inferior (many programs install custom
+handlers), which would not reliably interrupt execution.
+
+---
+
+## 20. Enhanced Stop Reasons (TrapType)
+
+**Source:** `debugger/process.go` (TrapType, augmentStopReason, siginfo)
+
+### The problem
+
+On x86-64, `SIGTRAP` (signal 5) is delivered for at least four distinct
+events: software breakpoints (`int3`), single stepping (`EFLAGS.TF`),
+hardware breakpoints/watchpoints (`#DB` exception), and syscall-stops. The
+kernel delivers the same signal for all of them — the debugger must determine
+the *actual* cause to give the user meaningful feedback.
+
+### TrapType enum
+
+```go
+type TrapType int
+const (
+    TrapSingleStep    TrapType = iota  // PTRACE_SINGLESTEP completed
+    TrapSoftwareBreak                  // int3 (0xCC)
+    TrapHardwareBreak                  // Debug register match (#DB)
+    TrapSyscall                        // Syscall entry/exit
+    TrapUnknown                        // Unrecognized
+)
+```
+
+### How augmentStopReason works
+
+The `augmentStopReason` method runs after every `WaitOnSignal` when the
+process is stopped:
+
+1. **TRACESYSGOOD check:** If the stop signal is `SIGTRAP|0x80` (133),
+   this is a syscall stop. The `PTRACE_O_TRACESYSGOOD` option (set during
+   launch/attach) makes the kernel set bit 7 for syscall-stops, providing
+   an instant discriminator without needing `PTRACE_GETSIGINFO`.
+
+2. **PTRACE_GETSIGINFO:** For regular SIGTRAP, the kernel fills a
+   `siginfo_t` whose `si_code` field identifies the cause:
+
+   | `si_code`        | Value | Meaning              |
+   |------------------|-------|----------------------|
+   | `SI_KERNEL`      | 0x80  | Software breakpoint  |
+   | `TRAP_TRACE`     | 2     | Single step          |
+   | `TRAP_HWBKPT`    | 4     | Hardware BP/watchpoint |
+
+3. **StopReason enrichment:** The `TrapReason` pointer is set, and for
+   syscall traps, a `SyscallInformation` struct captures the syscall number
+   (from `orig_rax`), arguments (from `rdi/rsi/rdx/r10/r8/r9` on entry),
+   and return value (from `rax` on exit).
+
+### GetCurrentHardwareStoppoint
+
+When `TrapHardwareBreak` fires, the debugger reads DR6 (debug status
+register) to find which of the four debug registers (DR0–DR3) triggered.
+The low 4 bits of DR6 indicate which register matched; `bits.TrailingZeros64`
+(Go's equivalent of `__builtin_ctzll`) finds the index. The address in the
+corresponding DR is then looked up in the breakpoint and watchpoint
+collections.
+
+---
+
+## 21. Syscall Catchpoints
+
+**Source:** `debugger/process.go` (SyscallCatchPolicy, maybeResumeFromSyscall),
+`debugger/syscalls.go` (SyscallIDToName, SyscallNameToID)
+
+### Mental model
+
+Syscall catchpoints let the user trace specific system calls made by the
+inferior. This is the debugger equivalent of `strace` — but integrated into
+the REPL so the user can inspect registers and memory at each syscall
+boundary.
+
+### PTRACE_SYSCALL
+
+`PTRACE_SYSCALL` is like `PTRACE_CONT` but stops the tracee at the next
+syscall entry *or* exit. Combined with `PTRACE_O_TRACESYSGOOD`, the kernel
+delivers the stop as `SIGTRAP|0x80`, making it instantly distinguishable
+from other SIGTRAP causes.
+
+```
+                   PTRACE_SYSCALL
+                        │
+  ┌─────────────────────▼─────────────────────────┐
+  │ Tracee runs ... hits syscall(write, ...) ...   │
+  │                                                │
+  │ STOP #1: syscall entry                         │
+  │   orig_rax = 1 (write)                         │
+  │   rdi/rsi/rdx/... = args                       │
+  │                                                │
+  │                   PTRACE_SYSCALL                │
+  │                        │                       │
+  │ ... kernel executes write() ...                │
+  │                                                │
+  │ STOP #2: syscall exit                          │
+  │   rax = return value (bytes written)           │
+  └────────────────────────────────────────────────┘
+```
+
+### Entry/exit tracking
+
+The kernel doesn't tell you whether a syscall stop is entry or exit. The
+`Process` maintains an `expectingSyscallExit` boolean toggle: false → entry,
+true → exit, flipped at each syscall stop.
+
+### SyscallCatchPolicy
+
+Three modes:
+- **None** (default): No syscall tracing. `Resume` uses `PTRACE_CONT`.
+- **All**: Stop at every syscall. `Resume` uses `PTRACE_SYSCALL`.
+- **Some**: Stop only at listed syscalls. `Resume` uses `PTRACE_SYSCALL`,
+  and `maybeResumeFromSyscall` transparently resumes through non-matching
+  syscalls.
+
+### Syscall name table
+
+`debugger/syscalls.go` contains a static map of ~383 x86-64 syscall numbers
+to names, generated from `/usr/include/asm/unistd_64.h`. Two lookup functions
+provide bidirectional mapping:
+
+- `SyscallIDToName(id) → string` (e.g., 1 → "write")
+- `SyscallNameToID(name) → (int, bool)` (e.g., "write" → 1, true)
+
+### REPL command
+
+```
+catchpoint syscall              → catch all syscalls
+catchpoint syscall none         → stop catching
+catchpoint syscall write,read   → catch specific syscalls (by name or number)
+```
+
+---
+
+## 22. Watchpoint Data Tracking
+
+**Source:** `debugger/watchpoint.go` (Data, PreviousData, UpdateData)
+
+When a watchpoint triggers, the user wants to know *what changed*. The
+`Watchpoint` struct now tracks two values:
+
+- `data` — the current value at the watched address
+- `previousData` — the value before the most recent write
+
+`UpdateData()` reads `size` bytes from the watched address via
+`ReadMemory`, stores the result in `data`, and shifts the old value
+into `previousData`. It is called:
+
+1. When the watchpoint is first created (captures the initial value).
+2. Each time the watchpoint triggers (in `WaitOnSignal` when
+   `TrapHardwareBreak` is detected and the stoppoint is a watchpoint).
+
+The REPL uses these fields to display old/new values:
+
+```
+process stopped by SIGTRAP at 0x401042 (watchpoint 1)
+Old value: 0x0
+New value: 0x42
+```
+
+---
+
+## 23. Testing Strategy
 
 **Source:** `test/debugger_test.go`, `test/targets/`
 
@@ -1411,28 +1619,29 @@ the *kernel* sees the process in the expected state.
 
 ---
 
-## 20. File Reference
+## 24. File Reference
 
 | File | Purpose |
 |------|---------|
-| `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, step, breakpoint, watchpoint, register, memory, disassemble, help, quit) |
+| `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, step, breakpoint, watchpoint, register, memory, disassemble, catchpoint, help, quit), SIGINT handler, enhanced stop reason display |
 | `debugger/debugger.go` | Package documentation |
 | `debugger/error.go` | Custom error type and constructors |
 | `debugger/format.go` | `FormatRegisterValue` — display formatting for all register types |
 | `debugger/parse.go` | `ParseRegisterValue` — CLI string → typed value conversion |
 | `debugger/breakpoint_site.go` | BreakpointSite type (software and hardware, enable/disable) and breakpointSiteCollection |
-| `debugger/watchpoint.go` | Watchpoint type (data read/write triggers via debug registers) and watchpointCollection |
+| `debugger/watchpoint.go` | Watchpoint type (data read/write triggers via debug registers, data tracking) and watchpointCollection |
 | `debugger/stoppoint_mode.go` | StoppointMode enum (Execute, Write, ReadWrite) — shared by hardware breakpoints and watchpoints |
-| `debugger/process.go` | Process lifecycle: Launch, LaunchWithOptions, Attach, Resume, WaitOnSignal, GetPC, SetPC, breakpoint management, hardware stoppoint methods, watchpoint management, StepInstruction, ReadMemory, WriteMemory, ReadMemoryWithoutTraps, Close |
+| `debugger/process.go` | Process lifecycle: Launch, LaunchWithOptions, Attach, Resume, WaitOnSignal, GetPC, SetPC, breakpoint management, hardware stoppoint methods, watchpoint management, StepInstruction, ReadMemory, WriteMemory, ReadMemoryWithoutTraps, Close, TrapType, SyscallCatchPolicy, augmentStopReason, GetCurrentHardwareStoppoint |
+| `debugger/syscalls.go` | Syscall name/ID mapping table (generated from unistd_64.h): SyscallIDToName, SyscallNameToID |
 | `debugger/memory_linux.go` | Linux `process_vm_readv` wrapper for bulk memory reads |
 | `debugger/memory_unsupported.go` | Non-Linux memory read stub |
 | `debugger/disassembler.go` | Disassembler type: decodes x86-64 instructions via `x86asm` into AT&T syntax |
-| `debugger/ptrace_linux.go` | Linux ptrace syscall wrappers |
+| `debugger/ptrace_linux.go` | Linux ptrace syscall wrappers (including GETSIGINFO, SETOPTIONS, SYSCALL) |
 | `debugger/ptrace_unsupported.go` | Non-Linux stubs (return `ENOSYS`) |
 | `debugger/register_info.go` | Register metadata table (125 entries) and lookup functions |
 | `debugger/registers_linux.go` | Register cache: read/write via ptrace |
 | `debugger/registers_unsupported.go` | Non-Linux register stubs |
-| `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests, breakpoint tests, hardware breakpoint tests, watchpoint tests, memory read/write tests) |
+| `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests, breakpoint tests, hardware breakpoint tests, watchpoint tests, memory read/write tests, syscall mapping tests, syscall catchpoint tests) |
 | `test/targets/end_immediately/main.go` | Test target: exits immediately |
 | `test/targets/run_endlessly/main.go` | Test target: infinite loop |
 | `test/targets/reg_read.s` | Assembly test target: sets known register values and traps (no libc) |

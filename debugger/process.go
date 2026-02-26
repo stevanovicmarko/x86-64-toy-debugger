@@ -3,6 +3,7 @@ package debugger
 import (
 	"encoding/binary"
 	"io"
+	"math/bits"
 	"os"
 	"os/exec"
 	"runtime"
@@ -25,11 +26,35 @@ const (
 	ProcessTerminated                     // Process was killed by a signal
 )
 
+// TrapType distinguishes the specific cause of a SIGTRAP signal.
+// On x86-64, SIGTRAP is overloaded: software breakpoints (int3),
+// single steps (EFLAGS.TF), hardware breakpoints (#DB), and
+// syscall-stops all deliver the same signal number.
+type TrapType int
+
+const (
+	TrapSingleStep    TrapType = iota // PTRACE_SINGLESTEP completed
+	TrapSoftwareBreak                 // Executed int3 (0xCC)
+	TrapHardwareBreak                 // Debug register match (#DB)
+	TrapSyscall                       // Syscall entry or exit
+	TrapUnknown                       // Unrecognized si_code
+)
+
+// SyscallInformation describes a syscall stop (entry or exit).
+type SyscallInformation struct {
+	ID    uint16     // Syscall number (from orig_rax)
+	Entry bool       // true = entry, false = exit
+	Args  [6]uint64  // Arguments (valid on entry only)
+	Ret   int64      // Return value (valid on exit only)
+}
+
 // StopReason holds the reason a process stopped and additional info
 // such as the exit code or signal number.
 type StopReason struct {
-	Reason ProcessState
-	Info   uint8
+	Reason      ProcessState
+	Info        uint8
+	TrapReason  *TrapType           // non-nil only for SIGTRAP stops
+	SyscallInfo *SyscallInformation // non-nil only for syscall traps
 }
 
 // newStopReason parses a syscall.WaitStatus into a StopReason.
@@ -46,17 +71,127 @@ func newStopReason(ws syscall.WaitStatus) StopReason {
 	}
 }
 
+// si_code constants from the Linux kernel headers.
+const (
+	siKernel   = 0x80 // SI_KERNEL — software breakpoint (int3)
+	trapTrace  = 2    // TRAP_TRACE — single step
+	trapHWBkpt = 4    // TRAP_HWBKPT — hardware breakpoint/watchpoint
+)
+
+// augmentStopReason enriches a SIGTRAP stop with the specific trap
+// cause by inspecting the signal info and register state.
+func (p *Process) augmentStopReason(reason *StopReason) {
+	if reason.Reason != ProcessStopped {
+		return
+	}
+
+	// Check for syscall-stop: PTRACE_O_TRACESYSGOOD sets bit 7 on the
+	// stop signal, so syscall stops arrive as SIGTRAP|0x80 = 133.
+	if reason.Info == uint8(syscall.SIGTRAP)|0x80 {
+		trap := TrapSyscall
+		reason.TrapReason = &trap
+		reason.Info = uint8(syscall.SIGTRAP) // normalize for display
+
+		info := &SyscallInformation{}
+		info.Entry = !p.expectingSyscallExit
+		p.expectingSyscallExit = !p.expectingSyscallExit
+
+		// Read syscall number from orig_rax.
+		if origRaxInfo, ok := RegisterInfoByName("orig_rax"); ok {
+			info.ID = uint16(p.regs.Read(origRaxInfo).(uint64))
+		}
+
+		if info.Entry {
+			// Read the 6 syscall arguments from registers.
+			argRegs := [6]string{"rdi", "rsi", "rdx", "r10", "r8", "r9"}
+			for i, name := range argRegs {
+				if ri, ok := RegisterInfoByName(name); ok {
+					info.Args[i] = p.regs.Read(ri).(uint64)
+				}
+			}
+		} else {
+			// Read return value from rax.
+			if raxInfo, ok := RegisterInfoByName("rax"); ok {
+				info.Ret = int64(p.regs.Read(raxInfo).(uint64))
+			}
+		}
+		reason.SyscallInfo = info
+		return
+	}
+
+	if reason.Info != uint8(syscall.SIGTRAP) {
+		return
+	}
+
+	// Use PTRACE_GETSIGINFO to determine the specific SIGTRAP cause.
+	si, err := ptraceGetSigInfo(p.pid)
+	if err != nil {
+		trap := TrapUnknown
+		reason.TrapReason = &trap
+		return
+	}
+
+	var trap TrapType
+	switch si.Code {
+	case siKernel:
+		trap = TrapSoftwareBreak
+	case trapTrace:
+		trap = TrapSingleStep
+	case trapHWBkpt:
+		trap = TrapHardwareBreak
+	default:
+		trap = TrapUnknown
+	}
+	reason.TrapReason = &trap
+}
+
+// SyscallCatchPolicy controls which syscalls cause the debugger to stop.
+type SyscallCatchPolicy struct {
+	mode    int   // 0=none, 1=some, 2=all
+	toCatch []int // only used when mode=1
+}
+
+// CatchNoSyscalls returns a policy that does not stop on any syscalls.
+func CatchNoSyscalls() SyscallCatchPolicy {
+	return SyscallCatchPolicy{mode: 0}
+}
+
+// CatchAllSyscalls returns a policy that stops on every syscall entry/exit.
+func CatchAllSyscalls() SyscallCatchPolicy {
+	return SyscallCatchPolicy{mode: 2}
+}
+
+// CatchSomeSyscalls returns a policy that stops only on the listed syscalls.
+func CatchSomeSyscalls(ids []int) SyscallCatchPolicy {
+	return SyscallCatchPolicy{mode: 1, toCatch: ids}
+}
+
+// IsNone returns true if no syscalls are being caught.
+func (s SyscallCatchPolicy) IsNone() bool { return s.mode == 0 }
+
+// contains reports whether the given syscall ID is in the catch list.
+func (s SyscallCatchPolicy) contains(id int) bool {
+	for _, c := range s.toCatch {
+		if c == id {
+			return true
+		}
+	}
+	return false
+}
+
 // Process represents a running process being debugged.
 // Users must create one via Launch or Attach; direct construction is not possible
 // because all fields are unexported.
 type Process struct {
-	pid             int
-	terminateOnEnd  bool
-	isAttached      bool
-	state           ProcessState
-	regs            *Registers
-	breakpointSites breakpointSiteCollection
-	watchpoints     watchpointCollection
+	pid                  int
+	terminateOnEnd       bool
+	isAttached           bool
+	state                ProcessState
+	regs                 *Registers
+	breakpointSites      breakpointSiteCollection
+	watchpoints          watchpointCollection
+	expectingSyscallExit bool
+	syscallCatchPolicy   SyscallCatchPolicy
 }
 
 // Launch starts a new process under ptrace and returns a Process that
@@ -105,6 +240,7 @@ func launchWithOpts(program string, debug bool, opts LaunchOptions, args []strin
 	if debug {
 		cmd.SysProcAttr = &syscall.SysProcAttr{
 			Ptrace: true,
+			Setpgid: true,
 		}
 	}
 
@@ -126,6 +262,10 @@ func launchWithOpts(program string, debug bool, opts LaunchOptions, args []strin
 		if _, err := proc.WaitOnSignal(); err != nil {
 			runtime.UnlockOSThread()
 			return nil, err
+		}
+		if err := ptraceSetOptions(proc.pid, ptraceOTraceSysGood); err != nil {
+			proc.Close()
+			return nil, newErrorf("set ptrace options: %v", err)
 		}
 		proc.regs = &Registers{pid: proc.pid}
 		if err := proc.regs.readAll(); err != nil {
@@ -175,6 +315,11 @@ func Attach(pid int) (*Process, error) {
 	if _, err := proc.WaitOnSignal(); err != nil {
 		runtime.UnlockOSThread()
 		return nil, err
+	}
+
+	if err := ptraceSetOptions(pid, ptraceOTraceSysGood); err != nil {
+		proc.Close()
+		return nil, newErrorf("set ptrace options: %v", err)
 	}
 
 	proc.regs = &Registers{pid: proc.pid}
@@ -357,17 +502,65 @@ func (p *Process) StepInstruction() (StopReason, error) {
 	return reason, nil
 }
 
+// SetSyscallCatchPolicy configures which syscalls cause the debugger to
+// stop. When a non-"none" policy is active, Resume uses PTRACE_SYSCALL
+// instead of PTRACE_CONT so the kernel stops the tracee at syscall
+// boundaries.
+func (p *Process) SetSyscallCatchPolicy(policy SyscallCatchPolicy) {
+	p.syscallCatchPolicy = policy
+	p.expectingSyscallExit = false
+}
+
 // Resume continues a stopped process. If stopped at an enabled breakpoint,
 // it first steps over the breakpoint before continuing.
+//
+// When a syscall catch policy is active, PTRACE_SYSCALL is used instead
+// of PTRACE_CONT so the tracee stops at each syscall entry/exit.
 func (p *Process) Resume() error {
 	if err := p.stepOverBreakpoint(); err != nil {
 		return err
 	}
-	if err := ptraceCont(p.pid); err != nil {
-		return newErrorf("could not resume: %v", err)
+	if !p.syscallCatchPolicy.IsNone() {
+		if err := ptraceSyscall(p.pid); err != nil {
+			return newErrorf("could not resume (syscall): %v", err)
+		}
+	} else {
+		if err := ptraceCont(p.pid); err != nil {
+			return newErrorf("could not resume: %v", err)
+		}
 	}
 	p.state = ProcessRunning
 	return nil
+}
+
+// maybeResumeFromSyscall checks whether a syscall stop should be
+// reported to the user based on the current catch policy. If the
+// policy is "some" and the syscall is not in the catch list, it
+// resumes the tracee and waits again, repeating until a relevant
+// stop occurs.
+func (p *Process) maybeResumeFromSyscall(reason StopReason) (StopReason, error) {
+	for reason.SyscallInfo != nil {
+		id := int(reason.SyscallInfo.ID)
+		if p.syscallCatchPolicy.mode == 2 {
+			// Catch all: always report.
+			return reason, nil
+		}
+		if p.syscallCatchPolicy.mode == 1 && p.syscallCatchPolicy.contains(id) {
+			// Catch some: this syscall is in the list.
+			return reason, nil
+		}
+		// Not interested in this syscall — resume and wait again.
+		if err := ptraceSyscall(p.pid); err != nil {
+			return reason, newErrorf("could not resume from syscall: %v", err)
+		}
+		p.state = ProcessRunning
+		var err error
+		reason, err = p.WaitOnSignal()
+		if err != nil {
+			return reason, err
+		}
+	}
+	return reason, nil
 }
 
 // WaitOnSignal blocks until the process stops or terminates and returns
@@ -392,18 +585,39 @@ func (p *Process) WaitOnSignal() (StopReason, error) {
 			return reason, err
 		}
 
-		// If we stopped due to SIGTRAP and there is an enabled *software*
-		// breakpoint at PC-1, adjust the PC back to the breakpoint address.
-		// Hardware breakpoints stop AT the instruction (PC is already
-		// correct), so we only adjust for software breakpoints.
-		if reason.Info == uint8(syscall.SIGTRAP) {
-			pc, err := p.GetPC()
-			if err == nil {
-				if site := p.breakpointSites.enabledSoftwareAtAddress(pc - 1); site != nil {
-					if err := p.SetPC(pc - 1); err != nil {
-						return reason, err
+		// Determine the specific cause of the stop (software BP, hardware
+		// BP, single step, syscall, or unknown).
+		p.augmentStopReason(&reason)
+
+		if reason.TrapReason != nil {
+			switch *reason.TrapReason {
+			case TrapSoftwareBreak:
+				// Software breakpoints: x86-64 increments RIP past the
+				// 0xCC byte before delivering the trap, so we adjust PC
+				// back by 1 if an enabled SW breakpoint exists there.
+				pc, err := p.GetPC()
+				if err == nil {
+					if site := p.breakpointSites.enabledSoftwareAtAddress(pc - 1); site != nil {
+						if err := p.SetPC(pc - 1); err != nil {
+							return reason, err
+						}
 					}
 				}
+
+			case TrapHardwareBreak:
+				// Hardware breakpoints/watchpoints: check DR6 to find
+				// which debug register triggered, and if it's a watchpoint,
+				// capture the new data value.
+				if hs, err := p.GetCurrentHardwareStoppoint(); err == nil && hs.IsWatchpoint {
+					if wp, ok := p.watchpoints.getByID(hs.WatchpointID); ok {
+						wp.UpdateData()
+					}
+				}
+
+			case TrapSyscall:
+				// Syscall stops: filter through the catch policy. If the
+				// policy says "skip this syscall", resume and wait again.
+				return p.maybeResumeFromSyscall(reason)
 			}
 		}
 	}
@@ -523,6 +737,53 @@ func (p *Process) ClearHardwareStoppoint(index int) error {
 	}
 
 	return nil
+}
+
+// HardwareStoppoint identifies which hardware stoppoint (breakpoint or
+// watchpoint) triggered a #DB exception.
+type HardwareStoppoint struct {
+	IsWatchpoint bool
+	BreakpointID int32 // valid when !IsWatchpoint
+	WatchpointID int32 // valid when IsWatchpoint
+}
+
+// GetCurrentHardwareStoppoint reads DR6 to determine which debug register
+// triggered the most recent #DB exception, then looks up the address in
+// the breakpoint/watchpoint collections to identify the stoppoint.
+//
+// DR6 status bits: bit 0 = DR0 triggered, bit 1 = DR1, etc.
+// We use TrailingZeros to find the lowest set bit (Go equivalent of
+// __builtin_ctzll from the C++ implementation).
+func (p *Process) GetCurrentHardwareStoppoint() (HardwareStoppoint, error) {
+	dr6Info, _ := RegisterInfoByName("dr6")
+	dr6 := p.regs.Read(dr6Info).(uint64)
+
+	// Only the low 4 bits of DR6 indicate which register triggered.
+	triggeredBits := dr6 & 0xF
+	if triggeredBits == 0 {
+		return HardwareStoppoint{}, newError("no hardware stoppoint triggered (DR6 low bits are clear)")
+	}
+
+	index := bits.TrailingZeros64(triggeredBits)
+	drNames := [4]string{"dr0", "dr1", "dr2", "dr3"}
+	drInfo, _ := RegisterInfoByName(drNames[index])
+	addr := p.regs.Read(drInfo).(uint64)
+
+	// Check watchpoints first (they share debug registers with HW breakpoints).
+	for _, wp := range p.watchpoints.points {
+		if wp.address == addr && wp.hardwareRegisterIndex == index {
+			return HardwareStoppoint{IsWatchpoint: true, WatchpointID: wp.id}, nil
+		}
+	}
+
+	// Check hardware breakpoints.
+	for _, bp := range p.breakpointSites.sites {
+		if bp.isHardware && bp.address == addr && bp.hardwareRegisterIndex == index {
+			return HardwareStoppoint{IsWatchpoint: false, BreakpointID: bp.id}, nil
+		}
+	}
+
+	return HardwareStoppoint{}, newErrorf("hardware stoppoint at DR%d (0x%x) not found in collections", index, addr)
 }
 
 // setHardwareStoppoint is the core implementation for programming a
@@ -653,6 +914,10 @@ func (p *Process) CreateWatchpoint(addr uint64, mode StoppointMode, size int) (*
 		hardwareRegisterIndex: idx,
 	}
 	p.watchpoints.push(wp)
+	// Capture the initial value at the watched address.
+	if err := wp.UpdateData(); err != nil {
+		return wp, nil // non-fatal: watchpoint is still usable
+	}
 	return wp, nil
 }
 

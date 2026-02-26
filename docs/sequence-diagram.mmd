@@ -214,4 +214,64 @@ sequenceDiagram
     K-->>D: returns WaitStatus (stopped by SIGTRAP)
     D->>K: PtraceGetRegs / GETFPREGS / PeekUser
     K-->>D: register values
-    D->>U: print "process stopped by signal 5 at <PC>"
+    Note over D: PTRACE_GETSIGINFO → si_code=TRAP_HWBKPT
+    Note over D: Read DR6 → bit 1 set → DR1 triggered
+    Note over D: Lookup DR1 address → watchpoint 1
+    Note over D: UpdateData() — read new value, shift old
+    D->>U: print "process stopped by SIGTRAP at <PC> (watchpoint 1)"
+    D->>U: print "Old value: 0x0  New value: 0x42"
+
+    Note over D,T: ── Phase 10: SIGINT handling (Ctrl+C) ──
+    Note over D: On launch: child gets Setpgid (own process group)
+    Note over D: Debugger installs os/signal.Notify(SIGINT)
+    U-->>D: presses Ctrl+C while tracee is running
+    Note over D: SIGINT delivered to debugger's process group only
+    Note over D: Signal handler goroutine receives SIGINT
+    D->>K: kill(pid, SIGSTOP) — stop the inferior
+    Note over T: Tracee receives SIGSTOP → STOPS
+    D->>K: wait4(pid) — unblocks (was waiting for tracee)
+    K-->>D: returns WaitStatus (stopped by SIGSTOP)
+    D->>K: PtraceGetRegs / GETFPREGS / PeekUser
+    K-->>D: register values
+    D->>U: print "process stopped by SIGSTOP at <PC>"
+    D->>U: print prompt "(toydbg) "
+
+    Note over D,T: ── Phase 11: Enhanced stop reasons ──
+    Note over D: On every SIGTRAP stop:
+    Note over D: 1. Check TRACESYSGOOD bit (signal 133 = syscall)
+    Note over D: 2. Else call PTRACE_GETSIGINFO for si_code
+    Note over D: si_code=SI_KERNEL(0x80) → TrapSoftwareBreak
+    Note over D: si_code=TRAP_TRACE(2)   → TrapSingleStep
+    Note over D: si_code=TRAP_HWBKPT(4)  → TrapHardwareBreak
+    D->>U: print "process stopped by SIGTRAP at 0x401000 (breakpoint 1)"
+    Note over D: Instead of: "process stopped by signal 5 at 0x401000"
+
+    Note over D,T: ── Phase 12: Syscall catchpoints ──
+    U-->>D: types "catchpoint syscall write"
+    Note over D: SetSyscallCatchPolicy(CatchSome([1]))
+    D->>U: print "catching syscalls: write"
+
+    U-->>D: types "continue"
+    D->>K: PTRACE_SYSCALL(pid) — resume, stop at next syscall
+    Note over T: Tracee RESUMES execution
+    Note over T: Tracee enters write() syscall
+    Note over T: Tracee STOPS (SIGTRAP|0x80 from TRACESYSGOOD)
+    D->>K: wait4(pid)
+    K-->>D: returns WaitStatus (stopped by signal 133)
+    D->>K: PtraceGetRegs / GETFPREGS / PeekUser
+    K-->>D: register values (orig_rax=1=write)
+    Note over D: Signal 133 = SIGTRAP|0x80 → syscall stop
+    Note over D: orig_rax=1 → "write", entry (toggle=false→true)
+    Note over D: Policy "some" + write in list → report to user
+    D->>U: print "process stopped by SIGTRAP (syscall entry)"
+    D->>U: print "syscall: write(0x1, 0x..., 0x...)"
+
+    U-->>D: types "continue"
+    D->>K: PTRACE_SYSCALL(pid)
+    Note over T: write() syscall executes in kernel
+    Note over T: Tracee STOPS on syscall exit (SIGTRAP|0x80)
+    D->>K: wait4(pid)
+    K-->>D: returns WaitStatus (stopped by signal 133)
+    Note over D: Syscall exit: toggle=true→false, rax=return value
+    D->>U: print "process stopped by SIGTRAP (syscall exit)"
+    D->>U: print "syscall: write returned 14"

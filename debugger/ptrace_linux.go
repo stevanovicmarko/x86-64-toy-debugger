@@ -24,9 +24,19 @@ const (
 	ptracePokeUserReq  = 0x6 // PTRACE_POKEUSER
 
 	// ptrace requests for memory access and single-stepping.
-	ptracePeekDataReq  = 0x2 // PTRACE_PEEKDATA
-	ptracePokeDataReq  = 0x5 // PTRACE_POKEDATA
+	ptracePeekDataReq   = 0x2 // PTRACE_PEEKDATA
+	ptracePokeDataReq   = 0x5 // PTRACE_POKEDATA
 	ptraceSingleStepReq = 0x9 // PTRACE_SINGLESTEP
+
+	// ptrace requests for signal info, options, and syscall tracing.
+	ptraceGetSigInfoReq  = 0x4202 // PTRACE_GETSIGINFO
+	ptraceSetOptionsReq  = 0x4200 // PTRACE_SETOPTIONS
+	ptraceSyscallReq     = 24     // PTRACE_SYSCALL
+
+	// PTRACE_O_TRACESYSGOOD: set bit 7 on signal number for syscall stops,
+	// turning SIGTRAP into SIGTRAP|0x80 so we can distinguish syscall stops
+	// from other SIGTRAP causes without inspecting si_code.
+	ptraceOTraceSysGood = 1
 )
 
 func ptraceCont(pid int) error {
@@ -141,6 +151,57 @@ func ptracePokeData(pid int, addr uint64, data uint64) error {
 func ptraceSingleStep(pid int) error {
 	_, _, errno := syscall.RawSyscall6(syscall.SYS_PTRACE,
 		uintptr(ptraceSingleStepReq), uintptr(pid), 0, 0, 0, 0)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// siginfo is the Go representation of the kernel's siginfo_t structure.
+// We only need the first three fields (si_signo, si_errno, si_code) for
+// distinguishing trap causes; the rest is padded to match the kernel layout.
+type siginfo struct {
+	Signo int32
+	Errno int32
+	Code  int32
+	_     [128 - 12]byte // pad to SI_MAX_SIZE (128 bytes)
+}
+
+// ptraceGetSigInfo retrieves the siginfo_t for the last signal delivered
+// to the tracee. The si_code field distinguishes trap causes:
+//   - SI_KERNEL (0x80)   → software breakpoint (int3)
+//   - TRAP_TRACE (2)     → single step
+//   - TRAP_HWBKPT (4)    → hardware breakpoint or watchpoint
+func ptraceGetSigInfo(pid int) (siginfo, error) {
+	var info siginfo
+	_, _, errno := syscall.RawSyscall6(syscall.SYS_PTRACE,
+		uintptr(ptraceGetSigInfoReq), uintptr(pid), 0,
+		uintptr(unsafe.Pointer(&info)), 0, 0)
+	if errno != 0 {
+		return info, errno
+	}
+	return info, nil
+}
+
+// ptraceSetOptions sets ptrace options for the tracee. The primary option
+// we use is PTRACE_O_TRACESYSGOOD, which sets bit 7 on the stop signal
+// for syscall-stops (SIGTRAP|0x80 = signal 133).
+func ptraceSetOptions(pid int, options int) error {
+	_, _, errno := syscall.RawSyscall6(syscall.SYS_PTRACE,
+		uintptr(ptraceSetOptionsReq), uintptr(pid), 0,
+		uintptr(options), 0, 0)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// ptraceSyscall resumes the tracee like PTRACE_CONT but stops it at the
+// next syscall entry or exit boundary. Combined with PTRACE_O_TRACESYSGOOD,
+// the resulting stop signal will be SIGTRAP|0x80.
+func ptraceSyscall(pid int) error {
+	_, _, errno := syscall.RawSyscall6(syscall.SYS_PTRACE,
+		uintptr(ptraceSyscallReq), uintptr(pid), 0, 0, 0, 0)
 	if errno != 0 {
 		return errno
 	}

@@ -51,3 +51,22 @@ func ptracePokeData(_ int, _ uint64, _ uint64) error {
 func ptraceSingleStep(_ int) error {
 	return syscall.ENOSYS
 }
+
+type siginfo struct {
+	Signo int32
+	Errno int32
+	Code  int32
+	_     [128 - 12]byte
+}
+
+func ptraceGetSigInfo(_ int) (siginfo, error) {
+	return siginfo{}, syscall.ENOSYS
+}
+
+func ptraceSetOptions(_ int, _ int) error {
+	return syscall.ENOSYS
+}
+
+func ptraceSyscall(_ int) error {
+	return syscall.ENOSYS
+}

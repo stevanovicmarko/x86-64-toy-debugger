@@ -1,6 +1,9 @@
 package debugger
 
-import "sync/atomic"
+import (
+	"encoding/binary"
+	"sync/atomic"
+)
 
 // watchpointIDCounter is the global counter for assigning unique watchpoint IDs.
 var watchpointIDCounter int32
@@ -21,6 +24,8 @@ type Watchpoint struct {
 	size                  int
 	isEnabled             bool
 	hardwareRegisterIndex int
+	data                  uint64
+	previousData          uint64
 }
 
 // ID returns the unique identifier for this watchpoint.
@@ -46,6 +51,42 @@ func (w *Watchpoint) Size() int {
 // IsEnabled returns whether the watchpoint is currently active.
 func (w *Watchpoint) IsEnabled() bool {
 	return w.isEnabled
+}
+
+// Data returns the current value at the watched address (read at the
+// most recent watchpoint hit or when the watchpoint was created).
+func (w *Watchpoint) Data() uint64 {
+	return w.data
+}
+
+// PreviousData returns the value at the watched address before the
+// most recent update (i.e., the old value before the write that
+// triggered the watchpoint).
+func (w *Watchpoint) PreviousData() uint64 {
+	return w.previousData
+}
+
+// UpdateData reads the current value at the watched address and
+// shifts the old value into PreviousData. This should be called
+// each time the watchpoint triggers to capture the new value.
+func (w *Watchpoint) UpdateData() error {
+	buf, err := w.proc.ReadMemory(w.address, w.size)
+	if err != nil {
+		return err
+	}
+	w.previousData = w.data
+	// Read the value in little-endian, zero-extending to uint64.
+	switch w.size {
+	case 1:
+		w.data = uint64(buf[0])
+	case 2:
+		w.data = uint64(binary.LittleEndian.Uint16(buf))
+	case 4:
+		w.data = uint64(binary.LittleEndian.Uint32(buf))
+	case 8:
+		w.data = binary.LittleEndian.Uint64(buf)
+	}
+	return nil
 }
 
 // Enable activates the watchpoint by programming the debug register.

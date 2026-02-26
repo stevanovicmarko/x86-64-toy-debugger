@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/chzyer/readline"
+	"golang.org/x/sys/unix"
 
 	"x86-64-toy-debugger/debugger"
 )
@@ -39,6 +42,18 @@ func main() {
 		os.Exit(1)
 	}
 	defer proc.Close()
+
+	// Install SIGINT handler: when the user presses Ctrl+C, send SIGSTOP
+	// to the inferior instead of killing the debugger. Setpgid in Launch
+	// isolates the inferior's process group, so Ctrl+C only reaches us.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT)
+	go func() {
+		for range sigCh {
+			// Send SIGSTOP to the inferior to interrupt it.
+			_ = syscall.Kill(proc.Pid(), syscall.SIGSTOP)
+		}
+	}()
 
 	rl, err := readline.NewEx(&readline.Config{
 		Prompt: "(toydbg) ",
@@ -109,6 +124,8 @@ func main() {
 			handleWatchpoint(proc, fields[1:])
 		case "disassemble", "disas":
 			handleDisassemble(proc, fields[1:])
+		case "catchpoint", "catch":
+			handleCatchpoint(proc, fields[1:])
 		case "quit", "q", "exit":
 			return
 		default:
@@ -165,9 +182,16 @@ func handleHelp(args []string) {
 			fmt.Println("  disassemble -a <address>   - disassemble 5 instructions at address")
 			fmt.Println("  disassemble -c <n> -a <address> - disassemble n instructions at address")
 			return
+		case "catchpoint", "catch":
+			fmt.Println("catchpoint subcommands:")
+			fmt.Println("  catchpoint syscall              - catch all syscalls")
+			fmt.Println("  catchpoint syscall none         - stop catching syscalls")
+			fmt.Println("  catchpoint syscall <list>       - catch specific syscalls (by name or number)")
+			fmt.Println("  example: catchpoint syscall write,read,42")
+			return
 		}
 	}
-	fmt.Println("commands: continue (c), step (s), breakpoint (break), watchpoint (watch), register (reg), memory (mem), disassemble (disas), quit (q), help (h)")
+	fmt.Println("commands: continue (c), step (s), breakpoint (break), watchpoint (watch), register (reg), memory (mem), disassemble (disas), catchpoint (catch), quit (q), help (h)")
 }
 
 func handleBreakpoint(proc *debugger.Process, args []string) {
@@ -413,6 +437,66 @@ func handleWatchpoint(proc *debugger.Process, args []string) {
 	}
 }
 
+func handleCatchpoint(proc *debugger.Process, args []string) {
+	if len(args) == 0 {
+		fmt.Println("usage: catchpoint syscall [none|<name-or-number>,...]")
+		fmt.Println("  type 'help catchpoint' for details")
+		return
+	}
+
+	if args[0] != "syscall" {
+		fmt.Printf("unknown catchpoint type: %q (only 'syscall' is supported)\n", args[0])
+		return
+	}
+
+	if len(args) == 1 {
+		// "catchpoint syscall" with no further args → catch all.
+		proc.SetSyscallCatchPolicy(debugger.CatchAllSyscalls())
+		fmt.Println("catching all syscalls")
+		return
+	}
+
+	if args[1] == "none" {
+		proc.SetSyscallCatchPolicy(debugger.CatchNoSyscalls())
+		fmt.Println("stopped catching syscalls")
+		return
+	}
+
+	// Parse comma-separated list of syscall names or numbers.
+	parts := strings.Split(args[1], ",")
+	var ids []int
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		// Try as a number first.
+		if num, err := strconv.Atoi(p); err == nil {
+			ids = append(ids, num)
+			continue
+		}
+		// Try as a name.
+		if id, ok := debugger.SyscallNameToID(p); ok {
+			ids = append(ids, id)
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "toydbg: unknown syscall %q\n", p)
+		return
+	}
+
+	if len(ids) == 0 {
+		fmt.Println("no valid syscalls specified")
+		return
+	}
+
+	proc.SetSyscallCatchPolicy(debugger.CatchSomeSyscalls(ids))
+	names := make([]string, len(ids))
+	for i, id := range ids {
+		names[i] = debugger.SyscallIDToName(id)
+	}
+	fmt.Printf("catching syscalls: %s\n", strings.Join(names, ", "))
+}
+
 func handleRegister(proc *debugger.Process, args []string) {
 	if len(args) == 0 {
 		fmt.Println("usage: register <read|write> [args...]")
@@ -500,19 +584,87 @@ func handleRegisterWrite(proc *debugger.Process, args []string) {
 	fmt.Printf("%-12s %s\n", info.Name, debugger.FormatRegisterValue(info, val))
 }
 
+// signalName returns the symbolic name of a signal (e.g., "SIGTRAP")
+// or falls back to a numeric representation.
+func signalName(sig uint8) string {
+	name := unix.SignalName(syscall.Signal(sig))
+	if name != "" {
+		return name
+	}
+	return fmt.Sprintf("signal %d", sig)
+}
+
+// getSigtrapInfo returns extra context about a SIGTRAP stop, such as
+// which breakpoint or watchpoint triggered it, or syscall details.
+func getSigtrapInfo(proc *debugger.Process, reason debugger.StopReason) string {
+	if reason.TrapReason == nil {
+		return ""
+	}
+
+	switch *reason.TrapReason {
+	case debugger.TrapSingleStep:
+		return " (single step)"
+
+	case debugger.TrapSoftwareBreak:
+		pc, err := proc.GetPC()
+		if err != nil {
+			return " (software breakpoint)"
+		}
+		for _, bp := range proc.BreakpointSites() {
+			if bp.Address() == pc && !bp.IsHardware() {
+				return fmt.Sprintf(" (breakpoint %d)", bp.ID())
+			}
+		}
+		return " (software breakpoint)"
+
+	case debugger.TrapHardwareBreak:
+		hs, err := proc.GetCurrentHardwareStoppoint()
+		if err != nil {
+			return " (hardware breakpoint)"
+		}
+		if hs.IsWatchpoint {
+			wp, ok := proc.WatchpointByID(hs.WatchpointID)
+			if ok {
+				return fmt.Sprintf(" (watchpoint %d)\nOld value: 0x%x\nNew value: 0x%x",
+					wp.ID(), wp.PreviousData(), wp.Data())
+			}
+			return fmt.Sprintf(" (watchpoint %d)", hs.WatchpointID)
+		}
+		return fmt.Sprintf(" (breakpoint %d)", hs.BreakpointID)
+
+	case debugger.TrapSyscall:
+		if reason.SyscallInfo == nil {
+			return " (syscall)"
+		}
+		info := reason.SyscallInfo
+		name := debugger.SyscallIDToName(int(info.ID))
+		if info.Entry {
+			return fmt.Sprintf(" (syscall entry)\nsyscall: %s(0x%x, 0x%x, 0x%x, 0x%x, 0x%x, 0x%x)",
+				name, info.Args[0], info.Args[1], info.Args[2],
+				info.Args[3], info.Args[4], info.Args[5])
+		}
+		return fmt.Sprintf(" (syscall exit)\nsyscall: %s returned %d",
+			name, info.Ret)
+	}
+
+	return ""
+}
+
 func printStopReason(proc *debugger.Process, reason debugger.StopReason) {
 	switch reason.Reason {
 	case debugger.ProcessStopped:
+		sigName := signalName(reason.Info)
+		trapInfo := getSigtrapInfo(proc, reason)
 		pc, err := proc.GetPC()
 		if err != nil {
-			fmt.Printf("process stopped by signal %d\n", reason.Info)
+			fmt.Printf("process stopped by %s%s\n", sigName, trapInfo)
 		} else {
-			fmt.Printf("process stopped by signal %d at 0x%x\n", reason.Info, pc)
+			fmt.Printf("process stopped by %s at 0x%x%s\n", sigName, pc, trapInfo)
 		}
 	case debugger.ProcessExited:
 		fmt.Printf("process exited with code %d\n", reason.Info)
 	case debugger.ProcessTerminated:
-		fmt.Printf("process terminated by signal %d\n", reason.Info)
+		fmt.Printf("process terminated by %s\n", signalName(reason.Info))
 	case debugger.ProcessRunning:
 		fmt.Println("process running")
 	default:

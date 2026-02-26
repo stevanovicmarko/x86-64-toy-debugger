@@ -1527,3 +1527,138 @@ func TestWatchpointListAndRemove(t *testing.T) {
 		t.Error("expected empty watchpoint list after remove")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Syscall name mapping
+// ---------------------------------------------------------------------------
+
+func TestSyscallMapping(t *testing.T) {
+	// Verify well-known syscalls round-trip: ID → name → ID.
+	wellKnown := map[int]string{
+		0:  "read",
+		1:  "write",
+		2:  "open",
+		3:  "close",
+		9:  "mmap",
+		59: "execve",
+		60: "exit",
+	}
+
+	for id, expectedName := range wellKnown {
+		name := debugger.SyscallIDToName(id)
+		if name != expectedName {
+			t.Errorf("SyscallIDToName(%d) = %q, want %q", id, name, expectedName)
+		}
+		gotID, ok := debugger.SyscallNameToID(name)
+		if !ok {
+			t.Errorf("SyscallNameToID(%q) returned false", name)
+		}
+		if gotID != id {
+			t.Errorf("SyscallNameToID(%q) = %d, want %d", name, gotID, id)
+		}
+	}
+
+	// Unknown syscall ID should return a formatted string.
+	name := debugger.SyscallIDToName(99999)
+	if name != "syscall_99999" {
+		t.Errorf("SyscallIDToName(99999) = %q, want %q", name, "syscall_99999")
+	}
+
+	// Unknown syscall name should return -1, false.
+	_, ok := debugger.SyscallNameToID("nonexistent_syscall")
+	if ok {
+		t.Error("SyscallNameToID(nonexistent) should return false")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Syscall catchpoints
+// ---------------------------------------------------------------------------
+
+func TestSyscallCatchpoints(t *testing.T) {
+	// Use the anti_debugger target which does a write(2) syscall.
+	target := filepath.Join(targetDir, "anti_debugger")
+	proc, err := debugger.LaunchWithOptions(target, debugger.LaunchOptions{
+		Stdout: io.Discard,
+		Stderr: io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("Launch failed: %v", err)
+	}
+	defer proc.Close()
+
+	// Catch only the "write" syscall (ID=1).
+	writeID, ok := debugger.SyscallNameToID("write")
+	if !ok {
+		t.Fatal("SyscallNameToID(write) returned false")
+	}
+	proc.SetSyscallCatchPolicy(debugger.CatchSomeSyscalls([]int{writeID}))
+
+	// Resume and wait — should stop at a write syscall entry.
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume failed: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal failed: %v", err)
+	}
+
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+	}
+	if reason.TrapReason == nil {
+		t.Fatal("expected TrapReason to be set")
+	}
+	if *reason.TrapReason != debugger.TrapSyscall {
+		t.Fatalf("expected TrapSyscall, got %d", *reason.TrapReason)
+	}
+	if reason.SyscallInfo == nil {
+		t.Fatal("expected SyscallInfo to be set")
+	}
+	if int(reason.SyscallInfo.ID) != writeID {
+		t.Errorf("expected syscall ID %d (write), got %d (%s)",
+			writeID, reason.SyscallInfo.ID,
+			debugger.SyscallIDToName(int(reason.SyscallInfo.ID)))
+	}
+	if !reason.SyscallInfo.Entry {
+		t.Error("expected syscall entry, got exit")
+	}
+
+	// Resume again — should stop at the write syscall exit.
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume (exit) failed: %v", err)
+	}
+	reason, err = proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal (exit) failed: %v", err)
+	}
+	if reason.SyscallInfo != nil && !reason.SyscallInfo.Entry {
+		// Successfully caught the exit — verify it's still "write".
+		if int(reason.SyscallInfo.ID) != writeID {
+			t.Errorf("exit: expected syscall ID %d, got %d",
+				writeID, reason.SyscallInfo.ID)
+		}
+	}
+
+	// Disable catchpoints and let the process finish.
+	proc.SetSyscallCatchPolicy(debugger.CatchNoSyscalls())
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume (final) failed: %v", err)
+	}
+	reason, err = proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal (final) failed: %v", err)
+	}
+	if reason.Reason != debugger.ProcessExited {
+		// Process might stop again — resume until it exits.
+		for reason.Reason == debugger.ProcessStopped {
+			if err := proc.Resume(); err != nil {
+				break
+			}
+			reason, err = proc.WaitOnSignal()
+			if err != nil {
+				break
+			}
+		}
+	}
+}
