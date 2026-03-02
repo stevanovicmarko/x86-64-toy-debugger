@@ -28,6 +28,11 @@ type ELF struct {
 	// symbols with Size > 0 are included (we need the range to
 	// answer "which function contains this address?").
 	symbolsByAddr []addrSymbol
+
+	// dwarf holds the DWARF debug info, or nil if the binary has
+	// no DWARF sections. When present, it provides richer function
+	// lookup and source-location mapping than the symbol table alone.
+	dwarf *DWARF
 }
 
 // OpenELF opens and parses an ELF binary, building the symbol lookup
@@ -69,6 +74,12 @@ func OpenELF(path string) (*ELF, error) {
 		return e.symbolsByAddr[i].addr < e.symbolsByAddr[j].addr
 	})
 
+	// Load DWARF debug info if present. This is non-fatal — the
+	// debugger works without it, just with less detail.
+	if dwarfData, err := f.DWARF(); err == nil {
+		e.dwarf = newDWARF(dwarfData)
+	}
+
 	return e, nil
 }
 
@@ -97,6 +108,15 @@ func (e *ELF) EntryPoint() uint64 {
 // PIE binaries under ASLR this is non-zero; for ET_EXEC it is 0.
 func (e *ELF) SetLoadBias(bias uint64) {
 	e.loadBias = bias
+	if e.dwarf != nil {
+		e.dwarf.loadBias = bias
+	}
+}
+
+// DWARF returns the DWARF debug info, or nil if the binary has no
+// DWARF sections. Use this for source-location and rich function lookup.
+func (e *ELF) DWARF() *DWARF {
+	return e.dwarf
 }
 
 // LoadBias returns the current load bias.

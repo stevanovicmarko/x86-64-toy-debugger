@@ -33,7 +33,8 @@ codebase, extending it, or building your own debugger from scratch.
 22. [Watchpoint Data Tracking](#22-watchpoint-data-tracking)
 23. [Testing Strategy](#23-testing-strategy)
 24. [ELF Parsing and the Target Type](#24-elf-parsing-and-the-target-type)
-25. [File Reference](#25-file-reference)
+25. [DWARF Debug Information](#25-dwarf-debug-information)
+26. [File Reference](#26-file-reference)
 
 ---
 
@@ -260,8 +261,10 @@ When the process stops, `WaitOnSignal()` returns a `StopReason`:
 
 ```go
 type StopReason struct {
-    Reason ProcessState  // Why it stopped
-    Info   uint8         // Exit code or signal number
+    Reason      ProcessState       // Why it stopped
+    Info        uint8              // Exit code or signal number
+    TrapReason  *TrapType          // non-nil only for SIGTRAP stops
+    SyscallInfo *SyscallInformation // non-nil only for syscall traps
 }
 ```
 
@@ -390,7 +393,7 @@ type RegisterInfo struct {
 | Type | Registers | Count | Description |
 |------|-----------|-------|-------------|
 | `RegisterTypeGPR` | `rax`..`gs`, `orig_rax` | 25 | 64-bit general-purpose registers |
-| `RegisterTypeSubGPR` | `eax`, `ax`, `ah`, `al`, etc. | 36 | Narrower views into GPRs (32/16/8-bit) |
+| `RegisterTypeSubGPR` | `eax`, `ax`, `ah`, `al`, etc. | 52 | Narrower views into GPRs (32/16/8-bit) |
 | `RegisterTypeFPR` | `fcw`, `st0`..`st7`, `mm0`..`mm7`, `xmm0`..`xmm15` | 40 | Floating-point, MMX, and SSE registers |
 | `RegisterTypeDR` | `dr0`..`dr7` | 8 | Hardware debug/breakpoint registers |
 
@@ -899,11 +902,15 @@ and the CPU would immediately hit it again. Instead, it performs a
 
 ```go
 type BreakpointSite struct {
-    id        int32   // unique ID (monotonically increasing)
-    pid       int     // tracee PID (for ptrace calls)
-    address   uint64  // where the breakpoint is set
-    isEnabled bool    // whether 0xCC is currently in memory
-    savedData byte    // the original byte that was replaced
+    id                    int32    // unique ID (monotonically increasing)
+    pid                   int      // tracee PID (for ptrace calls)
+    proc                  *Process // back-pointer to owning Process
+    address               uint64   // where the breakpoint is set
+    isEnabled             bool     // whether 0xCC is currently in memory
+    savedData             byte     // the original byte that was replaced
+    isHardware            bool     // true = debug register, false = int3
+    isInternal            bool     // true = hidden from user (e.g., step-over)
+    hardwareRegisterIndex int      // DR0–DR3 index (hardware BPs only)
 }
 ```
 
@@ -1720,18 +1727,132 @@ The REPL's stop message now includes the function name when available:
 process stopped by SIGTRAP at 0x401156 (main) (breakpoint 1)
 ```
 
-The `printStopReason` function calls `target.ELF().FunctionContainingAddress(pc)`
-and appends the result in parentheses before the trap info.
+The `printStopReason` function calls `formatFunctionInfo(target, pc)` which
+prefers DWARF (showing source file and line) over the plain symbol table:
+
+```
+DWARF present:  "process stopped by SIGTRAP at 0x401156 (main at dwarf_target.c:30)"
+DWARF absent:   "process stopped by SIGTRAP at 0x401156 (main)"
+No symbols:     "process stopped by SIGTRAP at 0x401156"
+```
 
 ---
 
-## 25. File Reference
+## 25. DWARF Debug Information
+
+DWARF (Debugging With Arbitrary Record Formats) is the standard encoding for
+debug information on Linux. When a program is compiled with `-g`, the compiler
+writes DWARF data into ELF sections (`.debug_info`, `.debug_line`,
+`.debug_abbrev`, `.debug_ranges`). This data maps machine addresses back to
+source constructs: function names, source files, line numbers.
+
+### Why DWARF when we already have `.symtab`?
+
+The ELF symbol table (`.symtab`) gives us function names and sizes — enough
+for "which function is this address in?" But it cannot answer:
+
+- **What source file and line produced this instruction?**
+- **Where does an inlined function live in the caller?**
+- **What are the variable types and locations?**
+
+DWARF provides all of this. For now, toydbg uses it for function lookup with
+source locations. The infrastructure supports future extensions (variable
+inspection, line-level stepping).
+
+### Mental model: the DIE tree
+
+DWARF organizes debug info as a tree of **DIEs** (Debugging Information
+Entries). Each DIE has a **tag** and **attributes**:
+
+```
+TagCompileUnit (name="main.c", language=C)
+├── TagSubprogram (name="main", low_pc=0x401130, high_pc=0x4011a0)
+│   └── TagInlinedSubroutine (abstract_origin→"add_numbers", ranges=...)
+├── TagSubprogram (name="add_numbers", low_pc=0x401100, high_pc=0x401120)
+└── TagSubprogram (name="multiply_numbers", low_pc=0x401120, high_pc=0x401130)
+```
+
+- **`TagCompileUnit`** — one per source file, owns a line number program
+- **`TagSubprogram`** — a function, with address range(s)
+- **`TagInlinedSubroutine`** — an inlined function call, references its
+  original definition via `AttrAbstractOrigin`
+
+### Go's `debug/dwarf` package
+
+Go's standard library handles all the complex DWARF encoding:
+
+| What | Go API |
+|------|--------|
+| Load all DWARF sections | `elf.File.DWARF()` → `*dwarf.Data` |
+| Walk the DIE tree | `dwarf.Reader.Next()`, `SkipChildren()` |
+| Read a DIE's attributes | `dwarf.Entry.Val(attr)` |
+| Get address ranges | `dwarf.Data.Ranges(entry)` → `[][2]uint64` |
+| Map PC → source line | `dwarf.LineReader.SeekPC()` |
+
+This mirrors how `debugger/elf.go` wraps `debug/elf` — the stdlib parses,
+we build indexes.
+
+### Our wrapper: `debugger/dwarf.go`
+
+The `DWARF` struct holds pre-built indexes for fast lookup:
+
+```go
+type DWARF struct {
+    data        *dwarf.Data
+    funcsByAddr []funcAddrEntry          // sorted by startPC for binary search
+    funcsByName map[string][]*FunctionEntry
+    loadBias    uint64
+}
+```
+
+**Constructor (`newDWARF`):** Single-pass walk of the DIE tree:
+1. `TagSubprogram` with ranges → add to both `funcsByAddr` and `funcsByName`
+2. `TagInlinedSubroutine` → add to `funcsByName` only (resolve name via
+   `AttrAbstractOrigin`)
+3. Sort `funcsByAddr` by start address
+
+**Query methods:**
+
+| Method | Purpose | Complexity |
+|--------|---------|------------|
+| `FunctionContainingPC(addr)` | Binary search on sorted address index | O(log n) |
+| `FunctionsByName(name)` | Map lookup | O(1) |
+| `PCToSourceLocation(addr)` | Iterate CUs, use `LineReader.SeekPC()` | O(CUs) |
+
+### Load bias propagation
+
+DWARF addresses are file addresses (the addresses in the ELF before ASLR
+relocation). When querying by virtual address, we subtract the load bias first.
+The `ELF.SetLoadBias()` method propagates the bias to the DWARF wrapper:
+
+```go
+func (e *ELF) SetLoadBias(bias uint64) {
+    e.loadBias = bias
+    if e.dwarf != nil {
+        e.dwarf.loadBias = bias
+    }
+}
+```
+
+### Integration with the CLI
+
+The `formatFunctionInfo` function in `cmd/toydbg/main.go` prefers DWARF
+when available, falling back to the symbol table:
+
+1. Try `DWARF.FunctionContainingPC(pc)` + `PCToSourceLocation(pc)`
+2. Fall back to `ELF.FunctionContainingAddress(pc)` (symtab)
+3. Return empty string if neither works
+
+---
+
+## 26. File Reference
 
 | File | Purpose |
 |------|---------|
-| `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, step, breakpoint, watchpoint, register, memory, disassemble, catchpoint, help, quit), SIGINT handler, enhanced stop reason display with function names via Target |
+| `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, step, breakpoint, watchpoint, register, memory, disassemble, catchpoint, help, quit), SIGINT handler, DWARF-aware stop reason display with source locations |
 | `debugger/debugger.go` | Package documentation |
-| `debugger/elf.go` | ELF binary wrapper: symbol lookup by name and address, load bias, FunctionContainingAddress |
+| `debugger/elf.go` | ELF binary wrapper: symbol lookup by name and address, load bias, FunctionContainingAddress, DWARF loading |
+| `debugger/dwarf.go` | DWARF debug info wrapper: function lookup by address/name, source location mapping (PCToSourceLocation) |
 | `debugger/auxv_linux.go` | Linux `/proc/<pid>/auxv` reader for AT_ENTRY (load bias computation) |
 | `debugger/auxv_unsupported.go` | Non-Linux auxv stub |
 | `debugger/target.go` | Target type: combines Process + ELF for symbolic debugging (LaunchTarget, AttachTarget) |
@@ -1751,7 +1872,7 @@ and appends the result in parentheses before the trap info.
 | `debugger/register_info.go` | Register metadata table (125 entries) and lookup functions |
 | `debugger/registers_linux.go` | Register cache: read/write via ptrace |
 | `debugger/registers_unsupported.go` | Non-Linux register stubs |
-| `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests, breakpoint tests, hardware breakpoint tests, watchpoint tests, memory read/write tests, syscall mapping tests, syscall catchpoint tests, ELF parsing tests, Target tests) |
+| `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests, breakpoint tests, hardware breakpoint tests, watchpoint tests, memory read/write tests, syscall mapping tests, syscall catchpoint tests, ELF parsing tests, Target tests, DWARF tests) |
 | `test/targets/end_immediately/main.go` | Test target: exits immediately |
 | `test/targets/run_endlessly/main.go` | Test target: infinite loop |
 | `test/targets/reg_read.s` | Assembly test target: sets known register values and traps (no libc) |
@@ -1759,6 +1880,7 @@ and appends the result in parentheses before the trap info.
 | `test/targets/hello_toydbg.s` | Assembly test target: write + exit (no libc, non-PIE, used for breakpoint tests) |
 | `test/targets/memory.s` | Assembly test target: stores known values and provides buffers for memory read/write tests |
 | `test/targets/anti_debugger.c` | C test target: checksums its own function to detect software breakpoints (tests hardware breakpoint invisibility) |
+| `test/targets/dwarf_target.c` | C test target: compiled with `-g` for DWARF debug info tests (function lookup, source location) |
 | `doc.go` | Module-root package declaration |
 | `docs/sequence-diagram.mmd` | Mermaid sequence diagram of the attach-and-REPL lifecycle |
 | `Dockerfile` | Multi-stage build: compile + slim runtime image |

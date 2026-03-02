@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -662,12 +663,7 @@ func printStopReason(target *debugger.Target, reason debugger.StopReason) {
 		if err != nil {
 			fmt.Printf("process stopped by %s%s\n", sigName, trapInfo)
 		} else {
-			funcInfo := ""
-			if e := target.ELF(); e != nil {
-				if name, ok := e.FunctionContainingAddress(pc); ok {
-					funcInfo = fmt.Sprintf(" (%s)", name)
-				}
-			}
+			funcInfo := formatFunctionInfo(target, pc)
 			fmt.Printf("process stopped by %s at 0x%x%s%s\n", sigName, pc, funcInfo, trapInfo)
 		}
 	case debugger.ProcessExited:
@@ -679,6 +675,36 @@ func printStopReason(target *debugger.Target, reason debugger.StopReason) {
 	default:
 		fmt.Println("process status changed")
 	}
+}
+
+// formatFunctionInfo returns a parenthesized annotation for a stop address.
+// It prefers DWARF (which gives source file + line) over the plain symbol table.
+//
+//	DWARF present:  " (main at dwarf_target.c:30)"
+//	Symtab only:    " (main)"
+//	No symbols:     ""
+func formatFunctionInfo(target *debugger.Target, pc uint64) string {
+	e := target.ELF()
+	if e == nil {
+		return ""
+	}
+
+	// Try DWARF first — it gives us function name + source location.
+	if dw := e.DWARF(); dw != nil {
+		if fn := dw.FunctionContainingPC(pc); fn != nil {
+			if loc, ok := dw.PCToSourceLocation(pc); ok {
+				return fmt.Sprintf(" (%s at %s:%d)", fn.Name, filepath.Base(loc.File), loc.Line)
+			}
+			return fmt.Sprintf(" (%s)", fn.Name)
+		}
+	}
+
+	// Fall back to the ELF symbol table.
+	if name, ok := e.FunctionContainingAddress(pc); ok {
+		return fmt.Sprintf(" (%s)", name)
+	}
+
+	return ""
 }
 
 // handleStop prints the stop reason and, when the process is stopped,

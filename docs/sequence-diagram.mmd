@@ -43,10 +43,13 @@ sequenceDiagram
     K-->>D: file descriptor
     Note over D: Parse ELF header, symbol table (.symtab)
     Note over D: Build symbolsByName map + sorted symbolsByAddr
+    Note over D: Load DWARF sections (.debug_info, .debug_line, ...)
+    Note over D: Walk DIE tree → build funcsByAddr + funcsByName indexes
     D->>K: read /proc/<pid>/auxv — auxiliary vector
     K-->>D: array of {tag, value} pairs
     Note over D: Extract AT_ENTRY (tag 9) = actual entry point
     Note over D: loadBias = AT_ENTRY - elf.Entry
+    Note over D: Propagate loadBias to both ELF and DWARF
     Note over D: For non-PIE: loadBias = 0
     Note over D: For PIE: loadBias = ASLR base offset
 
@@ -69,8 +72,10 @@ sequenceDiagram
     K-->>D: register values
     Note over D: Registers cached in Process.regs
 
-    Note over D: Lookup function name: ELF.FunctionContainingAddress(PC)
-    D->>U: print stop reason (with PC address and function name)
+    Note over D: Lookup function: try DWARF.FunctionContainingPC(PC) first
+    Note over D: If DWARF: also PCToSourceLocation(PC) for file:line
+    Note over D: Fallback: ELF.FunctionContainingAddress(PC) (symtab only)
+    D->>U: print stop reason (with PC, function name, source location)
     D->>U: print prompt "(toydbg) "
     Note over D: Debugger BLOCKED on readline again
     Note over T: Tracee STOPPED again

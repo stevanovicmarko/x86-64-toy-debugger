@@ -59,6 +59,7 @@ func TestMain(m *testing.M) {
 		{"hello_toydbg", "hello_toydbg.s", []string{"-nostdlib", "-no-pie"}},
 		{"memory", "memory.s", []string{"-nostdlib", "-no-pie"}},
 		{"anti_debugger", "anti_debugger.c", []string{"-no-pie"}},
+		{"dwarf_target", "dwarf_target.c", []string{"-g", "-no-pie"}},
 	}
 	for _, t := range gccTargets {
 		src := filepath.Join("targets", t.src)
@@ -1770,4 +1771,164 @@ func TestTargetLaunchWithELF(t *testing.T) {
 	} else if name != "main" {
 		t.Errorf("FunctionContainingAddress(0x%x) = %q, want %q", pc, name, "main")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// DWARF debug information tests
+// ---------------------------------------------------------------------------
+
+func TestDWARFFunctionByName(t *testing.T) {
+	// Open the dwarf_target binary directly (no process needed for
+	// name-based DWARF lookup).
+	e, err := debugger.OpenELF(targetPath("dwarf_target"))
+	if err != nil {
+		t.Fatalf("OpenELF failed: %v", err)
+	}
+	defer e.Close()
+
+	dw := e.DWARF()
+	if dw == nil {
+		t.Fatal("expected DWARF info to be present (compiled with -g)")
+	}
+
+	// Verify we can find each function by name.
+	for _, name := range []string{"add_numbers", "multiply_numbers", "main"} {
+		fns := dw.FunctionsByName(name)
+		if len(fns) == 0 {
+			t.Errorf("FunctionsByName(%q) returned no results", name)
+			continue
+		}
+		if fns[0].Name != name {
+			t.Errorf("FunctionsByName(%q)[0].Name = %q", name, fns[0].Name)
+		}
+		if len(fns[0].Ranges) == 0 {
+			t.Errorf("FunctionsByName(%q)[0] has no address ranges", name)
+		}
+		t.Logf("%s: ranges=%v", name, fns[0].Ranges)
+	}
+
+	// Verify the address from DWARF matches the ELF symbol table.
+	addFns := dw.FunctionsByName("add_numbers")
+	addSyms := e.SymbolsByName("add_numbers")
+	if len(addFns) > 0 && len(addSyms) > 0 {
+		dwarfAddr := addFns[0].Ranges[0][0]
+		symAddr := addSyms[0].Value
+		if dwarfAddr != symAddr {
+			t.Errorf("DWARF address 0x%x != symtab address 0x%x for add_numbers",
+				dwarfAddr, symAddr)
+		}
+	}
+}
+
+func TestDWARFFunctionContainingPC(t *testing.T) {
+	// Launch the dwarf_target process and stop at the first int3.
+	// The int3 is inside main(), so FunctionContainingPC should
+	// return "main".
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer pr.Close()
+
+	target, err := debugger.LaunchTargetWithOptions(
+		targetPath("dwarf_target"),
+		debugger.LaunchOptions{Stdout: pw},
+	)
+	if err != nil {
+		pw.Close()
+		t.Fatalf("LaunchTarget failed: %v", err)
+	}
+	defer target.Close()
+	pw.Close()
+
+	proc := target.Process()
+
+	// Resume to the first int3 (past the address writes).
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume failed: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal failed: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+	}
+
+	pc, err := proc.GetPC()
+	if err != nil {
+		t.Fatalf("GetPC failed: %v", err)
+	}
+
+	dw := target.ELF().DWARF()
+	if dw == nil {
+		t.Fatal("expected DWARF info to be present")
+	}
+
+	fn := dw.FunctionContainingPC(pc)
+	if fn == nil {
+		t.Fatalf("FunctionContainingPC(0x%x) returned nil", pc)
+	}
+	if fn.Name != "main" {
+		t.Errorf("FunctionContainingPC(0x%x) = %q, want %q", pc, fn.Name, "main")
+	}
+	t.Logf("PC=0x%x is in function %q", pc, fn.Name)
+}
+
+func TestDWARFSourceLocation(t *testing.T) {
+	// Launch the dwarf_target and verify PCToSourceLocation returns
+	// a file containing "dwarf_target.c" with a positive line number.
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer pr.Close()
+
+	target, err := debugger.LaunchTargetWithOptions(
+		targetPath("dwarf_target"),
+		debugger.LaunchOptions{Stdout: pw},
+	)
+	if err != nil {
+		pw.Close()
+		t.Fatalf("LaunchTarget failed: %v", err)
+	}
+	defer target.Close()
+	pw.Close()
+
+	proc := target.Process()
+
+	// Resume to the first int3.
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume failed: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal failed: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+	}
+
+	pc, err := proc.GetPC()
+	if err != nil {
+		t.Fatalf("GetPC failed: %v", err)
+	}
+
+	dw := target.ELF().DWARF()
+	if dw == nil {
+		t.Fatal("expected DWARF info to be present")
+	}
+
+	loc, ok := dw.PCToSourceLocation(pc)
+	if !ok {
+		t.Fatalf("PCToSourceLocation(0x%x) returned false", pc)
+	}
+
+	if !strings.Contains(loc.File, "dwarf_target.c") {
+		t.Errorf("PCToSourceLocation file = %q, want it to contain %q", loc.File, "dwarf_target.c")
+	}
+	if loc.Line <= 0 {
+		t.Errorf("PCToSourceLocation line = %d, want > 0", loc.Line)
+	}
+	t.Logf("PC=0x%x → %s:%d", pc, loc.File, loc.Line)
 }
