@@ -1662,3 +1662,112 @@ func TestSyscallCatchpoints(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ELF parsing tests
+// ---------------------------------------------------------------------------
+
+func TestELFParserSymbolLookup(t *testing.T) {
+	// Open the hello_toydbg binary — a non-PIE assembly program with
+	// a known _start symbol at the entry point.
+	e, err := debugger.OpenELF(targetPath("hello_toydbg"))
+	if err != nil {
+		t.Fatalf("OpenELF failed: %v", err)
+	}
+	defer e.Close()
+
+	// _start should be findable by name.
+	syms := e.SymbolsByName("_start")
+	if len(syms) == 0 {
+		t.Fatal("expected to find _start symbol")
+	}
+
+	// For a non-PIE binary, load bias is 0. The _start symbol value
+	// should equal the ELF entry point.
+	if syms[0].Value != e.EntryPoint() {
+		t.Errorf("_start value 0x%x != entry point 0x%x", syms[0].Value, e.EntryPoint())
+	}
+
+	// Open the anti_debugger binary — a C program with main and
+	// an_innocent_function symbols.
+	e2, err := debugger.OpenELF(targetPath("anti_debugger"))
+	if err != nil {
+		t.Fatalf("OpenELF (anti_debugger) failed: %v", err)
+	}
+	defer e2.Close()
+
+	mainSyms := e2.SymbolsByName("main")
+	if len(mainSyms) == 0 {
+		t.Fatal("expected to find main symbol in anti_debugger")
+	}
+
+	innocentSyms := e2.SymbolsByName("an_innocent_function")
+	if len(innocentSyms) == 0 {
+		t.Fatal("expected to find an_innocent_function symbol")
+	}
+
+	// Verify FunctionContainingAddress works for the main symbol.
+	// Load bias is 0 for non-PIE.
+	mainAddr := mainSyms[0].Value
+	name, ok := e2.FunctionContainingAddress(mainAddr)
+	if !ok {
+		t.Fatal("FunctionContainingAddress did not find main")
+	}
+	if name != "main" {
+		t.Errorf("FunctionContainingAddress returned %q, want %q", name, "main")
+	}
+
+	// An address outside any function should return false.
+	_, ok = e2.FunctionContainingAddress(0x1)
+	if ok {
+		t.Error("FunctionContainingAddress should return false for address 0x1")
+	}
+}
+
+func TestTargetLaunchWithELF(t *testing.T) {
+	target, err := debugger.LaunchTargetWithOptions(
+		targetPath("anti_debugger"),
+		debugger.LaunchOptions{Stdout: io.Discard, Stderr: io.Discard},
+	)
+	if err != nil {
+		t.Fatalf("LaunchTarget failed: %v", err)
+	}
+	defer target.Close()
+
+	e := target.ELF()
+	if e == nil {
+		t.Fatal("expected ELF to be loaded")
+	}
+
+	// Verify the process is accessible.
+	proc := target.Process()
+	pc, err := proc.GetPC()
+	if err != nil {
+		t.Fatalf("GetPC failed: %v", err)
+	}
+
+	t.Logf("initial PC: 0x%x, entry point: 0x%x, load bias: 0x%x",
+		pc, e.EntryPoint(), e.LoadBias())
+
+	// Resume to the first int3 in the anti_debugger program.
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume failed: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal failed: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+	}
+
+	// At the int3 inside main(), FunctionContainingAddress should
+	// return "main".
+	pc, _ = proc.GetPC()
+	name, ok := e.FunctionContainingAddress(pc)
+	if !ok {
+		t.Errorf("FunctionContainingAddress(0x%x) returned false, expected a function", pc)
+	} else if name != "main" {
+		t.Errorf("FunctionContainingAddress(0x%x) = %q, want %q", pc, name, "main")
+	}
+}

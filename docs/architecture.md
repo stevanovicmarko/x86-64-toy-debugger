@@ -32,7 +32,8 @@ codebase, extending it, or building your own debugger from scratch.
 21. [Syscall Catchpoints](#21-syscall-catchpoints)
 22. [Watchpoint Data Tracking](#22-watchpoint-data-tracking)
 23. [Testing Strategy](#23-testing-strategy)
-24. [File Reference](#24-file-reference)
+24. [ELF Parsing and the Target Type](#24-elf-parsing-and-the-target-type)
+25. [File Reference](#25-file-reference)
 
 ---
 
@@ -1538,8 +1539,9 @@ Two minimal Go programs serve as tracees for basic lifecycle tests:
 | `end_immediately` | `test/targets/end_immediately/main.go` | Exits immediately (tests process exit handling) |
 | `run_endlessly` | `test/targets/run_endlessly/main.go` | Infinite loop (tests attach, resume, and signal delivery) |
 
-`TestMain()` compiles both Go targets with `go build` and all three
-assembly targets with `gcc` into a temporary directory before any tests run.
+`TestMain()` compiles both Go targets with `go build` and all five native
+targets (four assembly, one C) with `gcc` into a temporary directory before
+any tests run.
 
 ### Test categories
 
@@ -1558,6 +1560,8 @@ assembly targets with `gcc` into a temporary directory before any tests run.
 | **Memory write** | Debugger writes a string into inferior's buffer; inferior prints buffer contents; test verifies output |
 | **Hardware breakpoint** | Software BP at a function is detected by anti-debugger checksum (prints "pepperoni"); hardware BP at the same address evades the checksum (prints "pineapple"); verifies PC lands exactly at the breakpoint address |
 | **Watchpoint** | Write watchpoint creation, alignment validation, CRUD operations (list, get by ID, remove); verifies watchpoint enable/disable cycle through debug registers |
+| **ELF parsing** | Open ELF binaries (non-PIE assembly and C); find symbols by name (`_start`, `main`, `an_innocent_function`); verify `FunctionContainingAddress` resolves correctly; verify unknown addresses return false |
+| **Target** | Launch via `LaunchTargetWithOptions`; verify ELF is loaded and load bias is computed; resume to a known point inside `main()` and verify `FunctionContainingAddress` returns `"main"` |
 
 ### Native test targets (assembly and C)
 
@@ -1623,12 +1627,114 @@ the *kernel* sees the process in the expected state.
 
 ---
 
-## 24. File Reference
+## 24. ELF Parsing and the Target Type
+
+**Source:** `debugger/elf.go`, `debugger/auxv_linux.go`, `debugger/target.go`
+
+### Why ELF parsing?
+
+Until now, the debugger operated purely at the ptrace level — it knew
+process IDs, register values, and memory addresses, but had no idea what
+*function* an address belonged to. When a breakpoint triggers at `0x401156`,
+the user must mentally map that address to a function name. Real debuggers
+display `main` or `an_innocent_function` next to the address.
+
+ELF (Executable and Linkable Format) binaries contain a **symbol table**
+(`.symtab` section) that maps names to address ranges. By parsing this
+table, the debugger can answer "which function contains address X?"
+
+### Go's `debug/elf` package
+
+Go's standard library provides `debug/elf`, which handles all the low-level
+ELF parsing: file headers, section headers, program headers, symbol tables,
+and string tables. We wrap it with two pre-built lookup structures:
+
+```
+ELF
+├── symbolsByName   map[string][]*elf.Symbol    ← name → symbol(s)
+└── symbolsByAddr   []addrSymbol (sorted)       ← binary search by address
+```
+
+- **`symbolsByName`** — direct map lookup for "find the symbol named `main`".
+- **`symbolsByAddr`** — sorted slice of `{address, *Symbol}` pairs. For
+  "which function contains address X?", we binary search for the last symbol
+  with `addr ≤ X`, then check if `X < addr + size`.
+
+Only symbols with `Size > 0` enter the address index, since zero-size
+symbols cannot meaningfully "contain" an address.
+
+### Load bias and the auxiliary vector
+
+For a traditional `ET_EXEC` binary (compiled with `-no-pie`), symbol
+addresses in the ELF file are absolute virtual addresses — the kernel loads
+the binary at exactly the address specified. The **load bias** is 0.
+
+For a PIE (`ET_DYN`) binary, the kernel chooses a random base address
+(ASLR). Symbol values in the ELF file are offsets from that base. The load
+bias is `actual_load_address - elf_expected_address`.
+
+To compute the load bias, we read the **auxiliary vector** from
+`/proc/<pid>/auxv`. The kernel populates this array of `{tag, value}` pairs
+on the stack during `execve`. The key entry is `AT_ENTRY` (tag 9), which
+holds the actual entry point address. The load bias is:
+
+```
+load_bias = auxv[AT_ENTRY] - elf.Entry
+```
+
+For non-PIE: both are the same address, so `load_bias = 0`.
+For PIE: `auxv[AT_ENTRY]` includes the ASLR offset, `elf.Entry` does not.
+
+The `ELF` type stores the load bias and all address-lookup methods subtract
+it to convert virtual addresses (from the running process) to file addresses
+(from the symbol table).
+
+### The Target type
+
+`Target` is the new top-level abstraction that combines a `Process` (ptrace
+operations) with an `ELF` (symbol resolution):
+
+```
+Target
+├── process  *Process   ← ptrace, registers, breakpoints
+└── elf      *ELF       ← symbol table, load bias
+```
+
+`LaunchTarget` and `AttachTarget` replace direct `Launch`/`Attach` calls in
+the CLI. They:
+
+1. Create the `Process` via existing `Launch`/`Attach`
+2. Open the ELF file (path from argument, or `/proc/<pid>/exe` for attach)
+3. Read `/proc/<pid>/auxv` to get `AT_ENTRY`
+4. Compute and store the load bias
+
+ELF loading is **non-fatal** — if the binary is stripped, statically linked
+with no symbols, or `/proc` is unavailable, the `Target` works normally
+without symbol resolution.
+
+### CLI integration
+
+The REPL's stop message now includes the function name when available:
+
+```
+process stopped by SIGTRAP at 0x401156 (main) (breakpoint 1)
+```
+
+The `printStopReason` function calls `target.ELF().FunctionContainingAddress(pc)`
+and appends the result in parentheses before the trap info.
+
+---
+
+## 25. File Reference
 
 | File | Purpose |
 |------|---------|
-| `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, step, breakpoint, watchpoint, register, memory, disassemble, catchpoint, help, quit), SIGINT handler, enhanced stop reason display |
+| `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, step, breakpoint, watchpoint, register, memory, disassemble, catchpoint, help, quit), SIGINT handler, enhanced stop reason display with function names via Target |
 | `debugger/debugger.go` | Package documentation |
+| `debugger/elf.go` | ELF binary wrapper: symbol lookup by name and address, load bias, FunctionContainingAddress |
+| `debugger/auxv_linux.go` | Linux `/proc/<pid>/auxv` reader for AT_ENTRY (load bias computation) |
+| `debugger/auxv_unsupported.go` | Non-Linux auxv stub |
+| `debugger/target.go` | Target type: combines Process + ELF for symbolic debugging (LaunchTarget, AttachTarget) |
 | `debugger/error.go` | Custom error type and constructors |
 | `debugger/format.go` | `FormatRegisterValue` — display formatting for all register types |
 | `debugger/parse.go` | `ParseRegisterValue` — CLI string → typed value conversion |
@@ -1645,7 +1751,7 @@ the *kernel* sees the process in the expected state.
 | `debugger/register_info.go` | Register metadata table (125 entries) and lookup functions |
 | `debugger/registers_linux.go` | Register cache: read/write via ptrace |
 | `debugger/registers_unsupported.go` | Non-Linux register stubs |
-| `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests, breakpoint tests, hardware breakpoint tests, watchpoint tests, memory read/write tests, syscall mapping tests, syscall catchpoint tests) |
+| `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests, breakpoint tests, hardware breakpoint tests, watchpoint tests, memory read/write tests, syscall mapping tests, syscall catchpoint tests, ELF parsing tests, Target tests) |
 | `test/targets/end_immediately/main.go` | Test target: exits immediately |
 | `test/targets/run_endlessly/main.go` | Test target: infinite loop |
 | `test/targets/reg_read.s` | Assembly test target: sets known register values and traps (no libc) |

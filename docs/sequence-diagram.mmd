@@ -38,6 +38,18 @@ sequenceDiagram
     Note over D: Registers cached in Process.regs
     Note over T: Tracee remains STOPPED
 
+    Note over D,T: ── Phase 1c: ELF loading (Target) ──
+    D->>K: open(program) — read ELF binary
+    K-->>D: file descriptor
+    Note over D: Parse ELF header, symbol table (.symtab)
+    Note over D: Build symbolsByName map + sorted symbolsByAddr
+    D->>K: read /proc/<pid>/auxv — auxiliary vector
+    K-->>D: array of {tag, value} pairs
+    Note over D: Extract AT_ENTRY (tag 9) = actual entry point
+    Note over D: loadBias = AT_ENTRY - elf.Entry
+    Note over D: For non-PIE: loadBias = 0
+    Note over D: For PIE: loadBias = ASLR base offset
+
     Note over D,T: ── Phase 2: REPL loop ──
     D->>U: print prompt "(toydbg) "
     Note over D: Debugger BLOCKED on readline
@@ -57,7 +69,8 @@ sequenceDiagram
     K-->>D: register values
     Note over D: Registers cached in Process.regs
 
-    D->>U: print stop reason (with PC address)
+    Note over D: Lookup function name: ELF.FunctionContainingAddress(PC)
+    D->>U: print stop reason (with PC address and function name)
     D->>U: print prompt "(toydbg) "
     Note over D: Debugger BLOCKED on readline again
     Note over T: Tracee STOPPED again

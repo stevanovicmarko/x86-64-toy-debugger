@@ -28,20 +28,22 @@ func main() {
 	}
 
 	var (
-		proc *debugger.Process
-		err  error
+		target *debugger.Target
+		err    error
 	)
 
 	if pid != 0 {
-		proc, err = debugger.Attach(pid)
+		target, err = debugger.AttachTarget(pid)
 	} else {
-		proc, err = debugger.Launch(flag.Arg(0))
+		target, err = debugger.LaunchTarget(flag.Arg(0))
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
 		os.Exit(1)
 	}
-	defer proc.Close()
+	defer target.Close()
+
+	proc := target.Process()
 
 	// Install SIGINT handler: when the user presses Ctrl+C, send SIGSTOP
 	// to the inferior instead of killing the debugger. Setpgid in Launch
@@ -98,7 +100,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
 				return
 			}
-			handleStop(proc, reason)
+			handleStop(target, reason)
 
 			if reason.Reason == debugger.ProcessExited || reason.Reason == debugger.ProcessTerminated {
 				return
@@ -111,7 +113,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
 				continue
 			}
-			handleStop(proc, reason)
+			handleStop(target, reason)
 
 			if reason.Reason == debugger.ProcessExited || reason.Reason == debugger.ProcessTerminated {
 				return
@@ -650,7 +652,8 @@ func getSigtrapInfo(proc *debugger.Process, reason debugger.StopReason) string {
 	return ""
 }
 
-func printStopReason(proc *debugger.Process, reason debugger.StopReason) {
+func printStopReason(target *debugger.Target, reason debugger.StopReason) {
+	proc := target.Process()
 	switch reason.Reason {
 	case debugger.ProcessStopped:
 		sigName := signalName(reason.Info)
@@ -659,7 +662,13 @@ func printStopReason(proc *debugger.Process, reason debugger.StopReason) {
 		if err != nil {
 			fmt.Printf("process stopped by %s%s\n", sigName, trapInfo)
 		} else {
-			fmt.Printf("process stopped by %s at 0x%x%s\n", sigName, pc, trapInfo)
+			funcInfo := ""
+			if e := target.ELF(); e != nil {
+				if name, ok := e.FunctionContainingAddress(pc); ok {
+					funcInfo = fmt.Sprintf(" (%s)", name)
+				}
+			}
+			fmt.Printf("process stopped by %s at 0x%x%s%s\n", sigName, pc, funcInfo, trapInfo)
 		}
 	case debugger.ProcessExited:
 		fmt.Printf("process exited with code %d\n", reason.Info)
@@ -674,10 +683,10 @@ func printStopReason(proc *debugger.Process, reason debugger.StopReason) {
 
 // handleStop prints the stop reason and, when the process is stopped,
 // auto-disassembles a few instructions at the current PC.
-func handleStop(proc *debugger.Process, reason debugger.StopReason) {
-	printStopReason(proc, reason)
+func handleStop(target *debugger.Target, reason debugger.StopReason) {
+	printStopReason(target, reason)
 	if reason.Reason == debugger.ProcessStopped {
-		printDisassembly(proc, 5, nil)
+		printDisassembly(target.Process(), 5, nil)
 	}
 }
 
