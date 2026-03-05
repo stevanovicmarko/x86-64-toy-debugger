@@ -45,6 +45,8 @@ sequenceDiagram
     Note over D: Build symbolsByName map + sorted symbolsByAddr
     Note over D: Load DWARF sections (.debug_info, .debug_line, ...)
     Note over D: Walk DIE tree → build funcsByAddr + funcsByName indexes
+    Note over D: Load CFI sections (.eh_frame, .eh_frame_hdr)
+    Note over D: Parse .eh_frame_hdr → binary search table for FDE lookup
     D->>K: read /proc/<pid>/auxv — auxiliary vector
     K-->>D: array of {tag, value} pairs
     Note over D: Extract AT_ENTRY (tag 9) = actual entry point

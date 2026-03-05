@@ -33,6 +33,11 @@ type ELF struct {
 	// no DWARF sections. When present, it provides richer function
 	// lookup and source-location mapping than the symbol table alone.
 	dwarf *DWARF
+
+	// cfi holds the parsed call frame information from .eh_frame,
+	// or nil if the section is absent. CFI enables stack unwinding
+	// without requiring frame pointers.
+	cfi *CallFrameInformation
 }
 
 // OpenELF opens and parses an ELF binary, building the symbol lookup
@@ -80,7 +85,40 @@ func OpenELF(path string) (*ELF, error) {
 		e.dwarf = newDWARF(dwarfData)
 	}
 
+	// Load call frame information (.eh_frame) if present. This
+	// enables stack unwinding without frame pointers.
+	e.loadCFI(f)
+
 	return e, nil
+}
+
+// loadCFI reads the .eh_frame and .eh_frame_hdr sections and
+// constructs the CallFrameInformation. Non-fatal if sections are absent.
+func (e *ELF) loadCFI(f *elf.File) {
+	ehFrameSec := f.Section(".eh_frame")
+	if ehFrameSec == nil {
+		return
+	}
+	ehFrameData, err := ehFrameSec.Data()
+	if err != nil {
+		return
+	}
+
+	var ehFrameHdrData []byte
+	var ehFrameHdrAddr uint64
+	if hdrSec := f.Section(".eh_frame_hdr"); hdrSec != nil {
+		if data, err := hdrSec.Data(); err == nil {
+			ehFrameHdrData = data
+			ehFrameHdrAddr = hdrSec.Addr
+		}
+	}
+
+	var textStart uint64
+	if textSec := f.Section(".text"); textSec != nil {
+		textStart = textSec.Addr
+	}
+
+	e.cfi = newCallFrameInformation(ehFrameData, ehFrameSec.Addr, ehFrameHdrData, ehFrameHdrAddr, textStart)
 }
 
 // Close releases the underlying ELF file handle.
@@ -111,12 +149,21 @@ func (e *ELF) SetLoadBias(bias uint64) {
 	if e.dwarf != nil {
 		e.dwarf.loadBias = bias
 	}
+	if e.cfi != nil {
+		e.cfi.loadBias = bias
+	}
 }
 
 // DWARF returns the DWARF debug info, or nil if the binary has no
 // DWARF sections. Use this for source-location and rich function lookup.
 func (e *ELF) DWARF() *DWARF {
 	return e.dwarf
+}
+
+// CFI returns the call frame information, or nil if the binary has no
+// .eh_frame section. CFI enables stack unwinding without frame pointers.
+func (e *ELF) CFI() *CallFrameInformation {
+	return e.cfi
 }
 
 // LoadBias returns the current load bias.

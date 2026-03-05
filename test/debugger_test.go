@@ -2461,3 +2461,148 @@ func TestPrologueEndForRange(t *testing.T) {
 	}
 	t.Logf("add: [0x%x, 0x%x), prologue end at 0x%x", lowPC, highPC, pe)
 }
+
+// ---------------------------------------------------------------------------
+// Call Frame Information (CFI) tests
+// ---------------------------------------------------------------------------
+
+func TestCFILoaded(t *testing.T) {
+	// The stepping_target is compiled with -g -no-pie, which always
+	// produces an .eh_frame section. Verify CFI is loaded.
+	e, err := debugger.OpenELF(targetPath("stepping_target"))
+	if err != nil {
+		t.Fatalf("OpenELF failed: %v", err)
+	}
+	defer e.Close()
+
+	if e.CFI() == nil {
+		t.Fatal("expected CFI to be loaded (stepping_target has .eh_frame)")
+	}
+}
+
+func TestFDEForPC(t *testing.T) {
+	// Open the stepping_target and look up the FDE for the "add" function.
+	e, err := debugger.OpenELF(targetPath("stepping_target"))
+	if err != nil {
+		t.Fatalf("OpenELF failed: %v", err)
+	}
+	defer e.Close()
+
+	dw := e.DWARF()
+	if dw == nil {
+		t.Fatal("expected DWARF info")
+	}
+	cfi := e.CFI()
+	if cfi == nil {
+		t.Fatal("expected CFI info")
+	}
+
+	fns := dw.FunctionsByName("add")
+	if len(fns) == 0 {
+		t.Fatal("FunctionsByName(add) returned no results")
+	}
+	lowPC := fns[0].Ranges[0][0]
+
+	// For non-PIE, loadBias=0, so file addresses == runtime addresses.
+	// FDEForPC expects a runtime PC.
+	fde, err := cfi.FDEForPC(lowPC)
+	if err != nil {
+		t.Fatalf("FDEForPC(0x%x) failed: %v", lowPC, err)
+	}
+
+	// The FDE's range should contain the function's lowPC.
+	if !fde.ContainsPC(lowPC) {
+		t.Errorf("FDE [0x%x, 0x%x) does not contain add's lowPC 0x%x",
+			fde.InitialLocation, fde.InitialLocation+fde.AddressRange, lowPC)
+	}
+
+	t.Logf("add lowPC=0x%x → FDE [0x%x, 0x%x), range=%d bytes",
+		lowPC, fde.InitialLocation, fde.InitialLocation+fde.AddressRange, fde.AddressRange)
+}
+
+func TestCIEFields(t *testing.T) {
+	// Verify the CIE referenced by the "add" FDE has standard x86-64
+	// alignment factors.
+	e, err := debugger.OpenELF(targetPath("stepping_target"))
+	if err != nil {
+		t.Fatalf("OpenELF failed: %v", err)
+	}
+	defer e.Close()
+
+	cfi := e.CFI()
+	if cfi == nil {
+		t.Fatal("expected CFI info")
+	}
+	dw := e.DWARF()
+	if dw == nil {
+		t.Fatal("expected DWARF info")
+	}
+
+	fns := dw.FunctionsByName("add")
+	if len(fns) == 0 {
+		t.Fatal("no add function")
+	}
+
+	fde, err := cfi.FDEForPC(fns[0].Ranges[0][0])
+	if err != nil {
+		t.Fatalf("FDEForPC failed: %v", err)
+	}
+
+	cie := fde.CIE
+	// x86-64 standard: code alignment = 1, data alignment = -8
+	if cie.CodeAlignmentFactor != 1 {
+		t.Errorf("CodeAlignmentFactor = %d, want 1", cie.CodeAlignmentFactor)
+	}
+	if cie.DataAlignmentFactor != -8 {
+		t.Errorf("DataAlignmentFactor = %d, want -8", cie.DataAlignmentFactor)
+	}
+	// Return address register on x86-64 is 16 (RA).
+	if cie.ReturnAddressRegister != 16 {
+		t.Errorf("ReturnAddressRegister = %d, want 16", cie.ReturnAddressRegister)
+	}
+
+	t.Logf("CIE: code_align=%d, data_align=%d, return_reg=%d, has_aug=%v, fde_enc=0x%02x",
+		cie.CodeAlignmentFactor, cie.DataAlignmentFactor, cie.ReturnAddressRegister,
+		cie.HasAugmentation, cie.FDEPointerEncoding)
+}
+
+func TestFDEInstructions(t *testing.T) {
+	// Verify FDEs have non-empty instruction bytes (the actual
+	// DW_CFA_* evaluation comes in a later chapter).
+	e, err := debugger.OpenELF(targetPath("stepping_target"))
+	if err != nil {
+		t.Fatalf("OpenELF failed: %v", err)
+	}
+	defer e.Close()
+
+	cfi := e.CFI()
+	if cfi == nil {
+		t.Fatal("expected CFI info")
+	}
+	dw := e.DWARF()
+	if dw == nil {
+		t.Fatal("expected DWARF info")
+	}
+
+	fns := dw.FunctionsByName("add")
+	if len(fns) == 0 {
+		t.Fatal("no add function")
+	}
+
+	fde, err := cfi.FDEForPC(fns[0].Ranges[0][0])
+	if err != nil {
+		t.Fatalf("FDEForPC failed: %v", err)
+	}
+
+	if len(fde.Instructions) == 0 {
+		t.Error("FDE has no instructions (expected DW_CFA_* bytes)")
+	}
+
+	// The CIE should also have initial instructions.
+	if len(fde.CIE.Instructions) == 0 {
+		t.Error("CIE has no initial instructions")
+	}
+
+	t.Logf("FDE: %d instruction bytes; CIE: %d initial instruction bytes",
+		len(fde.Instructions), len(fde.CIE.Instructions))
+}

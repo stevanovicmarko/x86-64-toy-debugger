@@ -35,7 +35,8 @@ codebase, extending it, or building your own debugger from scratch.
 24. [ELF Parsing and the Target Type](#24-elf-parsing-and-the-target-type)
 25. [DWARF Debug Information](#25-dwarf-debug-information)
 26. [Source-Level Stepping and Breakpoints](#26-source-level-stepping-and-breakpoints)
-27. [File Reference](#27-file-reference)
+27. [Call Frame Information (CFI)](#27-call-frame-information-cfi)
+28. [File Reference](#28-file-reference)
 
 ---
 
@@ -1674,7 +1675,9 @@ and string tables. We wrap it with two pre-built lookup structures:
 ```
 ELF
 ├── symbolsByName   map[string][]*elf.Symbol    ← name → symbol(s)
-└── symbolsByAddr   []addrSymbol (sorted)       ← binary search by address
+├── symbolsByAddr   []addrSymbol (sorted)       ← binary search by address
+├── dwarf           *DWARF                      ← debug info (optional)
+└── cfi             *CallFrameInformation       ← stack unwinding (optional)
 ```
 
 - **`symbolsByName`** — direct map lookup for "find the symbol named `main`".
@@ -1880,13 +1883,17 @@ for backward compatibility but now delegates to `GetEntryByAddress`.
 
 DWARF addresses are file addresses (the addresses in the ELF before ASLR
 relocation). When querying by virtual address, we subtract the load bias first.
-The `ELF.SetLoadBias()` method propagates the bias to the DWARF wrapper:
+The `ELF.SetLoadBias()` method propagates the bias to both the DWARF and
+CFI wrappers:
 
 ```go
 func (e *ELF) SetLoadBias(bias uint64) {
     e.loadBias = bias
     if e.dwarf != nil {
         e.dwarf.loadBias = bias
+    }
+    if e.cfi != nil {
+        e.cfi.loadBias = bias
     }
 }
 ```
@@ -2028,14 +2035,158 @@ innermost. This is used by `StepOut` to detect when we're in an inlined frame.
 
 ---
 
-## 27. File Reference
+## 27. Call Frame Information (CFI)
+
+### Why CFI matters
+
+The debugger's `StepOut()` currently reads `[rbp+8]` to find the return address. This
+works with frame-pointer ABI, but breaks with `-fomit-frame-pointer` or optimized code
+where `rbp` is used as a general-purpose register. **Call Frame Information** is the
+DWARF mechanism for stack unwinding that works with *any* calling convention — each
+program counter maps to rules for recovering the previous frame's registers.
+
+### .eh_frame vs .debug_frame
+
+Both sections encode the same CFI data, but `.eh_frame` is the standard on Linux:
+
+| Aspect | `.eh_frame` | `.debug_frame` |
+|--------|-------------|----------------|
+| Purpose | Exception handling + debugging | Debugging only |
+| CIE ID field | 0 (backwards pointer convention) | 0xffffffff |
+| Pointer encoding | Supports pcrel, datarel, etc. | Absolute only |
+| Retained in stripped binaries? | Yes (needed for C++ exceptions) | No |
+
+The debugger parses `.eh_frame` because it is always present (even in stripped binaries),
+while `.debug_frame` is often absent.
+
+### CIE and FDE structure
+
+CFI data is organized as a series of entries in `.eh_frame`:
+
+```
+┌─────────────────────────────────────────┐
+│ CIE (Common Information Entry)          │
+│  ├── length, CIE_id=0, version          │
+│  ├── augmentation string ("zR", "zPLR") │
+│  ├── code_alignment_factor (ULEB128)    │  ← x86-64: 1
+│  ├── data_alignment_factor (SLEB128)    │  ← x86-64: -8
+│  ├── return_address_register (ULEB128)  │  ← x86-64: 16 (RA)
+│  ├── [augmentation data: R, L, P, ...]  │
+│  └── initial_instructions               │
+├─────────────────────────────────────────┤
+│ FDE (Frame Description Entry)           │
+│  ├── length, CIE_pointer (backward)     │
+│  ├── initial_location + address_range   │
+│  ├── [augmentation data]                │
+│  └── instructions                       │
+├─────────────────────────────────────────┤
+│ FDE ...                                 │
+├─────────────────────────────────────────┤
+│ CIE (another group) ...                │
+└─────────────────────────────────────────┘
+```
+
+The **CIE pointer** in an FDE is a *backward offset* from the CIE pointer field
+itself to the start of the referenced CIE. This means `cieOffset = fieldPosition - ciePtr`.
+
+### Pointer encoding
+
+`.eh_frame` uses a compact pointer encoding scheme where a single byte describes both
+*format* (how bytes are stored) and *application* (what the value is relative to):
+
+```
+ encoding byte: [ application (4 bits) | format (4 bits) ]
+
+ Format (low nibble):        Application (high nibble):
+   0x00 = absptr (8 bytes)     0x00 = absolute
+   0x01 = uleb128              0x10 = pcrel (relative to this byte's address)
+   0x02 = udata2               0x20 = textrel (relative to .text)
+   0x03 = udata4               0x30 = datarel (relative to section start)
+   0x04 = udata8
+   0x09 = sleb128            Special:
+   0x0a = sdata2               0xff = omit (value absent)
+   0x0b = sdata4
+   0x0c = sdata8
+```
+
+On x86-64 Linux, the typical encoding is `0x1b` = `DW_EH_PE_pcrel | DW_EH_PE_sdata4`,
+meaning each pointer is a 4-byte signed offset relative to its own position. This makes
+`.eh_frame` position-independent — critical for shared libraries.
+
+### Augmentation string
+
+The augmentation string in a CIE (e.g., `"zR"`, `"zPLR"`) describes optional data:
+
+- **`z`**: Augmentation data has a ULEB128 length prefix (enables skipping unknown data)
+- **`R`**: FDE pointer encoding byte follows — controls how `initial_location` is encoded
+- **`L`**: LSDA (Language-Specific Data Area) encoding byte for exception tables
+- **`P`**: Personality routine encoding byte + pointer (for C++ exception handling)
+- **`S`**: Signal frame marker (no data)
+
+### .eh_frame_hdr binary search
+
+The `.eh_frame_hdr` section provides a **sorted table** of `(initial_location, fde_pointer)`
+pairs, enabling O(log n) FDE lookup instead of scanning the entire `.eh_frame`:
+
+```
+.eh_frame_hdr layout:
+  version (1 byte, must be 1)
+  eh_frame_ptr_enc (1 byte)
+  fde_count_enc (1 byte)
+  table_enc (1 byte)
+  eh_frame_ptr (encoded)
+  fde_count (encoded)
+  ┌──────────────────────────────┐
+  │ search table (sorted):       │
+  │   initial_location₀, fde₀   │
+  │   initial_location₁, fde₁   │
+  │   ...                        │
+  └──────────────────────────────┘
+```
+
+`FDEForPC()` binary searches this table, then parses the FDE at the found offset.
+If `.eh_frame_hdr` is absent, it falls back to a linear scan of `.eh_frame`.
+
+### Implementation
+
+CFI parsing lives in **`debugger/cfi.go`** with these key types:
+
+- **`cfiReader`**: Stateful cursor over a byte slice with a `baseAddr` field tracking
+  the virtual address of `data[0]`. This is essential for `DW_EH_PE_pcrel` decoding —
+  the "current PC" is `baseAddr + pos`.
+
+- **`CIE`**: Parsed Common Information Entry with alignment factors, return register,
+  augmentation flags, and initial instructions.
+
+- **`FDE`**: Parsed Frame Description Entry with initial location, address range,
+  CIE reference, and instructions.
+
+- **`CallFrameInformation`**: Main container that holds `.eh_frame` data, a CIE cache,
+  and the `.eh_frame_hdr` binary search table. Provides `FDEForPC(pc)` for lookup.
+
+### ELF integration
+
+`OpenELF()` reads `.eh_frame`, `.eh_frame_hdr`, and `.text` sections, constructing
+`CallFrameInformation` if `.eh_frame` exists. `SetLoadBias()` propagates the bias
+to CFI (just as it does for DWARF). Access via `ELF.CFI()`.
+
+### SLEB128 note
+
+Go's `encoding/binary.Varint` uses **zigzag encoding** (protobuf style), not SLEB128.
+SLEB128 uses sign extension of the last byte's bit 6. The `cfiReader.readSLEB128()`
+method implements the DWARF algorithm directly.
+
+---
+
+## 28. File Reference
 
 | File | Purpose |
 |------|---------|
 | `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, step, next, finish, stepi, list, breakpoint, watchpoint, register, memory, disassemble, catchpoint, help, quit), SIGINT handler, source-level stop display |
 | `debugger/debugger.go` | Package documentation |
-| `debugger/elf.go` | ELF binary wrapper: symbol lookup by name and address, load bias, FunctionContainingAddress, DWARF loading |
+| `debugger/elf.go` | ELF binary wrapper: symbol lookup by name and address, load bias, FunctionContainingAddress, DWARF loading, CFI loading |
 | `debugger/dwarf.go` | DWARF debug info wrapper: function lookup by address/name, line table index (GetEntryByAddress, GetEntriesByLine, AllLineEntries), source location mapping, InlineStackAtAddress, PrologueEndForRange |
+| `debugger/cfi.go` | Call Frame Information parser: CIE/FDE parsing, pointer encoding, .eh_frame_hdr binary search, FDEForPC lookup |
 | `debugger/auxv_linux.go` | Linux `/proc/<pid>/auxv` reader for AT_ENTRY (load bias computation) |
 | `debugger/auxv_unsupported.go` | Non-Linux auxv stub |
 | `debugger/target.go` | Target type: combines Process + ELF for symbolic debugging (LaunchTarget, AttachTarget) |
@@ -2056,7 +2207,7 @@ innermost. This is used by `StepOut` to detect when we're in an inlined frame.
 | `debugger/register_info.go` | Register metadata table (125 entries) and lookup functions |
 | `debugger/registers_linux.go` | Register cache: read/write via ptrace |
 | `debugger/registers_unsupported.go` | Non-Linux register stubs |
-| `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests, breakpoint tests, hardware breakpoint tests, watchpoint tests, memory read/write tests, syscall mapping tests, syscall catchpoint tests, ELF parsing tests, Target tests, DWARF tests, source-level stepping tests, source-level breakpoint tests, inline stack tests, source display tests) |
+| `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests, breakpoint tests, hardware breakpoint tests, watchpoint tests, memory read/write tests, syscall mapping tests, syscall catchpoint tests, ELF parsing tests, Target tests, DWARF tests, source-level stepping tests, source-level breakpoint tests, inline stack tests, source display tests, CFI tests) |
 | `test/targets/end_immediately/main.go` | Test target: exits immediately |
 | `test/targets/run_endlessly/main.go` | Test target: infinite loop |
 | `test/targets/reg_read.s` | Assembly test target: sets known register values and traps (no libc) |
