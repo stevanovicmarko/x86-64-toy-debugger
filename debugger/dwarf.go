@@ -13,8 +13,9 @@ import (
 // or optimized with hot/cold partitioning can have multiple ranges.
 type FunctionEntry struct {
 	Name      string
-	Ranges    [][2]uint64 // [low, high) in file-address space
+	Ranges    [][2]uint64  // [low, high) in file-address space
 	IsInlined bool
+	DIEOffset dwarf.Offset // offset of this DIE in .debug_info
 }
 
 // SourceLocation maps a program counter to the source file and line
@@ -204,6 +205,7 @@ func (d *DWARF) addFunction(entry *dwarf.Entry, reader *dwarf.Reader, inlined bo
 		Name:      name,
 		Ranges:    ranges,
 		IsInlined: inlined,
+		DIEOffset: entry.Offset,
 	}
 
 	d.funcsByName[name] = append(d.funcsByName[name], fn)
@@ -359,6 +361,140 @@ func (d *DWARF) AllLineEntries() []LineEntry {
 	result := make([]LineEntry, len(d.lines.entries))
 	copy(result, d.lines.entries)
 	return result
+}
+
+// InlineStackAtAddress returns the inline call stack at a virtual address,
+// ordered outermost → innermost. The outermost entry is the containing
+// non-inlined function; deeper entries are inlined subroutines whose
+// ranges enclose the address. Returns nil if no DWARF info is available.
+func (d *DWARF) InlineStackAtAddress(addr uint64) []*FunctionEntry {
+	fileAddr := addr - d.loadBias
+
+	// Find the non-inlined function containing this address.
+	outerFn := d.FunctionContainingPC(addr)
+	if outerFn == nil {
+		return nil
+	}
+
+	stack := []*FunctionEntry{outerFn}
+	d.walkInlineChildren(outerFn.DIEOffset, fileAddr, &stack)
+	return stack
+}
+
+// walkInlineChildren recursively walks children of a DIE, looking for
+// TagInlinedSubroutine entries whose ranges contain fileAddr. Matching
+// entries are appended to stack and their children are recursed into.
+// TagLexicalBlock entries are also recursed through since they can
+// contain inlined subroutines.
+func (d *DWARF) walkInlineChildren(parentOffset dwarf.Offset, fileAddr uint64, stack *[]*FunctionEntry) {
+	reader := d.data.Reader()
+	reader.Seek(parentOffset)
+
+	// Read the parent entry itself and skip past it.
+	parent, err := reader.Next()
+	if err != nil || parent == nil || !parent.Children {
+		return
+	}
+
+	for {
+		child, err := reader.Next()
+		if err != nil || child == nil || child.Tag == 0 {
+			break
+		}
+
+		switch child.Tag {
+		case dwarf.TagInlinedSubroutine:
+			ranges, err := d.data.Ranges(child)
+			if err != nil || !rangesContain(ranges, fileAddr) {
+				reader.SkipChildren()
+				continue
+			}
+			// Resolve the name via abstract origin.
+			name := entryName(child)
+			if name == "" {
+				if ref, ok := child.Val(dwarf.AttrAbstractOrigin).(dwarf.Offset); ok {
+					name = d.resolveAbstractOriginName(ref)
+				}
+			}
+			fn := &FunctionEntry{
+				Name:      name,
+				Ranges:    ranges,
+				IsInlined: true,
+				DIEOffset: child.Offset,
+			}
+			*stack = append(*stack, fn)
+			// Recurse into this inlined subroutine's children.
+			d.walkInlineChildren(child.Offset, fileAddr, stack)
+			// After recursion we've already consumed children via the
+			// recursive seek, so skip them here. But since we already
+			// recursed with a fresh reader from Seek, the current
+			// reader's position is stale. We need to skip children
+			// in the current reader.
+			reader.SkipChildren()
+
+		case dwarf.TagLexDwarfBlock:
+			ranges, err := d.data.Ranges(child)
+			if err != nil || !rangesContain(ranges, fileAddr) {
+				reader.SkipChildren()
+				continue
+			}
+			// Lexical blocks can contain inlined subroutines — recurse.
+			d.walkInlineChildren(child.Offset, fileAddr, stack)
+			reader.SkipChildren()
+
+		default:
+			reader.SkipChildren()
+		}
+	}
+}
+
+// rangesContain reports whether any [low, high) range contains addr.
+func rangesContain(ranges [][2]uint64, addr uint64) bool {
+	for _, r := range ranges {
+		if addr >= r[0] && addr < r[1] {
+			return true
+		}
+	}
+	return false
+}
+
+// PrologueEndForRange scans the line table for the first entry with
+// PrologueEnd==true in [lowPC, highPC). If none is found, it falls
+// back to the address of the second line entry in the range (a common
+// heuristic: the first entry is the prologue, the second is the body).
+// All addresses are in file-address space.
+func (d *DWARF) PrologueEndForRange(lowPC, highPC uint64) (uint64, bool) {
+	entries := d.lines.entries
+	n := len(entries)
+	if n == 0 {
+		return 0, false
+	}
+
+	// Binary search for the first entry with Address >= lowPC.
+	start := sort.Search(n, func(i int) bool {
+		return entries[i].Address >= lowPC
+	})
+
+	// First pass: look for an explicit PrologueEnd marker.
+	for i := start; i < n && entries[i].Address < highPC; i++ {
+		if entries[i].PrologueEnd && !entries[i].EndSequence {
+			return entries[i].Address, true
+		}
+	}
+
+	// Fallback: return the second non-EndSequence entry in the range.
+	count := 0
+	for i := start; i < n && entries[i].Address < highPC; i++ {
+		if entries[i].EndSequence {
+			continue
+		}
+		count++
+		if count == 2 {
+			return entries[i].Address, true
+		}
+	}
+
+	return 0, false
 }
 
 // pathEndsWith checks whether fullPath ends with suffix at a path

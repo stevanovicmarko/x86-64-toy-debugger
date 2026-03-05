@@ -60,6 +60,7 @@ func TestMain(m *testing.M) {
 		{"memory", "memory.s", []string{"-nostdlib", "-no-pie"}},
 		{"anti_debugger", "anti_debugger.c", []string{"-no-pie"}},
 		{"dwarf_target", "dwarf_target.c", []string{"-g", "-no-pie"}},
+		{"stepping_target", "stepping_target.c", []string{"-g", "-no-pie"}},
 	}
 	for _, t := range gccTargets {
 		src := filepath.Join("targets", t.src)
@@ -2090,4 +2091,373 @@ func TestDWARFGetEntryByAddress(t *testing.T) {
 	}
 
 	t.Logf("PC=0x%x → %s:%d (column=%d)", pc, entry.File, entry.Line, entry.Column)
+}
+
+// ---------------------------------------------------------------------------
+// Source-level stepping tests
+// ---------------------------------------------------------------------------
+
+// launchSteppingTarget starts the stepping_target binary, captures its
+// stdout pipe, and resumes to the first int3. Returns the target and
+// the address of the "add" function (read from the pipe).
+func launchSteppingTarget(t *testing.T) (*debugger.Target, uint64) {
+	t.Helper()
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer pr.Close()
+
+	target, err := debugger.LaunchTargetWithOptions(
+		targetPath("stepping_target"),
+		debugger.LaunchOptions{Stdout: pw},
+	)
+	if err != nil {
+		pw.Close()
+		t.Fatalf("LaunchTarget failed: %v", err)
+	}
+	pw.Close()
+
+	proc := target.Process()
+
+	// Resume to the first int3.
+	if err := proc.Resume(); err != nil {
+		target.Close()
+		t.Fatalf("Resume failed: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		target.Close()
+		t.Fatalf("WaitOnSignal failed: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		target.Close()
+		t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+	}
+
+	// Read the address of add from the pipe.
+	var addAddr uint64
+	if err := binary.Read(pr, binary.LittleEndian, &addAddr); err != nil {
+		target.Close()
+		t.Fatalf("read add address: %v", err)
+	}
+
+	return target, addAddr
+}
+
+func TestBreakpointAtFunction(t *testing.T) {
+	target, _ := launchSteppingTarget(t)
+	defer target.Close()
+
+	// Set a breakpoint on the "add" function.
+	sites, err := target.SetBreakpointAtFunction("add", false)
+	if err != nil {
+		t.Fatalf("SetBreakpointAtFunction failed: %v", err)
+	}
+	if len(sites) == 0 {
+		t.Fatal("SetBreakpointAtFunction returned no sites")
+	}
+	t.Logf("breakpoint set at 0x%x", sites[0].Address())
+
+	// Resume — should stop at the breakpoint.
+	proc := target.Process()
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume failed: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal failed: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+	}
+
+	// Verify PC is at the breakpoint (past prologue, within add's range).
+	pc, _ := proc.GetPC()
+	dw := target.ELF().DWARF()
+	fn := dw.FunctionContainingPC(pc)
+	if fn == nil {
+		t.Fatalf("FunctionContainingPC(0x%x) returned nil", pc)
+	}
+	if fn.Name != "add" {
+		t.Errorf("stopped in %q, want %q", fn.Name, "add")
+	}
+	t.Logf("stopped at 0x%x in function %q", pc, fn.Name)
+}
+
+func TestBreakpointAtLine(t *testing.T) {
+	target, _ := launchSteppingTarget(t)
+	defer target.Close()
+
+	// Set a breakpoint at stepping_target.c:37 (the add() call line).
+	sites, err := target.SetBreakpointAtLine("stepping_target.c", 37, false)
+	if err != nil {
+		t.Fatalf("SetBreakpointAtLine failed: %v", err)
+	}
+	if len(sites) == 0 {
+		t.Fatal("SetBreakpointAtLine returned no sites")
+	}
+	t.Logf("breakpoint set at 0x%x", sites[0].Address())
+
+	// Resume — should stop at the breakpoint.
+	proc := target.Process()
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume failed: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal failed: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+	}
+
+	// Verify we're at the right line.
+	pc, _ := proc.GetPC()
+	dw := target.ELF().DWARF()
+	loc, ok := dw.PCToSourceLocation(pc)
+	if !ok {
+		t.Fatalf("PCToSourceLocation(0x%x) failed", pc)
+	}
+	if !strings.Contains(loc.File, "stepping_target.c") {
+		t.Errorf("stopped in %q, want stepping_target.c", loc.File)
+	}
+	if loc.Line != 37 {
+		t.Errorf("stopped at line %d, want 37", loc.Line)
+	}
+	t.Logf("stopped at %s:%d (0x%x)", loc.File, loc.Line, pc)
+}
+
+func TestStepIn(t *testing.T) {
+	target, _ := launchSteppingTarget(t)
+	defer target.Close()
+
+	// We're at the first int3 (inside main, before the add() call).
+	// StepIn repeatedly until we enter the "add" function.
+	enteredAdd := false
+	for i := 0; i < 50; i++ {
+		reason, err := target.StepIn()
+		if err != nil {
+			t.Fatalf("StepIn failed: %v", err)
+		}
+		if reason.Reason != debugger.ProcessStopped {
+			t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+		}
+
+		pc, _ := target.Process().GetPC()
+		dw := target.ELF().DWARF()
+		fn := dw.FunctionContainingPC(pc)
+		if fn != nil && fn.Name == "add" {
+			enteredAdd = true
+			t.Logf("entered add at 0x%x after %d steps", pc, i+1)
+			break
+		}
+	}
+	if !enteredAdd {
+		t.Error("StepIn did not enter add within 50 source-level steps")
+	}
+}
+
+func TestStepOver(t *testing.T) {
+	target, _ := launchSteppingTarget(t)
+	defer target.Close()
+
+	// Set a breakpoint at line 37 (the add() call).
+	sites, err := target.SetBreakpointAtLine("stepping_target.c", 37, false)
+	if err != nil {
+		t.Fatalf("SetBreakpointAtLine failed: %v", err)
+	}
+
+	// Resume to the breakpoint.
+	proc := target.Process()
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume failed: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal failed: %v", err)
+	}
+
+	// Clean up the breakpoint so stepping doesn't hit it again.
+	for _, s := range sites {
+		proc.RemoveBreakpointSite(s.ID())
+	}
+
+	// Now StepOver — should skip over add() and land on the next line.
+	reason, err = target.StepOver()
+	if err != nil {
+		t.Fatalf("StepOver failed: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+	}
+
+	// Verify we're still in main (did not enter add).
+	pc, _ := proc.GetPC()
+	dw := target.ELF().DWARF()
+	fn := dw.FunctionContainingPC(pc)
+	if fn == nil {
+		t.Fatalf("FunctionContainingPC(0x%x) returned nil", pc)
+	}
+	if fn.Name != "main" {
+		t.Errorf("after StepOver, in %q, want %q", fn.Name, "main")
+	}
+
+	// Verify we advanced past line 37.
+	loc, ok := dw.PCToSourceLocation(pc)
+	if !ok {
+		t.Fatalf("PCToSourceLocation(0x%x) failed", pc)
+	}
+	if loc.Line <= 37 {
+		t.Errorf("after StepOver from line 37, now at line %d (expected > 37)", loc.Line)
+	}
+	t.Logf("after StepOver: %s:%d in %s", loc.File, loc.Line, fn.Name)
+}
+
+func TestStepOut(t *testing.T) {
+	target, _ := launchSteppingTarget(t)
+	defer target.Close()
+
+	// StepIn until we enter add.
+	for i := 0; i < 50; i++ {
+		reason, err := target.StepIn()
+		if err != nil {
+			t.Fatalf("StepIn failed: %v", err)
+		}
+		if reason.Reason != debugger.ProcessStopped {
+			t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+		}
+		pc, _ := target.Process().GetPC()
+		dw := target.ELF().DWARF()
+		fn := dw.FunctionContainingPC(pc)
+		if fn != nil && fn.Name == "add" {
+			break
+		}
+	}
+
+	// Now StepOut — should return to main.
+	reason, err := target.StepOut()
+	if err != nil {
+		t.Fatalf("StepOut failed: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+	}
+
+	pc, _ := target.Process().GetPC()
+	dw := target.ELF().DWARF()
+	fn := dw.FunctionContainingPC(pc)
+	if fn == nil {
+		t.Fatalf("FunctionContainingPC(0x%x) returned nil after StepOut", pc)
+	}
+	if fn.Name != "main" {
+		t.Errorf("after StepOut, in %q, want %q", fn.Name, "main")
+	}
+	t.Logf("StepOut returned to %s at 0x%x", fn.Name, pc)
+}
+
+func TestInlineStack(t *testing.T) {
+	// Use the dwarf_target binary for inline stack testing.
+	// Even without actual inlining (-O0), InlineStackAtAddress
+	// should return at least the containing function.
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer pr.Close()
+
+	target, err := debugger.LaunchTargetWithOptions(
+		targetPath("dwarf_target"),
+		debugger.LaunchOptions{Stdout: pw},
+	)
+	if err != nil {
+		pw.Close()
+		t.Fatalf("LaunchTarget failed: %v", err)
+	}
+	defer target.Close()
+	pw.Close()
+
+	proc := target.Process()
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume failed: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal failed: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+	}
+
+	pc, _ := proc.GetPC()
+	dw := target.ELF().DWARF()
+	stack := dw.InlineStackAtAddress(pc)
+
+	// At -O0, the stack should have at least the outer function (main).
+	if len(stack) == 0 {
+		t.Fatal("InlineStackAtAddress returned empty stack")
+	}
+	if stack[0].Name != "main" {
+		t.Errorf("stack[0].Name = %q, want %q", stack[0].Name, "main")
+	}
+	t.Logf("inline stack at 0x%x: %d entries, outer=%s", pc, len(stack), stack[0].Name)
+}
+
+func TestPrintSource(t *testing.T) {
+	target, _ := launchSteppingTarget(t)
+	defer target.Close()
+
+	var buf strings.Builder
+	ok := target.PrintSourceAtPC(&buf, 2)
+	if !ok {
+		t.Fatal("PrintSourceAtPC returned false")
+	}
+
+	output := buf.String()
+	if output == "" {
+		t.Fatal("PrintSourceAtPC produced no output")
+	}
+
+	// Should contain a '>' marker for the current line.
+	if !strings.Contains(output, ">") {
+		t.Error("output missing '>' marker for current line")
+	}
+
+	t.Logf("PrintSourceAtPC output:\n%s", output)
+}
+
+func TestPrologueEndForRange(t *testing.T) {
+	// Open the stepping_target binary and verify PrologueEndForRange
+	// returns an address within the "add" function.
+	e, err := debugger.OpenELF(targetPath("stepping_target"))
+	if err != nil {
+		t.Fatalf("OpenELF failed: %v", err)
+	}
+	defer e.Close()
+
+	dw := e.DWARF()
+	if dw == nil {
+		t.Fatal("expected DWARF info to be present")
+	}
+
+	fns := dw.FunctionsByName("add")
+	if len(fns) == 0 {
+		t.Fatal("FunctionsByName(add) returned no results")
+	}
+
+	fn := fns[0]
+	lowPC := fn.Ranges[0][0]
+	highPC := fn.Ranges[0][1]
+
+	pe, ok := dw.PrologueEndForRange(lowPC, highPC)
+	if !ok {
+		t.Fatal("PrologueEndForRange returned false for add")
+	}
+	if pe < lowPC || pe >= highPC {
+		t.Errorf("prologue end 0x%x outside add's range [0x%x, 0x%x)", pe, lowPC, highPC)
+	}
+	if pe == lowPC {
+		t.Log("prologue end == lowPC (prologue is empty, this can happen at -O0)")
+	}
+	t.Logf("add: [0x%x, 0x%x), prologue end at 0x%x", lowPC, highPC, pe)
 }

@@ -107,8 +107,8 @@ func main() {
 				return
 			}
 		case "breakpoint", "break":
-			handleBreakpoint(proc, fields[1:])
-		case "step", "s":
+			handleBreakpoint(target, fields[1:])
+		case "stepi", "si":
 			reason, err := proc.StepInstruction()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
@@ -118,6 +118,43 @@ func main() {
 
 			if reason.Reason == debugger.ProcessExited || reason.Reason == debugger.ProcessTerminated {
 				return
+			}
+		case "step", "s":
+			reason, err := target.StepIn()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
+				continue
+			}
+			handleStop(target, reason)
+
+			if reason.Reason == debugger.ProcessExited || reason.Reason == debugger.ProcessTerminated {
+				return
+			}
+		case "next", "n":
+			reason, err := target.StepOver()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
+				continue
+			}
+			handleStop(target, reason)
+
+			if reason.Reason == debugger.ProcessExited || reason.Reason == debugger.ProcessTerminated {
+				return
+			}
+		case "finish", "fin":
+			reason, err := target.StepOut()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
+				continue
+			}
+			handleStop(target, reason)
+
+			if reason.Reason == debugger.ProcessExited || reason.Reason == debugger.ProcessTerminated {
+				return
+			}
+		case "list", "l":
+			if !target.PrintSourceAtPC(os.Stdout, 5) {
+				fmt.Println("no source information available at current PC")
 			}
 		case "register", "reg":
 			handleRegister(proc, fields[1:])
@@ -155,12 +192,14 @@ func handleHelp(args []string) {
 			return
 		case "breakpoint", "break":
 			fmt.Println("breakpoint subcommands:")
-			fmt.Println("  breakpoint set <hex-addr>      - set a software breakpoint")
-			fmt.Println("  breakpoint set -h <hex-addr>   - set a hardware breakpoint")
-			fmt.Println("  breakpoint list                - list all breakpoints")
-			fmt.Println("  breakpoint enable <id>         - enable a breakpoint")
-			fmt.Println("  breakpoint disable <id>        - disable a breakpoint")
-			fmt.Println("  breakpoint delete <id>         - delete a breakpoint")
+			fmt.Println("  breakpoint set <hex-addr>         - set breakpoint at address")
+			fmt.Println("  breakpoint set <function>         - set breakpoint at function")
+			fmt.Println("  breakpoint set <file>:<line>      - set breakpoint at source line")
+			fmt.Println("  breakpoint set -h <location>      - set a hardware breakpoint")
+			fmt.Println("  breakpoint list                   - list all breakpoints")
+			fmt.Println("  breakpoint enable <id>            - enable a breakpoint")
+			fmt.Println("  breakpoint disable <id>           - disable a breakpoint")
+			fmt.Println("  breakpoint delete <id>            - delete a breakpoint")
 			return
 		case "watchpoint", "watch":
 			fmt.Println("watchpoint subcommands:")
@@ -194,10 +233,11 @@ func handleHelp(args []string) {
 			return
 		}
 	}
-	fmt.Println("commands: continue (c), step (s), breakpoint (break), watchpoint (watch), register (reg), memory (mem), disassemble (disas), catchpoint (catch), quit (q), help (h)")
+	fmt.Println("commands: continue (c), step (s), next (n), finish (fin), stepi (si), list (l), breakpoint (break), watchpoint (watch), register (reg), memory (mem), disassemble (disas), catchpoint (catch), quit (q), help (h)")
 }
 
-func handleBreakpoint(proc *debugger.Process, args []string) {
+func handleBreakpoint(target *debugger.Target, args []string) {
+	proc := target.Process()
 	if len(args) == 0 {
 		fmt.Println("usage: breakpoint <set|list|enable|disable|delete> [args...]")
 		fmt.Println("  type 'help breakpoint' for details")
@@ -213,28 +253,60 @@ func handleBreakpoint(proc *debugger.Process, args []string) {
 			addrArgs = addrArgs[1:]
 		}
 		if len(addrArgs) < 1 {
-			fmt.Println("usage: breakpoint set [-h] <hex-addr>")
+			fmt.Println("usage: breakpoint set [-h] <addr|func|file:line>")
 			return
 		}
-		addr, err := strconv.ParseUint(strings.TrimPrefix(addrArgs[0], "0x"), 16, 64)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "toydbg: invalid address %q: %v\n", addrArgs[0], err)
-			return
+		location := addrArgs[0]
+
+		// Determine location type:
+		// - starts with "0x": hex address
+		// - contains ":": file:line
+		// - otherwise: function name
+		if strings.HasPrefix(location, "0x") {
+			addr, err := strconv.ParseUint(strings.TrimPrefix(location, "0x"), 16, 64)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "toydbg: invalid address %q: %v\n", location, err)
+				return
+			}
+			site, err := proc.CreateBreakpointSite(addr, hardware, false)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
+				return
+			}
+			if err := site.Enable(); err != nil {
+				fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
+				return
+			}
+			kind := "software"
+			if hardware {
+				kind = "hardware"
+			}
+			fmt.Printf("%s breakpoint %d set at 0x%x\n", kind, site.ID(), site.Address())
+		} else if strings.Contains(location, ":") {
+			parts := strings.SplitN(location, ":", 2)
+			line, err := strconv.Atoi(parts[1])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "toydbg: invalid line number %q: %v\n", parts[1], err)
+				return
+			}
+			sites, err := target.SetBreakpointAtLine(parts[0], line, hardware)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
+				return
+			}
+			for _, site := range sites {
+				fmt.Printf("breakpoint %d set at 0x%x (%s:%d)\n", site.ID(), site.Address(), parts[0], line)
+			}
+		} else {
+			sites, err := target.SetBreakpointAtFunction(location, hardware)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
+				return
+			}
+			for _, site := range sites {
+				fmt.Printf("breakpoint %d set at 0x%x (function %s)\n", site.ID(), site.Address(), location)
+			}
 		}
-		site, err := proc.CreateBreakpointSite(addr, hardware, false)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
-			return
-		}
-		if err := site.Enable(); err != nil {
-			fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
-			return
-		}
-		kind := "software"
-		if hardware {
-			kind = "hardware"
-		}
-		fmt.Printf("%s breakpoint %d set at 0x%x\n", kind, site.ID(), site.Address())
 
 	case "list":
 		sites := proc.BreakpointSites()
@@ -708,11 +780,14 @@ func formatFunctionInfo(target *debugger.Target, pc uint64) string {
 }
 
 // handleStop prints the stop reason and, when the process is stopped,
-// auto-disassembles a few instructions at the current PC.
+// shows source context if DWARF info is available, otherwise falls
+// back to disassembly.
 func handleStop(target *debugger.Target, reason debugger.StopReason) {
 	printStopReason(target, reason)
 	if reason.Reason == debugger.ProcessStopped {
-		printDisassembly(target.Process(), 5, nil)
+		if !target.PrintSourceAtPC(os.Stdout, 2) {
+			printDisassembly(target.Process(), 5, nil)
+		}
 	}
 }
 

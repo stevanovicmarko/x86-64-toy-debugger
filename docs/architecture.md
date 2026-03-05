@@ -34,7 +34,8 @@ codebase, extending it, or building your own debugger from scratch.
 23. [Testing Strategy](#23-testing-strategy)
 24. [ELF Parsing and the Target Type](#24-elf-parsing-and-the-target-type)
 25. [DWARF Debug Information](#25-dwarf-debug-information)
-26. [File Reference](#26-file-reference)
+26. [Source-Level Stepping and Breakpoints](#26-source-level-stepping-and-breakpoints)
+27. [File Reference](#27-file-reference)
 
 ---
 
@@ -283,27 +284,32 @@ shell over the `debugger` API, not an independent system.
 ### Flow
 
 ```
-┌──────────────────────────────────────────────────────┐
-│  1. Parse flags: -p <pid> or /path/to/prog           │
-│  2. Call debugger.Launch() or Attach()               │
-│  3. Initialize readline with (toydbg) prompt         │
-│  4. Loop:                                            │
-│     ├─ Read line, split into fields                  │
-│     ├─ Match command:                                │
-│     │   "continue"    → Resume + Wait + print PC     │
-│     │   "step"        → StepInstruction + print PC   │
-│     │   "breakpoint"  → set/list/enable/disable/del  │
-│     │   "watchpoint"  → set/list/enable/disable/del  │
-│     │   "register"    → read/write subcommands       │
-│     │   "memory"      → read/write subcommands       │
-│     │   "disassemble" → decode instructions at PC    │
-│     │   "help"        → print commands               │
-│     │   "quit"        → break                        │
-│     │   other         → print error                  │
-│     └─ If process exited → break                     │
-│  5. defer proc.Close()                               │
-│  6. defer rl.Close()                                 │
-└──────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  1. Parse flags: -p <pid> or /path/to/prog               │
+│  2. Call debugger.LaunchTarget() or AttachTarget()        │
+│  3. Initialize readline with (toydbg) prompt              │
+│  4. Loop:                                                 │
+│     ├─ Read line, split into fields                       │
+│     ├─ Match command:                                     │
+│     │   "continue"    → Resume + Wait + print stop        │
+│     │   "step"        → StepIn (source-level)             │
+│     │   "next"        → StepOver (source-level)           │
+│     │   "finish"      → StepOut (source-level)            │
+│     │   "stepi"       → StepInstruction + print stop      │
+│     │   "list"        → PrintSourceAtPC                   │
+│     │   "breakpoint"  → set/list/enable/disable/del       │
+│     │   "watchpoint"  → set/list/enable/disable/del       │
+│     │   "register"    → read/write subcommands            │
+│     │   "memory"      → read/write subcommands            │
+│     │   "disassemble" → decode instructions at PC         │
+│     │   "catchpoint"  → syscall catch configuration       │
+│     │   "help"        → print commands                    │
+│     │   "quit"        → break                             │
+│     │   other         → print error                       │
+│     └─ If process exited → break                          │
+│  5. defer target.Close()                                  │
+│  6. defer rl.Close()                                      │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ### Commands
@@ -311,9 +317,15 @@ shell over the `debugger` API, not an independent system.
 | Command | Aliases | Action |
 |---------|---------|--------|
 | `continue` | `c` | Resume the tracee, block until it stops again, print the stop reason with PC |
-| `step` | `s` | Execute one machine instruction, print the stop reason with PC |
-| `breakpoint set <addr>` | `break set <addr>` | Set and enable a software breakpoint at the given hex address |
-| `breakpoint set -h <addr>` | `break set -h <addr>` | Set and enable a hardware breakpoint (uses debug register, invisible to tracee) |
+| `step` | `s` | Source-level step into: advance until the source line changes (calls `StepIn`) |
+| `next` | `n` | Source-level step over: advance to next source line, stepping over CALL instructions (calls `StepOver`) |
+| `finish` | `fin` | Step out of the current function (calls `StepOut`) |
+| `stepi` | `si` | Execute one machine instruction (calls `StepInstruction`) |
+| `list` | `l` | Display source code at current PC via DWARF |
+| `breakpoint set <0xaddr>` | `break set <0xaddr>` | Set and enable a software breakpoint at the given hex address |
+| `breakpoint set <func>` | `break set <func>` | Set breakpoint at named function (past prologue via DWARF) |
+| `breakpoint set <file>:<line>` | `break set <file>:<line>` | Set breakpoint at source line (via DWARF line table) |
+| `breakpoint set -h <location>` | `break set -h <location>` | Set a hardware breakpoint at any location type (address, function, or file:line) |
 | `breakpoint list` | `break list` | List all breakpoints with ID, address, type [hw/sw], and status |
 | `breakpoint enable <id>` | `break enable <id>` | Enable a breakpoint by ID |
 | `breakpoint disable <id>` | `break disable <id>` | Disable a breakpoint by ID |
@@ -1109,12 +1121,12 @@ type Instruction struct {
 4. **Error recovery:** If a byte sequence cannot be decoded, emit a
    `.byte 0xNN` pseudo-instruction and advance by one byte.
 
-### Auto-disassembly on stop
+### Source display on stop
 
-The REPL's `handleStop` function automatically disassembles 5 instructions
-at the current PC whenever the process stops (after `continue` or `step`).
-This provides immediate context about what instruction the program is about
-to execute — similar to GDB's `display/i $pc` behavior.
+The REPL's `handleStop` function prefers showing source context when DWARF
+info is available (via `PrintSourceAtPC`), falling back to disassembling 5
+instructions at the current PC when no source info exists. This provides
+immediate context — similar to GDB's `list` or `display/i $pc` behavior.
 
 ---
 
@@ -1546,8 +1558,8 @@ Two minimal Go programs serve as tracees for basic lifecycle tests:
 | `end_immediately` | `test/targets/end_immediately/main.go` | Exits immediately (tests process exit handling) |
 | `run_endlessly` | `test/targets/run_endlessly/main.go` | Infinite loop (tests attach, resume, and signal delivery) |
 
-`TestMain()` compiles both Go targets with `go build` and all five native
-targets (four assembly, one C) with `gcc` into a temporary directory before
+`TestMain()` compiles both Go targets with `go build` and all seven native
+targets (five assembly, two C) with `gcc` into a temporary directory before
 any tests run.
 
 ### Test categories
@@ -1578,6 +1590,7 @@ inferior uses that value in a `printf` call. Go programs cannot control
 which values land in specific registers (the compiler and runtime manage
 register allocation), so these tests use hand-written x86-64 assembly.
 The `anti_debugger` target uses C to test hardware breakpoint invisibility.
+The `stepping_target` uses C compiled with `-g` to test source-level stepping.
 
 | Target | Path | Libc | Build flags | Entry |
 |--------|------|------|-------------|-------|
@@ -1586,6 +1599,8 @@ The `anti_debugger` target uses C to test hardware breakpoint invisibility.
 | `hello_toydbg` | `test/targets/hello_toydbg.s` | No | `-nostdlib -no-pie` | `_start` |
 | `memory` | `test/targets/memory.s` | No | `-nostdlib -no-pie` | `_start` |
 | `anti_debugger` | `test/targets/anti_debugger.c` | Yes | `-no-pie` | `main` |
+| `dwarf_target` | `test/targets/dwarf_target.c` | Yes | `-g -no-pie` | `main` |
+| `stepping_target` | `test/targets/stepping_target.c` | Yes | `-g -no-pie` | `main` |
 
 The register targets (`reg_read`, `reg_write`) use the **trap-resume-read
 pattern**: the assembly program executes `int3` (software breakpoint) at
@@ -1617,7 +1632,7 @@ breakpoint at the same address is invisible to memory — the checksum matches
 and the program calls the function, printing "pineapple". The test uses
 both breakpoint types in sequence to verify this distinction.
 
-`TestMain` builds all five native targets with `gcc` alongside the Go
+`TestMain` builds all seven native targets with `gcc` alongside the Go
 targets.
 
 ### Process state verification
@@ -1822,6 +1837,8 @@ type DWARF struct {
 | `GetEntryByAddress(addr)` | Binary search on sorted line table index | O(log n) |
 | `GetEntriesByLine(path, line)` | Map lookup + path suffix matching | O(matches) |
 | `AllLineEntries()` | Return a copy of all line entries (file-address space) | O(n) |
+| `InlineStackAtAddress(addr)` | Walk DIE tree to build inline call stack at address | O(tree depth) |
+| `PrologueEndForRange(low, high)` | Scan line table for `PrologueEnd` flag or second entry in range | O(entries in range) |
 
 ### Line table index
 
@@ -1885,17 +1902,144 @@ when available, falling back to the symbol table:
 
 ---
 
-## 26. File Reference
+## 26. Source-Level Stepping and Breakpoints
+
+The previous sections described instruction-level stepping (`StepInstruction`) and
+address-only breakpoints (`CreateBreakpointSite`). This section covers the
+**source-level** layer built on top: stepping by source lines, setting breakpoints
+by function name or file:line, and displaying source context.
+
+All source-level operations live in **`debugger/stepping.go`** as methods on
+`*Target` (not `*Process`), because they need both the DWARF metadata and the
+ptrace process handle.
+
+### Mental model
+
+Think of the source-level layer as a "macro" layer that repeatedly calls the
+instruction-level primitives until a source-line-level condition is met:
+
+```
+  User types "step"
+      │
+      ▼
+  StepIn() loop:
+      ├── StepInstruction()   ← instruction-level
+      ├── GetEntryByAddress() ← check DWARF line table
+      └── Line changed? ──no──→ loop
+                │yes
+                ▼
+          skipPrologueIfNeeded()
+                │
+                ▼
+          return StopReason
+```
+
+### RunUntilAddress — the temp-breakpoint helper
+
+`RunUntilAddress(addr)` is the building block for StepOver, StepOut, and
+prologue skipping. It:
+
+1. Creates an internal (hidden) software breakpoint at `addr`
+2. Calls `Resume()` + `WaitOnSignal()`
+3. Removes the temporary breakpoint
+4. If we stopped at the target, marks the trap reason as `TrapSingleStep`
+
+This avoids burning CPU on single-step loops when the destination is far away.
+
+### StepIn (source-level step into)
+
+Steps instructions until the DWARF line table reports a different `file:line`.
+After arriving at a new line, checks whether the PC is at the start of a
+function (matching any range's `lowPC`). If so, it calls `PrologueEndForRange`
+and `RunUntilAddress` to skip past register-saving instructions.
+
+### StepOver (source-level step over)
+
+Like StepIn, but when the current instruction is a `CALL`:
+
+1. Decode instruction via `x86asm.Decode()`
+2. If `inst.Op == CALL`, set temp breakpoint at `pc + inst.Len` (the return
+   address, i.e., the instruction after the CALL) and `RunUntilAddress()`
+3. Otherwise, `StepInstruction()` as usual
+
+The loop continues until the source line changes.
+
+### StepOut (step out of current function)
+
+Two strategies based on whether we're in an inlined function:
+
+1. **Inlined frame:** Walk `InlineStackAtAddress()`. If the deepest frame is
+   inlined, `RunUntilAddress(highPC + loadBias)` — the end of the inlined range.
+2. **Regular frame:** Read `rbp` register, read 8 bytes at `rbp+8` (the return
+   address in the frame-pointer calling convention), `RunUntilAddress(retAddr)`.
+
+The `[rbp+8]` approach assumes frame-pointer ABI (`-fno-omit-frame-pointer`,
+which is the default at `-O0`). Full DWARF CFI unwinding is deferred.
+
+### Source-level breakpoints
+
+**By function name:** `SetBreakpointAtFunction(name)` looks up functions via
+`DWARF.FunctionsByName()`, finds the prologue end via `PrologueEndForRange()`,
+adjusts by load bias, and creates a breakpoint site. Falls back to ELF symbol
+table if no DWARF match.
+
+**By file:line:** `SetBreakpointAtLine(file, line)` calls
+`DWARF.GetEntriesByLine()` and creates breakpoints at each matching address.
+If the address happens to be a function's `lowPC`, it skips the prologue.
+
+### Prologue skipping
+
+When a breakpoint lands at a function's first instruction, the frame pointer
+hasn't been set up yet — local variables are inaccessible and `rbp` still
+points to the caller's frame. `PrologueEndForRange(lowPC, highPC)` finds the
+end of the prologue by:
+
+1. Scanning the DWARF line table for `PrologueEnd == true` (DWARF 3+ compilers
+   like GCC set this flag)
+2. Falling back to the second line entry in the function range (the book's
+   heuristic: first entry = prologue, second = body)
+
+### Source display (PrintSource / PrintSourceAtPC)
+
+`PrintSourceAtPC` resolves the current PC to a source file and line via DWARF,
+opens the source file, and prints surrounding lines with a `>` marker on the
+current line. `handleStop` in the CLI prefers source display over disassembly
+when DWARF info is available.
+
+### Inline stack tracking
+
+`DWARF.InlineStackAtAddress(addr)` walks the DWARF DIE tree under the containing
+function, recursing through `TagInlinedSubroutine` and `TagLexDwarfBlock` entries
+whose ranges contain the address. The result is a stack ordered outermost →
+innermost. This is used by `StepOut` to detect when we're in an inlined frame.
+
+### CLI commands
+
+| Command | Action |
+|---------|--------|
+| `step` / `s` | Source-level step into (StepIn) |
+| `next` / `n` | Source-level step over (StepOver) |
+| `finish` / `fin` | Step out of current function (StepOut) |
+| `stepi` / `si` | Single machine instruction step (StepInstruction) |
+| `list` / `l` | Display source code at current PC |
+| `break set <func>` | Set breakpoint at named function |
+| `break set file:line` | Set breakpoint at source line |
+| `break set 0xaddr` | Set breakpoint at address (unchanged) |
+
+---
+
+## 27. File Reference
 
 | File | Purpose |
 |------|---------|
-| `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, step, breakpoint, watchpoint, register, memory, disassemble, catchpoint, help, quit), SIGINT handler, DWARF-aware stop reason display with source locations |
+| `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, step, next, finish, stepi, list, breakpoint, watchpoint, register, memory, disassemble, catchpoint, help, quit), SIGINT handler, source-level stop display |
 | `debugger/debugger.go` | Package documentation |
 | `debugger/elf.go` | ELF binary wrapper: symbol lookup by name and address, load bias, FunctionContainingAddress, DWARF loading |
-| `debugger/dwarf.go` | DWARF debug info wrapper: function lookup by address/name, line table index (GetEntryByAddress, GetEntriesByLine, AllLineEntries), source location mapping |
+| `debugger/dwarf.go` | DWARF debug info wrapper: function lookup by address/name, line table index (GetEntryByAddress, GetEntriesByLine, AllLineEntries), source location mapping, InlineStackAtAddress, PrologueEndForRange |
 | `debugger/auxv_linux.go` | Linux `/proc/<pid>/auxv` reader for AT_ENTRY (load bias computation) |
 | `debugger/auxv_unsupported.go` | Non-Linux auxv stub |
 | `debugger/target.go` | Target type: combines Process + ELF for symbolic debugging (LaunchTarget, AttachTarget) |
+| `debugger/stepping.go` | Source-level operations: StepIn, StepOver, StepOut, RunUntilAddress, SetBreakpointAtFunction, SetBreakpointAtLine, PrintSource, PrintSourceAtPC |
 | `debugger/error.go` | Custom error type and constructors |
 | `debugger/format.go` | `FormatRegisterValue` — display formatting for all register types |
 | `debugger/parse.go` | `ParseRegisterValue` — CLI string → typed value conversion |
@@ -1912,7 +2056,7 @@ when available, falling back to the symbol table:
 | `debugger/register_info.go` | Register metadata table (125 entries) and lookup functions |
 | `debugger/registers_linux.go` | Register cache: read/write via ptrace |
 | `debugger/registers_unsupported.go` | Non-Linux register stubs |
-| `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests, breakpoint tests, hardware breakpoint tests, watchpoint tests, memory read/write tests, syscall mapping tests, syscall catchpoint tests, ELF parsing tests, Target tests, DWARF tests) |
+| `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests, breakpoint tests, hardware breakpoint tests, watchpoint tests, memory read/write tests, syscall mapping tests, syscall catchpoint tests, ELF parsing tests, Target tests, DWARF tests, source-level stepping tests, source-level breakpoint tests, inline stack tests, source display tests) |
 | `test/targets/end_immediately/main.go` | Test target: exits immediately |
 | `test/targets/run_endlessly/main.go` | Test target: infinite loop |
 | `test/targets/reg_read.s` | Assembly test target: sets known register values and traps (no libc) |
@@ -1921,6 +2065,7 @@ when available, falling back to the symbol table:
 | `test/targets/memory.s` | Assembly test target: stores known values and provides buffers for memory read/write tests |
 | `test/targets/anti_debugger.c` | C test target: checksums its own function to detect software breakpoints (tests hardware breakpoint invisibility) |
 | `test/targets/dwarf_target.c` | C test target: compiled with `-g` for DWARF debug info tests (function lookup, source location) |
+| `test/targets/stepping_target.c` | C test target: compiled with `-g` for source-level stepping tests (StepIn, StepOver, StepOut, line/function breakpoints) |
 | `doc.go` | Module-root package declaration |
 | `docs/sequence-diagram.mmd` | Mermaid sequence diagram of the attach-and-REPL lifecycle |
 | `Dockerfile` | Multi-stage build: compile + slim runtime image |

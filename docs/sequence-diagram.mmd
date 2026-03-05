@@ -293,3 +293,93 @@ sequenceDiagram
     Note over D: Syscall exit: toggle=true→false, rax=return value
     D->>U: print "process stopped by SIGTRAP (syscall exit)"
     D->>U: print "syscall: write returned 14"
+
+    Note over D,T: ── Phase 13: Source-level step-in ──
+    U-->>D: types "step"
+    Note over D: StepIn(): get current source location (file:line)
+    loop Until source line changes
+        D->>K: PTRACE_SINGLESTEP(pid)
+        Note over T: Tracee executes one instruction, STOPS
+        D->>K: wait4(pid)
+        K-->>D: returns WaitStatus
+        D->>K: PtraceGetRegs — read registers
+        K-->>D: register values
+        Note over D: GetEntryByAddress(PC) → check file:line
+        Note over D: Same line? → continue loop
+    end
+    Note over D: Line changed → check if at function start
+    Note over D: If at function start: skip prologue
+    Note over D: PrologueEndForRange(lowPC, highPC) → addr
+    D->>U: print source context with ">" on current line
+
+    Note over D,T: ── Phase 14: Source-level step-over ──
+    U-->>D: types "next"
+    Note over D: StepOver(): get current source location
+    loop Until source line changes
+        Note over D: Decode instruction at PC via x86asm.Decode
+        alt Current instruction is CALL
+            Note over D: Compute return addr = PC + instruction length
+            Note over D: Create internal breakpoint at return addr
+            D->>K: PTRACE_POKEDATA — write 0xCC at return addr
+            K-->>D: success
+            D->>K: PtraceCont(pid, 0) — resume over the CALL
+            Note over T: Tracee enters function, executes, returns
+            Note over T: Tracee hits temp breakpoint → STOPS
+            D->>K: wait4(pid)
+            K-->>D: returns WaitStatus
+            Note over D: Remove internal breakpoint
+        else Not a CALL
+            D->>K: PTRACE_SINGLESTEP(pid)
+            Note over T: Tracee executes one instruction, STOPS
+            D->>K: wait4(pid)
+            K-->>D: returns WaitStatus
+        end
+        D->>K: PtraceGetRegs — read registers
+        K-->>D: register values
+        Note over D: GetEntryByAddress(PC) → check file:line
+    end
+    D->>U: print source context
+
+    Note over D,T: ── Phase 15: Source-level step-out ──
+    U-->>D: types "finish"
+    Note over D: StepOut(): check inline stack
+    alt Deepest frame is inlined
+        Note over D: target = end of inlined range + loadBias
+    else Regular function frame
+        Note over D: Read rbp register
+        D->>K: process_vm_readv(pid, rbp+8, 8) — read return address
+        K-->>D: returns 8 bytes (return address)
+    end
+    Note over D: RunUntilAddress(returnAddr)
+    Note over D: Create internal breakpoint at returnAddr
+    D->>K: PTRACE_POKEDATA — write 0xCC
+    D->>K: PtraceCont(pid, 0)
+    Note over T: Tracee executes until return addr → STOPS
+    D->>K: wait4(pid)
+    K-->>D: returns WaitStatus
+    Note over D: Remove internal breakpoint
+    D->>U: print source context (now in caller)
+
+    Note over D,T: ── Phase 16: Source-level breakpoint set ──
+    U-->>D: types "breakpoint set add"
+    Note over D: SetBreakpointAtFunction("add")
+    Note over D: DWARF.FunctionsByName("add") → function entry
+    Note over D: PrologueEndForRange(lowPC, highPC) → skip prologue
+    Note over D: Adjust address by load bias
+    D->>K: PTRACE_PEEKDATA + POKEDATA — insert 0xCC
+    K-->>D: success
+    D->>U: print "breakpoint 1 set at 0x... (function add)"
+
+    U-->>D: types "breakpoint set main.c:42"
+    Note over D: SetBreakpointAtLine("main.c", 42)
+    Note over D: DWARF.GetEntriesByLine("main.c", 42) → addresses
+    Note over D: If address is function start: skip prologue
+    D->>K: PTRACE_PEEKDATA + POKEDATA — insert 0xCC
+    K-->>D: success
+    D->>U: print "breakpoint 2 set at 0x... (main.c:42)"
+
+    Note over D,T: ── Phase 17: Source display ──
+    U-->>D: types "list"
+    Note over D: SourceLocationAtPC() → file, line
+    Note over D: Open source file, read lines
+    D->>U: print surrounding lines with ">" marker
