@@ -1801,6 +1801,7 @@ type DWARF struct {
     data        *dwarf.Data
     funcsByAddr []funcAddrEntry          // sorted by startPC for binary search
     funcsByName map[string][]*FunctionEntry
+    lines       lineIndex
     loadBias    uint64
 }
 ```
@@ -1815,9 +1816,48 @@ type DWARF struct {
 
 | Method | Purpose | Complexity |
 |--------|---------|------------|
-| `FunctionContainingPC(addr)` | Binary search on sorted address index | O(log n) |
+| `FunctionContainingPC(addr)` | Binary search on sorted function address index | O(log n) |
 | `FunctionsByName(name)` | Map lookup | O(1) |
-| `PCToSourceLocation(addr)` | Iterate CUs, use `LineReader.SeekPC()` | O(CUs) |
+| `PCToSourceLocation(addr)` | Delegates to `GetEntryByAddress`, returns `SourceLocation` | O(log n) |
+| `GetEntryByAddress(addr)` | Binary search on sorted line table index | O(log n) |
+| `GetEntriesByLine(path, line)` | Map lookup + path suffix matching | O(matches) |
+| `AllLineEntries()` | Return a copy of all line entries (file-address space) | O(n) |
+
+### Line table index
+
+The DWARF line table maps machine addresses to source positions. Go's
+`dwarf.LineReader` runs the DWARF line number state machine internally —
+we iterate `Next()` to collect all rows into a `LineEntry` slice:
+
+```go
+type LineEntry struct {
+    Address       uint64
+    File          string   // resolved from dwarf.LineFile.Name
+    Line          int
+    Column        int
+    IsStmt        bool
+    BasicBlock    bool
+    EndSequence   bool
+    PrologueEnd   bool
+    EpilogueBegin bool
+    Discriminator int
+}
+```
+
+The `lineIndex` holds two data structures built during `newDWARF`:
+
+1. **`entries []LineEntry`** — all line table rows, sorted by address.
+   `GetEntryByAddress` binary-searches this slice, skipping `EndSequence`
+   markers (which are range terminators, not real source positions).
+
+2. **`byFileLine map[fileLineKey][]int`** — maps `{file, line}` pairs to
+   indices into `entries`. `GetEntriesByLine` iterates matching keys and
+   uses `pathEndsWith` for flexible path matching (e.g., `"dwarf_target.c"`
+   matches `/full/path/to/targets/dwarf_target.c`).
+
+This replaces the old `PCToSourceLocation` approach of re-iterating
+compile units on every call. The `PCToSourceLocation` method still exists
+for backward compatibility but now delegates to `GetEntryByAddress`.
 
 ### Load bias propagation
 
@@ -1852,7 +1892,7 @@ when available, falling back to the symbol table:
 | `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, step, breakpoint, watchpoint, register, memory, disassemble, catchpoint, help, quit), SIGINT handler, DWARF-aware stop reason display with source locations |
 | `debugger/debugger.go` | Package documentation |
 | `debugger/elf.go` | ELF binary wrapper: symbol lookup by name and address, load bias, FunctionContainingAddress, DWARF loading |
-| `debugger/dwarf.go` | DWARF debug info wrapper: function lookup by address/name, source location mapping (PCToSourceLocation) |
+| `debugger/dwarf.go` | DWARF debug info wrapper: function lookup by address/name, line table index (GetEntryByAddress, GetEntriesByLine, AllLineEntries), source location mapping |
 | `debugger/auxv_linux.go` | Linux `/proc/<pid>/auxv` reader for AT_ENTRY (load bias computation) |
 | `debugger/auxv_unsupported.go` | Non-Linux auxv stub |
 | `debugger/target.go` | Target type: combines Process + ELF for symbolic debugging (LaunchTarget, AttachTarget) |

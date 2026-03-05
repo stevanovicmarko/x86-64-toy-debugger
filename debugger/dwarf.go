@@ -2,7 +2,9 @@ package debugger
 
 import (
 	"debug/dwarf"
+	"path/filepath"
 	"sort"
+	"strings"
 )
 
 // FunctionEntry represents a function found in DWARF debug info.
@@ -32,6 +34,37 @@ type funcAddrEntry struct {
 	fn      *FunctionEntry
 }
 
+// LineEntry represents a single row in the DWARF line table. It wraps
+// the fields from Go's dwarf.LineEntry with File resolved to a plain
+// string (the stdlib's *LineFile pointer is only valid during iteration).
+// All addresses are in file-address space (before ASLR relocation).
+type LineEntry struct {
+	Address       uint64
+	File          string
+	Line          int
+	Column        int
+	IsStmt        bool
+	BasicBlock    bool
+	EndSequence   bool
+	PrologueEnd   bool
+	EpilogueBegin bool
+	Discriminator int
+}
+
+// fileLineKey indexes entries by source file and line number.
+type fileLineKey struct {
+	file string
+	line int
+}
+
+// lineIndex holds a pre-built index of all DWARF line table entries.
+// Entries are sorted by address for binary search; byFileLine provides
+// O(1) lookup by source location for "break at file:line" commands.
+type lineIndex struct {
+	entries    []LineEntry            // all entries, sorted by address
+	byFileLine map[fileLineKey][]int // file:line → indices into entries
+}
+
 // DWARF wraps Go's debug/dwarf.Data with pre-built indexes for fast
 // function and source-location lookup. It mirrors how ELF wraps
 // debug/elf — the stdlib handles parsing, we add debugger-focused
@@ -40,6 +73,7 @@ type DWARF struct {
 	data        *dwarf.Data
 	funcsByAddr []funcAddrEntry          // sorted by startPC for binary search
 	funcsByName map[string][]*FunctionEntry
+	lines       lineIndex
 	loadBias    uint64
 }
 
@@ -76,7 +110,71 @@ func newDWARF(data *dwarf.Data) *DWARF {
 		return d.funcsByAddr[i].startPC < d.funcsByAddr[j].startPC
 	})
 
+	d.buildLineIndex()
+
 	return d
+}
+
+// buildLineIndex iterates all compile units and their line number
+// programs, collecting every line table entry into a sorted slice
+// with a secondary file:line index.
+func (d *DWARF) buildLineIndex() {
+	d.lines.byFileLine = make(map[fileLineKey][]int)
+
+	reader := d.data.Reader()
+	for {
+		entry, err := reader.Next()
+		if err != nil || entry == nil {
+			break
+		}
+		if entry.Tag != dwarf.TagCompileUnit {
+			continue
+		}
+
+		lr, err := d.data.LineReader(entry)
+		if err != nil || lr == nil {
+			reader.SkipChildren()
+			continue
+		}
+
+		var le dwarf.LineEntry
+		for {
+			if err := lr.Next(&le); err != nil {
+				break
+			}
+			fileName := ""
+			if le.File != nil {
+				fileName = le.File.Name
+			}
+			d.lines.entries = append(d.lines.entries, LineEntry{
+				Address:       le.Address,
+				File:          fileName,
+				Line:          le.Line,
+				Column:        le.Column,
+				IsStmt:        le.IsStmt,
+				BasicBlock:    le.BasicBlock,
+				EndSequence:   le.EndSequence,
+				PrologueEnd:   le.PrologueEnd,
+				EpilogueBegin: le.EpilogueBegin,
+				Discriminator: le.Discriminator,
+			})
+		}
+	}
+
+	// Sort by address for binary search.
+	sort.Slice(d.lines.entries, func(i, j int) bool {
+		return d.lines.entries[i].Address < d.lines.entries[j].Address
+	})
+
+	// Build the file:line → index map.
+	for i := range d.lines.entries {
+		e := &d.lines.entries[i]
+		if e.EndSequence {
+			continue
+		}
+		key := fileLineKey{file: e.File, line: e.Line}
+		d.lines.byFileLine[key] = append(d.lines.byFileLine[key], i)
+	}
 }
 
 // addFunction extracts a function or inlined subroutine from a DIE
@@ -177,44 +275,107 @@ func (d *DWARF) FunctionsByName(name string) []*FunctionEntry {
 	return d.funcsByName[name]
 }
 
-// PCToSourceLocation maps a virtual address to its source file and line
-// using the DWARF line number program. It iterates compile units and
-// uses LineReader.SeekPC to find the matching line entry.
-//
-// This is O(CUs) per call, which is fine for a toy debugger — real
-// debuggers build an address-sorted index of CU ranges.
+// PCToSourceLocation maps a virtual address to its source file and line.
+// It delegates to GetEntryByAddress and returns the simplified
+// SourceLocation type for backward compatibility.
 func (d *DWARF) PCToSourceLocation(addr uint64) (SourceLocation, bool) {
+	entry, ok := d.GetEntryByAddress(addr)
+	if !ok {
+		return SourceLocation{}, false
+	}
+	return SourceLocation{
+		File:   entry.File,
+		Line:   entry.Line,
+		Column: entry.Column,
+	}, true
+}
+
+// GetEntryByAddress returns the line table entry covering the given
+// virtual address. It binary-searches the pre-built sorted index,
+// finding the last entry whose address is ≤ the target. EndSequence
+// markers are skipped because they represent range terminators, not
+// real source positions.
+func (d *DWARF) GetEntryByAddress(addr uint64) (LineEntry, bool) {
 	fileAddr := addr - d.loadBias
 
-	reader := d.data.Reader()
-	for {
-		entry, err := reader.Next()
-		if err != nil || entry == nil {
-			break
-		}
-
-		if entry.Tag != dwarf.TagCompileUnit {
-			continue
-		}
-
-		lr, err := d.data.LineReader(entry)
-		if err != nil || lr == nil {
-			reader.SkipChildren()
-			continue
-		}
-
-		var lineEntry dwarf.LineEntry
-		if err := lr.SeekPC(fileAddr, &lineEntry); err != nil {
-			reader.SkipChildren()
-			continue
-		}
-
-		return SourceLocation{
-			File:   lineEntry.File.Name,
-			Line:   lineEntry.Line,
-			Column: lineEntry.Column,
-		}, true
+	n := len(d.lines.entries)
+	if n == 0 {
+		return LineEntry{}, false
 	}
 
-	return SourceLocation{}, false
+	// Find the last entry with Address <= fileAddr.
+	idx := sort.Search(n, func(i int) bool {
+		return d.lines.entries[i].Address > fileAddr
+	})
+	idx--
+
+	// Walk backward past any EndSequence markers.
+	for idx >= 0 && d.lines.entries[idx].EndSequence {
+		idx--
+	}
+
+	if idx < 0 {
+		return LineEntry{}, false
+	}
+
+	entry := d.lines.entries[idx]
+	entry.Address += d.loadBias // return virtual address
+	return entry, true
+}
+
+// GetEntriesByLine returns all line table entries matching the given
+// file path and line number. The path can be a basename or partial
+// suffix — it is matched against full DWARF paths using pathEndsWith.
+// Returned addresses are virtual (adjusted for load bias).
+func (d *DWARF) GetEntriesByLine(path string, line int) []LineEntry {
+	var results []LineEntry
+
+	for key, indices := range d.lines.byFileLine {
+		if key.line != line {
+			continue
+		}
+		if !pathEndsWith(key.file, path) {
+			continue
+		}
+		for _, i := range indices {
+			entry := d.lines.entries[i]
+			entry.Address += d.loadBias
+			results = append(results, entry)
+		}
+	}
+
+	// Sort by address for deterministic output.
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Address < results[j].Address
+	})
+
+	return results
+}
+
+// AllLineEntries returns a copy of all line table entries in file-address
+// space (no load bias adjustment). This is useful for testing and
+// inspection.
+func (d *DWARF) AllLineEntries() []LineEntry {
+	result := make([]LineEntry, len(d.lines.entries))
+	copy(result, d.lines.entries)
+	return result
+}
+
+// pathEndsWith checks whether fullPath ends with suffix at a path
+// separator boundary. This allows matching "dwarf_target.c" against
+// "/home/user/project/test/targets/dwarf_target.c".
+func pathEndsWith(fullPath, suffix string) bool {
+	if fullPath == suffix {
+		return true
+	}
+	// Clean both paths to normalize separators.
+	full := filepath.ToSlash(fullPath)
+	sfx := filepath.ToSlash(suffix)
+
+	if !strings.HasSuffix(full, sfx) {
+		return false
+	}
+	// Ensure the match is at a path separator boundary.
+	preceding := len(full) - len(sfx)
+	return preceding > 0 && full[preceding-1] == '/'
 }

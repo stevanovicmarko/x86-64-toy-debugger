@@ -1932,3 +1932,162 @@ func TestDWARFSourceLocation(t *testing.T) {
 	}
 	t.Logf("PC=0x%x → %s:%d", pc, loc.File, loc.Line)
 }
+
+func TestDWARFLineTable(t *testing.T) {
+	// Open the dwarf_target binary and verify the line table index
+	// was built correctly.
+	e, err := debugger.OpenELF(targetPath("dwarf_target"))
+	if err != nil {
+		t.Fatalf("OpenELF failed: %v", err)
+	}
+	defer e.Close()
+
+	dw := e.DWARF()
+	if dw == nil {
+		t.Fatal("expected DWARF info to be present (compiled with -g)")
+	}
+
+	entries := dw.AllLineEntries()
+	if len(entries) == 0 {
+		t.Fatal("AllLineEntries returned no entries")
+	}
+
+	// Verify entries are sorted by address.
+	for i := 1; i < len(entries); i++ {
+		if entries[i].Address < entries[i-1].Address {
+			t.Fatalf("entries not sorted: [%d].Address=0x%x > [%d].Address=0x%x",
+				i-1, entries[i-1].Address, i, entries[i].Address)
+		}
+	}
+
+	// Verify at least some entries reference dwarf_target.c.
+	found := false
+	for _, e := range entries {
+		if strings.Contains(e.File, "dwarf_target.c") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("no line table entries reference dwarf_target.c")
+	}
+
+	t.Logf("line table has %d entries", len(entries))
+}
+
+func TestDWARFGetEntriesByLine(t *testing.T) {
+	e, err := debugger.OpenELF(targetPath("dwarf_target"))
+	if err != nil {
+		t.Fatalf("OpenELF failed: %v", err)
+	}
+	defer e.Close()
+
+	dw := e.DWARF()
+	if dw == nil {
+		t.Fatal("expected DWARF info to be present")
+	}
+
+	// Line 22 is "int add_numbers(int a, int b) {" — should have entries.
+	entries := dw.GetEntriesByLine("dwarf_target.c", 22)
+	if len(entries) == 0 {
+		t.Fatal("GetEntriesByLine(dwarf_target.c, 22) returned no entries")
+	}
+
+	// The returned addresses should fall within add_numbers' range.
+	fns := dw.FunctionsByName("add_numbers")
+	if len(fns) == 0 {
+		t.Fatal("FunctionsByName(add_numbers) returned no results")
+	}
+	fnLow := fns[0].Ranges[0][0]
+	fnHigh := fns[0].Ranges[0][1]
+	for _, entry := range entries {
+		// Entries are in file-address space (no load bias set), so
+		// they should match the DWARF function ranges directly.
+		if entry.Address < fnLow || entry.Address >= fnHigh {
+			t.Errorf("entry address 0x%x outside add_numbers range [0x%x, 0x%x)",
+				entry.Address, fnLow, fnHigh)
+		}
+	}
+	t.Logf("GetEntriesByLine(dwarf_target.c, 22) returned %d entries", len(entries))
+
+	// Test with full path suffix (should also match).
+	entries2 := dw.GetEntriesByLine("targets/dwarf_target.c", 22)
+	if len(entries2) == 0 {
+		t.Error("GetEntriesByLine with path suffix returned no entries")
+	}
+
+	// Non-existent line should return empty.
+	entries3 := dw.GetEntriesByLine("dwarf_target.c", 9999)
+	if len(entries3) != 0 {
+		t.Errorf("GetEntriesByLine for non-existent line returned %d entries", len(entries3))
+	}
+}
+
+func TestDWARFGetEntryByAddress(t *testing.T) {
+	// Launch the dwarf_target process and stop at the first int3.
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer pr.Close()
+
+	target, err := debugger.LaunchTargetWithOptions(
+		targetPath("dwarf_target"),
+		debugger.LaunchOptions{Stdout: pw},
+	)
+	if err != nil {
+		pw.Close()
+		t.Fatalf("LaunchTarget failed: %v", err)
+	}
+	defer target.Close()
+	pw.Close()
+
+	proc := target.Process()
+
+	// Resume to the first int3.
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume failed: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal failed: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+	}
+
+	pc, err := proc.GetPC()
+	if err != nil {
+		t.Fatalf("GetPC failed: %v", err)
+	}
+
+	dw := target.ELF().DWARF()
+	if dw == nil {
+		t.Fatal("expected DWARF info to be present")
+	}
+
+	entry, ok := dw.GetEntryByAddress(pc)
+	if !ok {
+		t.Fatalf("GetEntryByAddress(0x%x) returned false", pc)
+	}
+
+	if !strings.Contains(entry.File, "dwarf_target.c") {
+		t.Errorf("GetEntryByAddress file = %q, want it to contain %q",
+			entry.File, "dwarf_target.c")
+	}
+	if entry.Line <= 0 {
+		t.Errorf("GetEntryByAddress line = %d, want > 0", entry.Line)
+	}
+
+	// Cross-check with PCToSourceLocation for consistency.
+	loc, locOK := dw.PCToSourceLocation(pc)
+	if !locOK {
+		t.Fatal("PCToSourceLocation returned false but GetEntryByAddress succeeded")
+	}
+	if loc.File != entry.File || loc.Line != entry.Line {
+		t.Errorf("GetEntryByAddress(%s:%d) != PCToSourceLocation(%s:%d)",
+			entry.File, entry.Line, loc.File, loc.Line)
+	}
+
+	t.Logf("PC=0x%x → %s:%d (column=%d)", pc, entry.File, entry.Line, entry.Column)
+}
