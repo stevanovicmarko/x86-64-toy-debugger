@@ -23,6 +23,13 @@ type BreakpointSite struct {
 	isHardware            bool
 	isInternal            bool
 	hardwareRegisterIndex int
+
+	// onHit is an optional callback invoked when this breakpoint is hit.
+	// If it returns true, the process should immediately resume execution.
+	// This enables internal breakpoints (like the entry-point or
+	// _dl_debug_state breakpoints) to perform work and continue without
+	// involving the user.
+	onHit func() bool
 }
 
 // ID returns the unique identifier for this breakpoint site.
@@ -51,6 +58,22 @@ func (b *BreakpointSite) IsHardware() bool {
 // from the user.
 func (b *BreakpointSite) IsInternal() bool {
 	return b.isInternal
+}
+
+// InstallHitHandler sets a callback that will be invoked when this
+// breakpoint is hit. If the callback returns true, the process will
+// automatically resume execution.
+func (b *BreakpointSite) InstallHitHandler(handler func() bool) {
+	b.onHit = handler
+}
+
+// notifyHit calls the hit handler if one is installed. Returns true
+// if the process should immediately resume, false otherwise.
+func (b *BreakpointSite) notifyHit() bool {
+	if b.onHit != nil {
+		return b.onHit()
+	}
+	return false
 }
 
 // AtAddress reports whether this breakpoint is at the given address.

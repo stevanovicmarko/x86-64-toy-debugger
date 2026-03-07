@@ -37,7 +37,8 @@ codebase, extending it, or building your own debugger from scratch.
 26. [Source-Level Stepping and Breakpoints](#26-source-level-stepping-and-breakpoints)
 27. [Call Frame Information (CFI)](#27-call-frame-information-cfi)
 28. [Stack Unwinding](#28-stack-unwinding)
-29. [File Reference](#29-file-reference)
+29. [Shared Library Support](#29-shared-library-support)
+30. [File Reference](#30-file-reference)
 
 ---
 
@@ -2290,25 +2291,124 @@ register (e.g., with `-fomit-frame-pointer`).
 
 ---
 
-## 29. File Reference
+## 29. Shared Library Support
+
+When a dynamically-linked executable runs, the kernel loads the **dynamic linker**
+(`ld-linux-x86-64.so.2`), which maps shared libraries into the process's address
+space. The debugger needs to know about these libraries so it can set breakpoints,
+look up symbols, read DWARF debug info, and unwind the stack across library boundaries.
+
+### Why it matters
+
+Without shared library tracking, the debugger can only see symbols and debug info
+from the main binary. A breakpoint on `calc_check_threshold` — defined in
+`libcalc.so` — would fail because the debugger wouldn't know that function exists.
+Stack unwinding would also stop at the library boundary.
+
+### The rendezvous structure
+
+The dynamic linker maintains a **rendezvous structure** (`r_debug`) in the inferior's
+address space. The debugger finds it through these steps:
+
+```
+.dynamic section (DT_DEBUG entry)
+    ↓
+r_debug struct
+    ├── r_map  → linked list of loaded libraries (link_map)
+    ├── r_brk  → address of _dl_debug_state function
+    └── r_state → RT_CONSISTENT / RT_ADD / RT_DELETE
+```
+
+### Discovery algorithm
+
+1. **Entry-point breakpoint** — At launch, set an internal breakpoint on the real
+   program entry point (from `AT_ENTRY` in the auxiliary vector). The dynamic linker
+   runs first; when it jumps to the entry point, the rendezvous structure is initialized.
+
+2. **Read `.dynamic` section** — Find the `DT_DEBUG` entry, which the dynamic linker
+   patches at runtime to point to `r_debug`.
+
+3. **Walk the link map** — Read `r_debug.r_map`, a linked list of `link_map` entries.
+   Each entry contains the load address and path of a shared library. Open each as
+   a new `ELF` object with its own load bias, DWARF, and CFI.
+
+4. **`_dl_debug_state` breakpoint** — Set an internal breakpoint on `r_debug.r_brk`.
+   The dynamic linker calls this empty function whenever it loads or unloads a library.
+   When it fires, re-walk the link map to discover new libraries.
+
+5. **vDSO handling** — The virtual dynamic shared object (`linux-vdso.so.1`) doesn't
+   exist on disk. It's dumped from process memory to a temp file so it can be parsed
+   like any other ELF.
+
+### Multi-ELF architecture
+
+The `Target` type was refactored from a single `*ELF` to an `ELFCollection`:
+
+```go
+type Target struct {
+    process        *Process
+    elves          ELFCollection  // all loaded ELF objects
+    mainELF        *ELF           // convenience pointer to main binary
+    rendezvousAddr uint64         // r_debug address (0 until resolved)
+}
+```
+
+All lookups — function name resolution, DWARF source mapping, CFI unwinding —
+now search across all loaded ELFs. The `ELFContainingAddress(pc)` method finds
+which ELF a virtual address belongs to by checking LOAD segment ranges.
+
+### Breakpoint hit handlers
+
+Breakpoint sites gained an `onHit` callback (`func() bool`). When a breakpoint
+with a handler fires, the handler runs automatically. If it returns `true`,
+the process resumes without involving the user; if it returns `false`, execution
+stops normally. The `_dl_debug_state` breakpoint returns `true` (auto-resume
+after re-walking the link map), while the entry-point breakpoint returns `false`
+(stop at the program entry so `LaunchTarget` can return with libraries discovered).
+
+### Backtrace across libraries
+
+Stack frames now carry an `ELFFilename` field. The backtrace formatter qualifies
+function names with the ELF filename using a backtick separator:
+
+```
+*[0]: 0x7f... libcalc.so`calc_check_threshold at libcalc.c:7
+ [1]: 0x4004.. calc_client`main at calc_client.c:12
+ [2]: 0x7f... libc.so.6`??
+```
+
+### Key files
+
+| File | Role |
+|------|------|
+| `debugger/dynlib.go` | Rendezvous structure reading, link map walking, vDSO dumping |
+| `debugger/elf_collection.go` | `ELFCollection` type: push, lookup by path/filename/address |
+| `debugger/target.go` | Entry-point breakpoint, `resolveRendezvous` integration |
+| `debugger/breakpoint_site.go` | Hit handler support (`InstallHitHandler`, `notifyHit`) |
+
+---
+
+## 30. File Reference
 
 | File | Purpose |
 |------|---------|
 | `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, step, next, finish, stepi, list, backtrace, breakpoint, watchpoint, register, memory, disassemble, catchpoint, help, quit), SIGINT handler, source-level stop display |
 | `debugger/debugger.go` | Package documentation |
-| `debugger/elf.go` | ELF binary wrapper: symbol lookup by name and address, load bias, FunctionContainingAddress, DWARF loading, CFI loading |
+| `debugger/elf.go` | ELF binary wrapper: symbol lookup by name and address, load bias, FunctionContainingAddress, DWARF loading, CFI loading, ContainsAddress, NotifyLoaded |
+| `debugger/elf_collection.go` | ELFCollection type: multi-ELF container with lookup by path, filename, or address |
+| `debugger/dynlib.go` | Dynamic linker integration: rendezvous structure (r_debug), link map walking, vDSO dumping, shared library discovery |
 | `debugger/dwarf.go` | DWARF debug info wrapper: function lookup by address/name, line table index (GetEntryByAddress, GetEntriesByLine, AllLineEntries), source location mapping, InlineStackAtAddress, PrologueEndForRange |
 | `debugger/cfi.go` | Call Frame Information parser: CIE/FDE parsing, pointer encoding, .eh_frame_hdr binary search, FDEForPC lookup |
 | `debugger/auxv_linux.go` | Linux `/proc/<pid>/auxv` reader for AT_ENTRY (load bias computation) |
 | `debugger/auxv_unsupported.go` | Non-Linux auxv stub |
-| `debugger/target.go` | Target type: combines Process + ELF for symbolic debugging (LaunchTarget, AttachTarget) |
+| `debugger/target.go` | Target type: combines Process + ELFCollection for symbolic debugging, entry-point breakpoint for dynamic linker init, shared library discovery (LaunchTarget, AttachTarget) |
 | `debugger/unwind.go` | CFI instruction interpreter: executeCFIInstruction, UnwindFrame, register rule types, unwind context |
 | `debugger/stack.go` | Stack frame type and stack unwinding orchestration: UnwindStack, Backtrace, FormatBacktrace, inline frame handling |
 | `debugger/stepping.go` | Source-level operations: StepIn, StepOver, StepOut (CFI-based), RunUntilAddress, SetBreakpointAtFunction, SetBreakpointAtLine, PrintSource, PrintSourceAtPC, SourceLocationAtPC, InlineDepthAtPC, DWARF (accessor) |
 | `debugger/error.go` | Custom error type and constructors |
 | `debugger/format.go` | `FormatRegisterValue` — display formatting for all register types |
 | `debugger/parse.go` | `ParseRegisterValue` — CLI string → typed value conversion |
-| `debugger/breakpoint_site.go` | BreakpointSite type (software and hardware, enable/disable) and breakpointSiteCollection |
+| `debugger/breakpoint_site.go` | BreakpointSite type (software and hardware, enable/disable, hit handlers) and breakpointSiteCollection |
 | `debugger/watchpoint.go` | Watchpoint type (data read/write triggers via debug registers, data tracking) and watchpointCollection |
 | `debugger/stoppoint_mode.go` | StoppointMode enum (Execute, Write, ReadWrite) — shared by hardware breakpoints and watchpoints |
 | `debugger/process.go` | Process lifecycle: Launch, LaunchWithOptions, Attach, Resume, WaitOnSignal, GetPC, SetPC, breakpoint management, hardware stoppoint methods, watchpoint management, StepInstruction, ReadMemory, WriteMemory, ReadMemoryWithoutTraps, Close, TrapType, SyscallCatchPolicy, augmentStopReason, GetCurrentHardwareStoppoint |
@@ -2321,7 +2421,7 @@ register (e.g., with `-fomit-frame-pointer`).
 | `debugger/register_info.go` | Register metadata table (125 entries) and lookup functions |
 | `debugger/registers_linux.go` | Register cache: read/write via ptrace |
 | `debugger/registers_unsupported.go` | Non-Linux register stubs |
-| `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests, breakpoint tests, hardware breakpoint tests, watchpoint tests, memory read/write tests, syscall mapping tests, syscall catchpoint tests, ELF parsing tests, Target tests, DWARF tests, source-level stepping tests, source-level breakpoint tests, inline stack tests, source display tests, CFI tests, stack unwinding tests) |
+| `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests, breakpoint tests, hardware breakpoint tests, watchpoint tests, memory read/write tests, syscall mapping tests, syscall catchpoint tests, ELF parsing tests, Target tests, DWARF tests, source-level stepping tests, source-level breakpoint tests, inline stack tests, source display tests, CFI tests, stack unwinding tests, shared library tracing tests) |
 | `test/targets/end_immediately/main.go` | Test target: exits immediately |
 | `test/targets/run_endlessly/main.go` | Test target: infinite loop |
 | `test/targets/reg_read.s` | Assembly test target: sets known register values and traps (no libc) |
@@ -2331,6 +2431,8 @@ register (e.g., with `-fomit-frame-pointer`).
 | `test/targets/anti_debugger.c` | C test target: checksums its own function to detect software breakpoints (tests hardware breakpoint invisibility) |
 | `test/targets/dwarf_target.c` | C test target: compiled with `-g` for DWARF debug info tests (function lookup, source location) |
 | `test/targets/stepping_target.c` | C test target: compiled with `-g` for source-level stepping tests (StepIn, StepOver, StepOut, line/function breakpoints) |
+| `test/targets/libcalc.c` | Shared library source: defines `calc_check_threshold()` for shared library tracing tests |
+| `test/targets/calc_client.c` | Main program source: links against `libcalc.so`, used to test cross-library breakpoints and stack unwinding |
 | `doc.go` | Module-root package declaration |
 | `docs/sequence-diagram.mmd` | Mermaid sequence diagram of the attach-and-REPL lifecycle |
 | `Dockerfile` | Multi-stage build: compile + slim runtime image |

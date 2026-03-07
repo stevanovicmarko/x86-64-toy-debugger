@@ -1,6 +1,7 @@
 package debugger
 
 import (
+	"debug/elf"
 	"fmt"
 	"os"
 )
@@ -11,12 +12,19 @@ import (
 // relocates a PIE binary.
 const atEntry = 9 // AT_ENTRY
 
-// Target combines a traced Process with its ELF binary, providing the
-// symbolic layer above raw process control. The CLI uses Target to
-// resolve addresses to function names when displaying stop reasons.
+// Target combines a traced Process with its ELF binaries, providing the
+// symbolic layer above raw process control. It manages multiple ELF
+// objects — the main executable plus any shared libraries loaded by
+// the dynamic linker.
 type Target struct {
 	process *Process
-	elf     *ELF
+	elves   ELFCollection // all loaded ELF objects
+	mainELF *ELF          // convenience pointer to the main executable
+
+	// rendezvousAddr is the virtual address of the dynamic linker's
+	// r_debug structure. Zero until resolved via the entry-point
+	// breakpoint callback.
+	rendezvousAddr uint64
 }
 
 // LaunchTarget starts a new process under ptrace, opens its ELF binary,
@@ -40,6 +48,23 @@ func launchTargetWithOpts(program string, opts LaunchOptions, args []string) (*T
 
 	t := &Target{process: proc}
 	t.loadELF(program)
+
+	// Set an internal breakpoint on the real entry point so that
+	// when it's hit, the dynamic linker has finished initialization
+	// and we can read the rendezvous structure.
+	if t.installEntryPointBreakpoint() {
+		// Resume to the entry-point breakpoint so the dynamic linker
+		// runs and initializes. The breakpoint handler will discover
+		// shared libraries and auto-resume, leaving the process
+		// stopped at the entry point.
+		if err := proc.Resume(); err != nil {
+			return nil, err
+		}
+		if _, err := proc.WaitOnSignal(); err != nil {
+			return nil, err
+		}
+	}
+
 	return t, nil
 }
 
@@ -60,6 +85,10 @@ func AttachTarget(pid int) (*Target, error) {
 		t.loadELF(resolved)
 	}
 
+	// When attaching, the dynamic linker is already initialized,
+	// so resolve the rendezvous structure immediately.
+	t.resolveRendezvous()
+
 	return t, nil
 }
 
@@ -71,7 +100,8 @@ func (t *Target) loadELF(path string) {
 	if err != nil {
 		return
 	}
-	t.elf = e
+	t.mainELF = e
+	t.elves.Push(e)
 
 	// Read the auxiliary vector to compute load bias.
 	auxv, err := readAuxv(t.process.pid)
@@ -83,8 +113,58 @@ func (t *Target) loadELF(path string) {
 		// Load bias = actual entry point (from kernel) - ELF entry point (from file).
 		// For ET_EXEC (non-PIE) this is 0. For ET_DYN (PIE) this is the
 		// ASLR base address.
-		t.elf.SetLoadBias(actualEntry - t.elf.EntryPoint())
+		t.mainELF.SetLoadBias(actualEntry - t.mainELF.EntryPoint())
 	}
+}
+
+// installEntryPointBreakpoint sets an internal breakpoint at the
+// program's real entry point (from AT_ENTRY in the auxiliary vector).
+// When the dynamic linker finishes and jumps to the entry point,
+// this breakpoint fires and we resolve the rendezvous structure.
+// Returns true if the breakpoint was installed (i.e., the program
+// has a dynamic linker).
+func (t *Target) installEntryPointBreakpoint() bool {
+	if t.mainELF == nil {
+		return false
+	}
+
+	// Check if the program has an INTERP segment (dynamic linker).
+	hasDynLinker := false
+	for _, prog := range t.mainELF.file.Progs {
+		if prog.Type == elf.PT_INTERP {
+			hasDynLinker = true
+			break
+		}
+	}
+	if !hasDynLinker {
+		return false // statically linked — no entry-point dance needed
+	}
+
+	auxv, err := readAuxv(t.process.pid)
+	if err != nil {
+		return false
+	}
+	entryAddr, ok := auxv[atEntry]
+	if !ok {
+		return false
+	}
+
+	bp, err := t.process.CreateBreakpointSite(entryAddr, false, true)
+	if err != nil {
+		return false
+	}
+	bp.InstallHitHandler(func() bool {
+		t.resolveRendezvous()
+		// Disable and remove the entry-point breakpoint — it's a
+		// one-shot breakpoint that we no longer need.
+		bp.Disable()
+		t.process.breakpointSites.removeByAddress(entryAddr)
+		// Return false — stop here so LaunchTarget can return with
+		// the process stopped and all shared libraries discovered.
+		return false
+	})
+	bp.Enable()
+	return true
 }
 
 // Process returns the underlying Process for direct ptrace operations.
@@ -92,15 +172,33 @@ func (t *Target) Process() *Process {
 	return t.process
 }
 
-// ELF returns the ELF binary, or nil if ELF loading failed.
+// ELF returns the main ELF binary, or nil if ELF loading failed.
+// For multi-library lookups, use ELFs() instead.
 func (t *Target) ELF() *ELF {
-	return t.elf
+	return t.mainELF
 }
 
-// Close releases both the process and the ELF file.
-func (t *Target) Close() {
-	if t.elf != nil {
-		t.elf.Close()
+// ELFs returns the collection of all loaded ELF objects (main binary
+// + shared libraries).
+func (t *Target) ELFs() *ELFCollection {
+	return &t.elves
+}
+
+// ELFContainingPC returns the ELF object whose address range contains
+// the current program counter, or the main ELF as fallback.
+func (t *Target) ELFContainingPC() *ELF {
+	pc, err := t.process.GetPC()
+	if err != nil {
+		return t.mainELF
 	}
+	if e := t.elves.ELFContainingAddress(pc); e != nil {
+		return e
+	}
+	return t.mainELF
+}
+
+// Close releases both the process and all ELF files.
+func (t *Target) Close() {
+	t.elves.Close()
 	t.process.Close()
 }

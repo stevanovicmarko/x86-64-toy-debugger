@@ -196,7 +196,7 @@ func (t *Target) StepOut() (StopReason, error) {
 					}
 				}
 				// maxHigh is in file-address space; adjust by load bias.
-				targetAddr := maxHigh + t.elf.LoadBias()
+				targetAddr := maxHigh + t.elfForPC(pc).LoadBias()
 				return t.RunUntilAddress(targetAddr)
 			}
 		}
@@ -204,13 +204,16 @@ func (t *Target) StepOut() (StopReason, error) {
 
 	// Try CFI-based unwinding first: unwind one frame to find the
 	// return address without relying on frame pointers.
-	if cfi := t.elf.CFI(); cfi != nil {
-		unwoundRegs, _, err := cfi.UnwindFrame(proc, pc, proc.Registers())
-		if err == nil {
-			ripInfo, _ := RegisterInfoByName("rip")
-			retAddr := readRegisterUint64(unwoundRegs, ripInfo)
-			if retAddr != 0 {
-				return t.RunUntilAddress(retAddr)
+	curELF := t.elfForPC(pc)
+	if curELF != nil {
+		if cfi := curELF.CFI(); cfi != nil {
+			unwoundRegs, _, err := cfi.UnwindFrame(proc, pc, proc.Registers())
+			if err == nil {
+				ripInfo, _ := RegisterInfoByName("rip")
+				retAddr := readRegisterUint64(unwoundRegs, ripInfo)
+				if retAddr != 0 {
+					return t.RunUntilAddress(retAddr)
+				}
 			}
 		}
 	}
@@ -232,32 +235,35 @@ func (t *Target) StepOut() (StopReason, error) {
 }
 
 // SetBreakpointAtFunction sets breakpoints on all instances of the
-// named function, past their prologues. Returns the created sites.
+// named function, past their prologues. It searches all loaded ELFs
+// (main binary + shared libraries). Returns the created sites.
 func (t *Target) SetBreakpointAtFunction(name string, hardware bool) ([]*BreakpointSite, error) {
 	proc := t.process
-	dw := t.dwarf()
 	var sites []*BreakpointSite
 
-	if dw != nil {
+	// Search all ELFs for DWARF function entries.
+	t.elves.ForEach(func(e *ELF) {
+		dw := e.DWARF()
+		if dw == nil {
+			return
+		}
 		fns := dw.FunctionsByName(name)
 		for _, fn := range fns {
 			if fn.IsInlined {
-				continue // skip inlined instances
+				continue
 			}
 			for _, r := range fn.Ranges {
 				lowPC := r[0]
 				highPC := r[1]
-				// Try to find prologue end.
 				addr := lowPC
 				if prologueEnd, ok := dw.PrologueEndForRange(lowPC, highPC); ok {
 					addr = prologueEnd
 				}
-				// Adjust by load bias.
-				addr += t.elf.LoadBias()
+				addr += e.LoadBias()
 
 				site, err := proc.CreateBreakpointSite(addr, hardware, false)
 				if err != nil {
-					continue // skip duplicates
+					continue
 				}
 				if err := site.Enable(); err != nil {
 					proc.breakpointSites.removeByID(site.ID())
@@ -266,22 +272,24 @@ func (t *Target) SetBreakpointAtFunction(name string, hardware bool) ([]*Breakpo
 				sites = append(sites, site)
 			}
 		}
-	}
+	})
 
 	// Fallback to ELF symbol table if no DWARF matches.
-	if len(sites) == 0 && t.elf != nil {
-		for _, sym := range t.elf.SymbolsByName(name) {
-			addr := sym.Value + t.elf.LoadBias()
-			site, err := proc.CreateBreakpointSite(addr, hardware, false)
-			if err != nil {
-				continue
+	if len(sites) == 0 {
+		t.elves.ForEach(func(e *ELF) {
+			for _, sym := range e.SymbolsByName(name) {
+				addr := sym.Value + e.LoadBias()
+				site, err := proc.CreateBreakpointSite(addr, hardware, false)
+				if err != nil {
+					continue
+				}
+				if err := site.Enable(); err != nil {
+					proc.breakpointSites.removeByID(site.ID())
+					continue
+				}
+				sites = append(sites, site)
 			}
-			if err := site.Enable(); err != nil {
-				proc.breakpointSites.removeByID(site.ID())
-				continue
-			}
-			sites = append(sites, site)
-		}
+		})
 	}
 
 	if len(sites) == 0 {
@@ -291,16 +299,20 @@ func (t *Target) SetBreakpointAtFunction(name string, hardware bool) ([]*Breakpo
 }
 
 // SetBreakpointAtLine sets breakpoints at all addresses corresponding
-// to the given file:line. Returns the created sites.
+// to the given file:line. It searches all loaded ELFs. Returns the created sites.
 func (t *Target) SetBreakpointAtLine(file string, line int, hardware bool) ([]*BreakpointSite, error) {
 	proc := t.process
-	dw := t.dwarf()
 
-	if dw == nil {
-		return nil, newError("no DWARF info available for line breakpoints")
-	}
+	// Collect line entries from all ELFs.
+	var entries []LineEntry
+	t.elves.ForEach(func(e *ELF) {
+		dw := e.DWARF()
+		if dw == nil {
+			return
+		}
+		entries = append(entries, dw.GetEntriesByLine(file, line)...)
+	})
 
-	entries := dw.GetEntriesByLine(file, line)
 	if len(entries) == 0 {
 		return nil, newErrorf("no code at %s:%d", file, line)
 	}
@@ -310,12 +322,15 @@ func (t *Target) SetBreakpointAtLine(file string, line int, hardware bool) ([]*B
 		addr := entry.Address
 
 		// Check if this address is at a function start, and skip prologue.
-		fn := dw.FunctionContainingPC(addr)
-		if fn != nil && len(fn.Ranges) > 0 {
-			lowPC := fn.Ranges[0][0] + dw.loadBias
-			if addr == lowPC {
-				if pe, ok := dw.PrologueEndForRange(fn.Ranges[0][0], fn.Ranges[0][1]); ok {
-					addr = pe + dw.loadBias
+		dw := t.dwarfForPC(addr)
+		if dw != nil {
+			fn := dw.FunctionContainingPC(addr)
+			if fn != nil && len(fn.Ranges) > 0 {
+				lowPC := fn.Ranges[0][0] + dw.loadBias
+				if addr == lowPC {
+					if pe, ok := dw.PrologueEndForRange(fn.Ranges[0][0], fn.Ranges[0][1]); ok {
+						addr = pe + dw.loadBias
+					}
 				}
 			}
 		}
@@ -405,12 +420,34 @@ func (t *Target) sourceLocationAtPC() (LineEntry, bool) {
 	return dw.GetEntryByAddress(pc)
 }
 
-// dwarf returns the DWARF info from the ELF, or nil.
+// dwarf returns the DWARF info for the ELF containing the current PC,
+// falling back to the main ELF. Returns nil if no DWARF is available.
 func (t *Target) dwarf() *DWARF {
-	if t.elf == nil {
-		return nil
+	if e := t.ELFContainingPC(); e != nil {
+		return e.DWARF()
 	}
-	return t.elf.DWARF()
+	return nil
+}
+
+// dwarfForPC returns the DWARF info for the ELF containing the given
+// virtual address. Returns nil if no ELF or DWARF is found.
+func (t *Target) dwarfForPC(pc uint64) *DWARF {
+	if e := t.elves.ELFContainingAddress(pc); e != nil {
+		return e.DWARF()
+	}
+	if t.mainELF != nil {
+		return t.mainELF.DWARF()
+	}
+	return nil
+}
+
+// elfForPC returns the ELF containing the given virtual address,
+// or the main ELF as fallback.
+func (t *Target) elfForPC(pc uint64) *ELF {
+	if e := t.elves.ELFContainingAddress(pc); e != nil {
+		return e
+	}
+	return t.mainELF
 }
 
 // skipPrologueIfNeeded checks if the current PC is at the start of a
@@ -478,8 +515,8 @@ func (t *Target) PrintSourceAtPC(w io.Writer, contextLines int) bool {
 	file := loc.File
 	if _, err := os.Stat(file); err != nil {
 		// Try relative to binary path.
-		if t.elf != nil {
-			dir := filepath.Dir(t.elf.path)
+		if t.mainELF != nil {
+			dir := filepath.Dir(t.mainELF.path)
 			candidate := filepath.Join(dir, filepath.Base(file))
 			if _, err := os.Stat(candidate); err == nil {
 				file = candidate

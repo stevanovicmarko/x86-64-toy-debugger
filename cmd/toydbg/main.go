@@ -752,30 +752,45 @@ func printStopReason(target *debugger.Target, reason debugger.StopReason) {
 }
 
 // formatFunctionInfo returns a parenthesized annotation for a stop address.
-// It prefers DWARF (which gives source file + line) over the plain symbol table.
+// It searches all loaded ELFs (main binary + shared libraries) and qualifies
+// the function name with the ELF filename when in a shared library.
 //
-//	DWARF present:  " (main at dwarf_target.c:30)"
-//	Symtab only:    " (main)"
-//	No symbols:     ""
+//	Main binary DWARF:  " (main at dwarf_target.c:30)"
+//	Shared library:     " (libcalc.so`func at libcalc.c:4)"
+//	Symtab only:        " (main)"
+//	No symbols:         ""
 func formatFunctionInfo(target *debugger.Target, pc uint64) string {
-	e := target.ELF()
+	elves := target.ELFs()
+	if elves == nil {
+		return ""
+	}
+
+	e := elves.ELFContainingAddress(pc)
+	if e == nil {
+		e = target.ELF()
+	}
 	if e == nil {
 		return ""
+	}
+
+	prefix := ""
+	if e != target.ELF() {
+		prefix = e.Filename() + "`"
 	}
 
 	// Try DWARF first — it gives us function name + source location.
 	if dw := e.DWARF(); dw != nil {
 		if fn := dw.FunctionContainingPC(pc); fn != nil {
 			if loc, ok := dw.PCToSourceLocation(pc); ok {
-				return fmt.Sprintf(" (%s at %s:%d)", fn.Name, filepath.Base(loc.File), loc.Line)
+				return fmt.Sprintf(" (%s%s at %s:%d)", prefix, fn.Name, filepath.Base(loc.File), loc.Line)
 			}
-			return fmt.Sprintf(" (%s)", fn.Name)
+			return fmt.Sprintf(" (%s%s)", prefix, fn.Name)
 		}
 	}
 
 	// Fall back to the ELF symbol table.
 	if name, ok := e.FunctionContainingAddress(pc); ok {
-		return fmt.Sprintf(" (%s)", name)
+		return fmt.Sprintf(" (%s%s)", prefix, name)
 	}
 
 	return ""

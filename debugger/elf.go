@@ -2,6 +2,7 @@ package debugger
 
 import (
 	"debug/elf"
+	"path/filepath"
 	"sort"
 )
 
@@ -18,6 +19,12 @@ type ELF struct {
 	path     string
 	file     *elf.File
 	loadBias uint64
+
+	// addrLow and addrHigh define the file-address range of the ELF's
+	// LOAD segments. Combined with loadBias, this lets us check whether
+	// a virtual address belongs to this ELF.
+	addrLow  uint64
+	addrHigh uint64
 
 	// symbolsByName maps symbol names to all symbols with that name.
 	// Multiple symbols can share a name (e.g., static functions in
@@ -53,6 +60,9 @@ func OpenELF(path string) (*ELF, error) {
 		file:          f,
 		symbolsByName: make(map[string][]*elf.Symbol),
 	}
+
+	// Compute file-address range from LOAD segments.
+	e.computeAddressRange()
 
 	// Read the symbol table (.symtab). This may not exist in
 	// stripped binaries, which is fine — we just won't have symbols.
@@ -234,4 +244,52 @@ func (e *ELF) FunctionContainingAddress(addr uint64) (string, bool) {
 		return "", false
 	}
 	return sym.Name, true
+}
+
+// Path returns the filesystem path of this ELF binary.
+func (e *ELF) Path() string {
+	return e.path
+}
+
+// Filename returns just the basename of the ELF path.
+func (e *ELF) Filename() string {
+	return filepath.Base(e.path)
+}
+
+// ContainsAddress reports whether the given virtual address falls
+// within this ELF's loaded address range.
+func (e *ELF) ContainsAddress(addr uint64) bool {
+	if e.addrHigh == 0 {
+		return false
+	}
+	fileAddr := addr - e.loadBias
+	return fileAddr >= e.addrLow && fileAddr < e.addrHigh
+}
+
+// computeAddressRange scans the ELF LOAD program headers to determine
+// the file-address range that this binary occupies.
+func (e *ELF) computeAddressRange() {
+	first := true
+	for _, prog := range e.file.Progs {
+		if prog.Type != elf.PT_LOAD {
+			continue
+		}
+		if first {
+			e.addrLow = prog.Vaddr
+			first = false
+		}
+		end := prog.Vaddr + prog.Memsz
+		if end > e.addrHigh {
+			e.addrHigh = end
+		}
+	}
+}
+
+// NotifyLoaded sets the load bias from the known load address.
+// This is used for shared libraries where the load address comes
+// from the dynamic linker's link map, not from the auxiliary vector.
+func (e *ELF) NotifyLoaded(loadAddr uint64) {
+	// For shared libraries (ET_DYN), the load address is the base
+	// at which the lowest LOAD segment was mapped.
+	e.SetLoadBias(loadAddr)
 }

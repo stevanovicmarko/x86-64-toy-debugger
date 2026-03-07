@@ -55,6 +55,38 @@ sequenceDiagram
     Note over D: For non-PIE: loadBias = 0
     Note over D: For PIE: loadBias = ASLR base offset
 
+    Note over D,T: ── Phase 1d: Shared library discovery ──
+    Note over D: Check main ELF for PT_INTERP segment
+    alt Dynamic executable (has INTERP)
+        Note over D: Read AT_ENTRY from auxv → real entry point
+        D->>K: PTRACE_PEEKDATA(pid, entryAddr) — install BP
+        K-->>D: original byte
+        D->>K: PTRACE_POKEDATA(pid, entryAddr, 0xCC)
+        K-->>D: success
+        Note over D: Install hit handler on entry-point BP
+        D->>K: PtraceCont(pid, 0) — resume past dynamic linker
+        Note over T: Dynamic linker runs: maps shared libraries
+        Note over T: Tracee hits entry-point BP → STOPS
+        D->>K: wait4(pid)
+        K-->>D: returns WaitStatus (SIGTRAP)
+        D->>K: PtraceGetRegs
+        K-->>D: register values
+        Note over D: Entry-point BP handler fires:
+        Note over D: 1. Read .dynamic section from inferior memory
+        Note over D: 2. Find DT_DEBUG entry → r_debug address
+        Note over D: 3. Read r_debug.r_map → linked list of libraries
+        Note over D: 4. For each link_map entry:
+        Note over D:    - Read library path from inferior
+        Note over D:    - OpenELF(path) → parse symbols, DWARF, CFI
+        Note over D:    - Set load bias from link_map.l_addr
+        Note over D:    - Add to ELFCollection
+        Note over D: 5. Read r_debug.r_brk → set BP on _dl_debug_state
+        Note over D: 6. Remove entry-point BP (one-shot)
+        Note over T: Tracee STOPPED at program entry point
+    else Static executable (no INTERP)
+        Note over D: No dynamic linker — skip library discovery
+    end
+
     Note over D,T: ── Phase 2: REPL loop ──
     D->>U: print prompt "(toydbg) "
     Note over D: Debugger BLOCKED on readline
@@ -74,8 +106,9 @@ sequenceDiagram
     K-->>D: register values
     Note over D: Registers cached in Process.regs
 
-    Note over D: Lookup function: try DWARF.FunctionContainingPC(PC) first
-    Note over D: If DWARF: also PCToSourceLocation(PC) for file:line
+    Note over D: Find ELF for PC: ELFContainingAddress(PC) or fallback to mainELF
+    Note over D: If shared library ELF: prefix = "libname.so`"
+    Note over D: Try DWARF.FunctionContainingPC(PC) + PCToSourceLocation(PC)
     Note over D: Fallback: ELF.FunctionContainingAddress(PC) (symtab only)
     D->>U: print stop reason (with PC, function name, source location)
     D->>U: print prompt "(toydbg) "
@@ -369,8 +402,8 @@ sequenceDiagram
     Note over D,T: ── Phase 16: Source-level breakpoint set ──
     U-->>D: types "breakpoint set add"
     Note over D: SetBreakpointAtFunction("add")
-    Note over D: DWARF.FunctionsByName("add") → function entry
-    Note over D: PrologueEndForRange(lowPC, highPC) → skip prologue
+    Note over D: Search all ELFs (main + shared libs) for function "add"
+    Note over D: For each match: PrologueEndForRange → skip prologue
     Note over D: Adjust address by load bias
     D->>K: PTRACE_PEEKDATA + POKEDATA — insert 0xCC
     K-->>D: success
@@ -378,7 +411,7 @@ sequenceDiagram
 
     U-->>D: types "breakpoint set main.c:42"
     Note over D: SetBreakpointAtLine("main.c", 42)
-    Note over D: DWARF.GetEntriesByLine("main.c", 42) → addresses
+    Note over D: Search all ELFs for entries at main.c:42
     Note over D: If address is function start: skip prologue
     D->>K: PTRACE_PEEKDATA + POKEDATA — insert 0xCC
     K-->>D: success
@@ -394,11 +427,14 @@ sequenceDiagram
     U-->>D: types "backtrace"
     Note over D: UnwindStack(): start at current PC + registers
     loop For each physical frame
+        Note over D: ELFContainingAddress(PC) → find per-frame ELF
+        Note over D: Tag frames with ELFFilename (e.g. "libcalc.so")
         Note over D: InlineStackAtAddress(PC) → check for inlined frames
         Note over D: Create StackFrame(s) for this PC
-        Note over D: FDEForPC(PC) → find FDE for unwinding
+        Note over D: FDEForPC(PC) from per-frame ELF's CFI
         Note over D: Execute CIE + FDE CFI instructions
         Note over D: Compute CFA, apply register rules → caller regs
         Note over D: New PC = unwound RIP - 1 (point into call instruction)
     end
+    Note over D: FormatBacktrace: qualify names with ELF filename (e.g. "libcalc.so`func")
     D->>U: print backtrace (frame index, PC, function, source location)

@@ -601,6 +601,14 @@ func (p *Process) WaitOnSignal() (StopReason, error) {
 						if err := p.SetPC(pc - 1); err != nil {
 							return reason, err
 						}
+						// If the breakpoint has a hit handler, invoke it.
+						// If the handler returns true, resume and wait again.
+						if site.notifyHit() {
+							if err := p.Resume(); err != nil {
+								return reason, err
+							}
+							return p.WaitOnSignal()
+						}
 					}
 				}
 

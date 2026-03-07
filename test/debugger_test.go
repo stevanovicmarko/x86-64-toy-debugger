@@ -74,6 +74,28 @@ func TestMain(m *testing.M) {
 		}
 	}
 
+	// Build shared library test target: libcalc.so + calc_client.
+	libcalcSrc := filepath.Join("targets", "libcalc.c")
+	libcalcOut := filepath.Join(targetDir, "libcalc.so")
+	cmd := exec.Command("gcc", "-shared", "-o", libcalcOut, libcalcSrc, "-g", "-O0", "-fPIC", "-gdwarf-4")
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "build libcalc.so: %v\n", err)
+		os.Exit(1)
+	}
+
+	calcClientSrc := filepath.Join("targets", "calc_client.c")
+	calcClientOut := filepath.Join(targetDir, "calc_client")
+	cmd = exec.Command("gcc", "-o", calcClientOut, calcClientSrc,
+		"-g", "-O0", "-gdwarf-4",
+		"-L"+targetDir, "-lcalc",
+		"-Wl,-rpath,"+targetDir)
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "build calc_client: %v\n", err)
+		os.Exit(1)
+	}
+
 	os.Exit(m.Run())
 }
 
@@ -2660,4 +2682,102 @@ func TestStackUnwinding(t *testing.T) {
 
 	// Log the full backtrace.
 	t.Logf("backtrace:\n%s", debugger.FormatBacktrace(frames))
+}
+
+func TestSharedLibraryTracing(t *testing.T) {
+	// Launch the calc_client binary which links against libcalc.so.
+	// Redirect stdout to /dev/null since the program prints output.
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open /dev/null: %v", err)
+	}
+	defer devNull.Close()
+
+	target, err := debugger.LaunchTargetWithOptions(
+		targetPath("calc_client"),
+		debugger.LaunchOptions{Stdout: devNull, Stderr: devNull},
+	)
+	if err != nil {
+		t.Fatalf("LaunchTarget failed: %v", err)
+	}
+	defer target.Close()
+
+	proc := target.Process()
+
+	// Set a breakpoint on calc_check_threshold (defined in libcalc.so).
+	sites, err := target.SetBreakpointAtFunction("calc_check_threshold", false)
+	if err != nil {
+		t.Fatalf("SetBreakpointAtFunction failed: %v", err)
+	}
+	if len(sites) == 0 {
+		t.Fatal("expected at least one breakpoint site")
+	}
+	t.Logf("breakpoint set at 0x%x", sites[0].Address())
+
+	// Continue to the breakpoint.
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume failed: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal failed: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+	}
+	if reason.TrapReason == nil || *reason.TrapReason != debugger.TrapSoftwareBreak {
+		t.Fatalf("expected software breakpoint trap")
+	}
+
+	// Verify we're stopped inside libcalc.so.
+	pc, _ := proc.GetPC()
+	t.Logf("stopped at PC=0x%x", pc)
+
+	// The ELF containing the PC should be libcalc.so.
+	curELF := target.ELFs().ELFContainingAddress(pc)
+	if curELF == nil {
+		t.Fatal("no ELF found containing the current PC")
+	}
+	t.Logf("PC is in ELF: %s", curELF.Filename())
+	if curELF.Filename() != "libcalc.so" {
+		t.Errorf("expected PC in libcalc.so, got %s", curELF.Filename())
+	}
+
+	// Verify DWARF function lookup works in the shared library.
+	dw := curELF.DWARF()
+	if dw != nil {
+		fn := dw.FunctionContainingPC(pc)
+		if fn != nil {
+			t.Logf("function at PC: %s", fn.Name)
+			if fn.Name != "calc_check_threshold" {
+				t.Errorf("expected function calc_check_threshold, got %s", fn.Name)
+			}
+		} else {
+			t.Log("DWARF function lookup returned nil (may be in prologue)")
+		}
+	}
+
+	// Unwind the stack and verify the backtrace crosses libraries.
+	frames := target.UnwindStack(0)
+	if len(frames) < 2 {
+		t.Fatalf("expected at least 2 stack frames, got %d", len(frames))
+	}
+	t.Logf("backtrace:\n%s", debugger.FormatBacktrace(frames))
+
+	// Frame 0 should be in libcalc.so.
+	if frames[0].ELFFilename != "libcalc.so" {
+		t.Errorf("frame[0] ELF = %q, want %q", frames[0].ELFFilename, "libcalc.so")
+	}
+
+	// There should be a frame in calc_client (main).
+	foundMain := false
+	for _, f := range frames {
+		if f.FunctionName == "main" && f.ELFFilename == "calc_client" {
+			foundMain = true
+			break
+		}
+	}
+	if !foundMain {
+		t.Error("expected to find main in calc_client in the backtrace")
+	}
 }

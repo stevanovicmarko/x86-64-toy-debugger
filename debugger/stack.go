@@ -29,6 +29,10 @@ type StackFrame struct {
 	// FunctionName is the name of the function this frame belongs to.
 	FunctionName string
 
+	// ELFFilename is the basename of the ELF file containing this frame
+	// (e.g., "libcalc.so" or "calc_client"). Empty if unknown.
+	ELFFilename string
+
 	// Inlined is true if this frame represents an inlined function call.
 	Inlined bool
 
@@ -57,16 +61,6 @@ type StackFrame struct {
 // maxFrames limits the number of physical frames to unwind (0 = unlimited).
 // Even with a limit, all inlined frames at each physical frame are included.
 func (t *Target) UnwindStack(maxFrames int) []StackFrame {
-	if t.elf == nil {
-		return nil
-	}
-
-	dw := t.dwarf()
-	cfi := t.elf.CFI()
-	if cfi == nil {
-		return nil
-	}
-
 	proc := t.process
 	pc, err := proc.GetPC()
 	if err != nil {
@@ -82,26 +76,57 @@ func (t *Target) UnwindStack(maxFrames int) []StackFrame {
 			break
 		}
 
-		// Check if the PC is within our ELF's address space.
-		if dw == nil {
-			break
+		// Find the ELF containing the current PC. If none is found
+		// and we've already collected at least one frame, stop.
+		curELF := t.elves.ELFContainingAddress(pc)
+		if curELF == nil {
+			if physicalCount > 0 {
+				break
+			}
+			// First frame — try main ELF as fallback.
+			curELF = t.mainELF
+			if curELF == nil {
+				break
+			}
 		}
-		fn := dw.FunctionContainingPC(pc)
-		if fn == nil && physicalCount > 0 {
-			break // PC is outside our ELF — stop unwinding
+
+		dw := curELF.DWARF()
+		cfi := curELF.CFI()
+
+		var fn *FunctionEntry
+		if dw != nil {
+			fn = dw.FunctionContainingPC(pc)
+			if fn == nil && physicalCount > 0 {
+				break // PC is outside all known functions — stop unwinding
+			}
 		}
+
+		// Determine ELF filename for frame annotation.
+		elfFilename := curELF.Filename()
 
 		// Get the inline stack at this PC.
-		inlineStack := dw.InlineStackAtAddress(pc)
-
-		if len(inlineStack) > 1 {
-			frames = append(frames, createInlineFrames(dw, regs, pc, inlineStack)...)
+		framesBefore := len(frames)
+		if dw != nil {
+			inlineStack := dw.InlineStackAtAddress(pc)
+			if len(inlineStack) > 1 {
+				frames = append(frames, createInlineFrames(dw, regs, pc, inlineStack)...)
+			} else {
+				frame := createPhysicalFrame(dw, regs, pc, fn, physicalCount == 0)
+				frames = append(frames, frame)
+			}
 		} else {
-			frame := createPhysicalFrame(dw, regs, pc, fn, physicalCount == 0)
+			frame := createPhysicalFrame(nil, regs, pc, nil, physicalCount == 0)
 			frames = append(frames, frame)
+		}
+		// Tag new frames with the ELF filename.
+		for i := framesBefore; i < len(frames); i++ {
+			frames[i].ELFFilename = elfFilename
 		}
 
 		// Unwind one physical frame using CFI.
+		if cfi == nil {
+			break
+		}
 		unwoundRegs, frameCFA, err := cfi.UnwindFrame(proc, pc, regs)
 		if err != nil {
 			break // can't unwind further
@@ -318,6 +343,9 @@ func FormatBacktrace(frames []StackFrame) string {
 		funcName := frame.FunctionName
 		if funcName == "" {
 			funcName = "??"
+		}
+		if frame.ELFFilename != "" {
+			funcName = frame.ELFFilename + "`" + funcName
 		}
 
 		inlined := ""
