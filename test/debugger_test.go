@@ -2606,3 +2606,58 @@ func TestFDEInstructions(t *testing.T) {
 	t.Logf("FDE: %d instruction bytes; CIE: %d initial instruction bytes",
 		len(fde.Instructions), len(fde.CIE.Instructions))
 }
+
+func TestStackUnwinding(t *testing.T) {
+	target, _ := launchSteppingTarget(t)
+	defer target.Close()
+
+	// StepIn until we enter the "add" function.
+	for i := 0; i < 50; i++ {
+		reason, err := target.StepIn()
+		if err != nil {
+			t.Fatalf("StepIn failed: %v", err)
+		}
+		if reason.Reason != debugger.ProcessStopped {
+			t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+		}
+		pc, _ := target.Process().GetPC()
+		dw := target.ELF().DWARF()
+		fn := dw.FunctionContainingPC(pc)
+		if fn != nil && fn.Name == "add" {
+			t.Logf("entered add at 0x%x after %d steps", pc, i+1)
+			break
+		}
+	}
+
+	// Verify we are actually in "add".
+	pc, _ := target.Process().GetPC()
+	dw := target.ELF().DWARF()
+	fn := dw.FunctionContainingPC(pc)
+	if fn == nil || fn.Name != "add" {
+		t.Fatalf("expected to be in add, got %v", fn)
+	}
+
+	// Now unwind the stack and verify the backtrace.
+	frames := target.UnwindStack(0)
+	if len(frames) < 2 {
+		t.Fatalf("expected at least 2 stack frames, got %d", len(frames))
+	}
+
+	// Frame 0 should be "add".
+	if frames[0].FunctionName != "add" {
+		t.Errorf("frame[0] function = %q, want %q", frames[0].FunctionName, "add")
+	}
+
+	// Frame 1 should be "main".
+	if frames[1].FunctionName != "main" {
+		t.Errorf("frame[1] function = %q, want %q", frames[1].FunctionName, "main")
+	}
+
+	// CFA for the current frame should be non-zero.
+	if frames[0].CFA == 0 {
+		t.Error("frame[0] CFA is 0, expected non-zero")
+	}
+
+	// Log the full backtrace.
+	t.Logf("backtrace:\n%s", debugger.FormatBacktrace(frames))
+}

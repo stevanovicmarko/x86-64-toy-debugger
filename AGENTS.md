@@ -150,7 +150,7 @@ echo "c" | podman run --rm -i --cap-add=SYS_PTRACE --security-opt seccomp=unconf
 ```bash
 echo "help" | podman run --rm -i --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
   toydbg /bin/true
-# Expected output: "commands: continue (c), step (s), breakpoint (break), register (reg), quit (q), help (h)"
+# Expected output: "commands: continue (c), step (s), next (n), finish (fin), stepi (si), list (l), backtrace (bt), breakpoint (break), watchpoint (watch), register (reg), memory (mem), disassemble (disas), catchpoint (catch), quit (q), help (h)"
 ```
 
 > **Why is the container build mandatory?** Native-only testing does not guarantee the container environment works. The container is where `gcc` compiles assembly test targets, and where the Dockerfile's `RUN go test ./...` gate catches regressions in the full toolchain.

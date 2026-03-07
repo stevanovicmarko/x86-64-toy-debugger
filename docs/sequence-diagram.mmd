@@ -342,15 +342,19 @@ sequenceDiagram
     end
     D->>U: print source context
 
-    Note over D,T: ── Phase 15: Source-level step-out ──
+    Note over D,T: ── Phase 15: Source-level step-out (CFI-based) ──
     U-->>D: types "finish"
     Note over D: StepOut(): check inline stack
     alt Deepest frame is inlined
         Note over D: target = end of inlined range + loadBias
-    else Regular function frame
-        Note over D: Read rbp register
-        D->>K: process_vm_readv(pid, rbp+8, 8) — read return address
-        K-->>D: returns 8 bytes (return address)
+    else Regular function frame (CFI unwinding)
+        Note over D: FDEForPC(PC) → find matching FDE
+        Note over D: Execute CIE initial instructions → baseline rules
+        Note over D: Execute FDE instructions until location > PC
+        Note over D: Compute CFA = register[cfa.reg] + cfa.offset
+        Note over D: Apply register rules → unwound register set
+        Note over D: Return address = unwound RIP
+        Note over D: Fallback: read [rbp+8] if CFI unavailable
     end
     Note over D: RunUntilAddress(returnAddr)
     Note over D: Create internal breakpoint at returnAddr
@@ -385,3 +389,16 @@ sequenceDiagram
     Note over D: SourceLocationAtPC() → file, line
     Note over D: Open source file, read lines
     D->>U: print surrounding lines with ">" marker
+
+    Note over D,T: ── Phase 18: Backtrace (stack unwinding) ──
+    U-->>D: types "backtrace"
+    Note over D: UnwindStack(): start at current PC + registers
+    loop For each physical frame
+        Note over D: InlineStackAtAddress(PC) → check for inlined frames
+        Note over D: Create StackFrame(s) for this PC
+        Note over D: FDEForPC(PC) → find FDE for unwinding
+        Note over D: Execute CIE + FDE CFI instructions
+        Note over D: Compute CFA, apply register rules → caller regs
+        Note over D: New PC = unwound RIP - 1 (point into call instruction)
+    end
+    D->>U: print backtrace (frame index, PC, function, source location)

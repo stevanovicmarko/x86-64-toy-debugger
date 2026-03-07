@@ -168,8 +168,9 @@ func (t *Target) StepOver() (StopReason, error) {
 }
 
 // StepOut steps out of the current function. For inlined functions it
-// runs to the end of the inlined range. For regular functions it reads
-// the return address from [rbp+8] and runs to that address.
+// runs to the end of the inlined range. For regular functions it uses
+// CFI-based stack unwinding to find the return address, falling back
+// to reading from [rbp+8] if CFI is unavailable.
 func (t *Target) StepOut() (StopReason, error) {
 	proc := t.process
 	dw := t.dwarf()
@@ -201,7 +202,20 @@ func (t *Target) StepOut() (StopReason, error) {
 		}
 	}
 
-	// Regular function: read return address from [rbp+8].
+	// Try CFI-based unwinding first: unwind one frame to find the
+	// return address without relying on frame pointers.
+	if cfi := t.elf.CFI(); cfi != nil {
+		unwoundRegs, _, err := cfi.UnwindFrame(proc, pc, proc.Registers())
+		if err == nil {
+			ripInfo, _ := RegisterInfoByName("rip")
+			retAddr := readRegisterUint64(unwoundRegs, ripInfo)
+			if retAddr != 0 {
+				return t.RunUntilAddress(retAddr)
+			}
+		}
+	}
+
+	// Fallback: read return address from [rbp+8].
 	rbpInfo, ok := RegisterInfoByName("rbp")
 	if !ok {
 		return StopReason{}, newError("rbp register not found")

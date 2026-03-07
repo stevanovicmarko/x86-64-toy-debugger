@@ -36,7 +36,8 @@ codebase, extending it, or building your own debugger from scratch.
 25. [DWARF Debug Information](#25-dwarf-debug-information)
 26. [Source-Level Stepping and Breakpoints](#26-source-level-stepping-and-breakpoints)
 27. [Call Frame Information (CFI)](#27-call-frame-information-cfi)
-28. [File Reference](#28-file-reference)
+28. [Stack Unwinding](#28-stack-unwinding)
+29. [File Reference](#29-file-reference)
 
 ---
 
@@ -298,6 +299,7 @@ shell over the `debugger` API, not an independent system.
 │     │   "finish"      → StepOut (source-level)            │
 │     │   "stepi"       → StepInstruction + print stop      │
 │     │   "list"        → PrintSourceAtPC                   │
+│     │   "backtrace"   → UnwindStack + FormatBacktrace     │
 │     │   "breakpoint"  → set/list/enable/disable/del       │
 │     │   "watchpoint"  → set/list/enable/disable/del       │
 │     │   "register"    → read/write subcommands            │
@@ -323,6 +325,7 @@ shell over the `debugger` API, not an independent system.
 | `finish` | `fin` | Step out of the current function (calls `StepOut`) |
 | `stepi` | `si` | Execute one machine instruction (calls `StepInstruction`) |
 | `list` | `l` | Display source code at current PC via DWARF |
+| `backtrace` | `bt` | Print the call stack (physical + inlined frames via CFI unwinding) |
 | `breakpoint set <0xaddr>` | `break set <0xaddr>` | Set and enable a software breakpoint at the given hex address |
 | `breakpoint set <func>` | `break set <func>` | Set breakpoint at named function (past prologue via DWARF) |
 | `breakpoint set <file>:<line>` | `break set <file>:<line>` | Set breakpoint at source line (via DWARF line table) |
@@ -1973,15 +1976,15 @@ The loop continues until the source line changes.
 
 ### StepOut (step out of current function)
 
-Two strategies based on whether we're in an inlined function:
+Three strategies, tried in order:
 
 1. **Inlined frame:** Walk `InlineStackAtAddress()`. If the deepest frame is
    inlined, `RunUntilAddress(highPC + loadBias)` — the end of the inlined range.
-2. **Regular frame:** Read `rbp` register, read 8 bytes at `rbp+8` (the return
+2. **CFI unwinding:** Call `cfi.UnwindFrame()` to compute the caller's register
+   state, read the return address from the unwound `rip`, and `RunUntilAddress()`.
+   This works with any calling convention, including `-fomit-frame-pointer`.
+3. **Fallback (rbp):** Read `rbp` register, read 8 bytes at `rbp+8` (the return
    address in the frame-pointer calling convention), `RunUntilAddress(retAddr)`.
-
-The `[rbp+8]` approach assumes frame-pointer ABI (`-fno-omit-frame-pointer`,
-which is the default at `-O0`). Full DWARF CFI unwinding is deferred.
 
 ### Source-level breakpoints
 
@@ -2039,11 +2042,13 @@ innermost. This is used by `StepOut` to detect when we're in an inlined frame.
 
 ### Why CFI matters
 
-The debugger's `StepOut()` currently reads `[rbp+8]` to find the return address. This
+Without CFI, a debugger must read `[rbp+8]` to find the return address. This
 works with frame-pointer ABI, but breaks with `-fomit-frame-pointer` or optimized code
 where `rbp` is used as a general-purpose register. **Call Frame Information** is the
 DWARF mechanism for stack unwinding that works with *any* calling convention — each
 program counter maps to rules for recovering the previous frame's registers.
+`StepOut()` now uses CFI as its primary strategy, falling back to `[rbp+8]` only
+when CFI is unavailable.
 
 ### .eh_frame vs .debug_frame
 
@@ -2178,11 +2183,118 @@ method implements the DWARF algorithm directly.
 
 ---
 
-## 28. File Reference
+## 28. Stack Unwinding
+
+**Source:** `debugger/unwind.go`, `debugger/stack.go`
+
+Stack unwinding is the process of reconstructing the call chain from the
+current execution point back to `main()`. It enables the `backtrace` command
+and powers CFI-based `StepOut` (which no longer requires frame pointers).
+
+### Mental model
+
+The unwinder walks the call stack one physical frame at a time. At each frame
+it:
+
+1. **Finds the FDE** for the current PC via `FDEForPC()`
+2. **Executes CFI instructions** (a bytecode program) to build the unwind
+   table row for that PC
+3. **Applies register restore rules** to produce the caller's register state
+4. **Checks for inlined frames** at the PC and synthesizes logical frames
+
+```
+  Current Frame (add)          Caller Frame (main)
+  ┌──────────────────┐         ┌──────────────────┐
+  │ registers (live)  │  CFI   │ registers (restored)│
+  │ PC = 0x400470     │ ────►  │ PC = 0x4004c4       │
+  │ CFA = rsp + 16    │        │ CFA = rsp + 8        │
+  └──────────────────┘         └──────────────────┘
+         │                            │
+         ▼                            ▼
+    FDE instructions:             Next FDE...
+    DW_CFA_def_cfa r7, 8
+    DW_CFA_offset r16, -8
+    DW_CFA_advance_loc ...
+```
+
+### CFI instruction interpreter
+
+The CFI bytecode has 25 instructions operating on an abstract machine with:
+
+- **location** — the file address of the current table row
+- **cfa_rule** — how to compute the Canonical Frame Address (register + offset)
+- **register_rules** — map from DWARF register number to restore rule
+
+Instructions are split into two groups:
+
+| Encoding | Instructions |
+|----------|-------------|
+| Primary (high 2 bits) | `DW_CFA_advance_loc` (delta in low 6 bits), `DW_CFA_offset` (reg + ULEB128), `DW_CFA_restore` |
+| Extended (low 6 bits) | `DW_CFA_def_cfa`, `DW_CFA_def_cfa_register`, `DW_CFA_def_cfa_offset`, `DW_CFA_set_loc`, `DW_CFA_advance_loc{1,2,4}`, `DW_CFA_undefined`, `DW_CFA_same_value`, `DW_CFA_register`, `DW_CFA_remember_state`, `DW_CFA_restore_state`, and signed/extended variants |
+
+The interpreter runs in two phases:
+
+1. Execute the CIE's `initial_instructions` to establish baseline rules
+2. Execute the FDE's `instructions` until `location > target_PC`
+
+### Register restore rules
+
+Each register can have one of five rules:
+
+| Rule | Meaning |
+|------|---------|
+| `undefined` | Cannot restore (register clobbered) |
+| `same_value` | Register wasn't modified |
+| `offset(N)` | Previous value at memory `CFA + N` |
+| `val_offset(N)` | Previous value IS `CFA + N` |
+| `register(R)` | Previous value stored in register R |
+
+### Stack frame type
+
+```go
+type StackFrame struct {
+    Regs         *Registers
+    PC           uint64
+    FunctionName string
+    Inlined      bool
+    Location     SourceLocation
+    CFA          uint64
+}
+```
+
+### Inline frame handling
+
+When the PC falls within a `DW_TAG_inlined_subroutine`, the unwinder creates
+multiple logical frames for the single physical frame:
+
+- **Innermost inlined frame:** PC from actual registers, source from line table
+- **Outer frames:** PC from `DW_AT_low_pc` of inner subroutine, source from
+  `DW_AT_call_file` / `DW_AT_call_line` attributes
+
+### StepOut improvement
+
+`StepOut` now uses CFI unwinding instead of `[rbp+8]`:
+
+1. Call `cfi.UnwindFrame(proc, pc, regs)` to get the caller's register state
+2. Read `rip` from the unwound registers — this is the return address
+3. `RunUntilAddress(retAddr)` to run to the caller
+
+This works with optimized code where `rbp` may be used as a general-purpose
+register (e.g., with `-fomit-frame-pointer`).
+
+### CLI commands
+
+| Command | Action |
+|---------|--------|
+| `backtrace` / `bt` | Print the call stack |
+
+---
+
+## 29. File Reference
 
 | File | Purpose |
 |------|---------|
-| `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, step, next, finish, stepi, list, breakpoint, watchpoint, register, memory, disassemble, catchpoint, help, quit), SIGINT handler, source-level stop display |
+| `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, step, next, finish, stepi, list, backtrace, breakpoint, watchpoint, register, memory, disassemble, catchpoint, help, quit), SIGINT handler, source-level stop display |
 | `debugger/debugger.go` | Package documentation |
 | `debugger/elf.go` | ELF binary wrapper: symbol lookup by name and address, load bias, FunctionContainingAddress, DWARF loading, CFI loading |
 | `debugger/dwarf.go` | DWARF debug info wrapper: function lookup by address/name, line table index (GetEntryByAddress, GetEntriesByLine, AllLineEntries), source location mapping, InlineStackAtAddress, PrologueEndForRange |
@@ -2190,7 +2302,9 @@ method implements the DWARF algorithm directly.
 | `debugger/auxv_linux.go` | Linux `/proc/<pid>/auxv` reader for AT_ENTRY (load bias computation) |
 | `debugger/auxv_unsupported.go` | Non-Linux auxv stub |
 | `debugger/target.go` | Target type: combines Process + ELF for symbolic debugging (LaunchTarget, AttachTarget) |
-| `debugger/stepping.go` | Source-level operations: StepIn, StepOver, StepOut, RunUntilAddress, SetBreakpointAtFunction, SetBreakpointAtLine, PrintSource, PrintSourceAtPC |
+| `debugger/unwind.go` | CFI instruction interpreter: executeCFIInstruction, UnwindFrame, register rule types, unwind context |
+| `debugger/stack.go` | Stack frame type and stack unwinding orchestration: UnwindStack, Backtrace, FormatBacktrace, inline frame handling |
+| `debugger/stepping.go` | Source-level operations: StepIn, StepOver, StepOut (CFI-based), RunUntilAddress, SetBreakpointAtFunction, SetBreakpointAtLine, PrintSource, PrintSourceAtPC, SourceLocationAtPC, InlineDepthAtPC, DWARF (accessor) |
 | `debugger/error.go` | Custom error type and constructors |
 | `debugger/format.go` | `FormatRegisterValue` — display formatting for all register types |
 | `debugger/parse.go` | `ParseRegisterValue` — CLI string → typed value conversion |
@@ -2207,7 +2321,7 @@ method implements the DWARF algorithm directly.
 | `debugger/register_info.go` | Register metadata table (125 entries) and lookup functions |
 | `debugger/registers_linux.go` | Register cache: read/write via ptrace |
 | `debugger/registers_unsupported.go` | Non-Linux register stubs |
-| `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests, breakpoint tests, hardware breakpoint tests, watchpoint tests, memory read/write tests, syscall mapping tests, syscall catchpoint tests, ELF parsing tests, Target tests, DWARF tests, source-level stepping tests, source-level breakpoint tests, inline stack tests, source display tests, CFI tests) |
+| `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests, breakpoint tests, hardware breakpoint tests, watchpoint tests, memory read/write tests, syscall mapping tests, syscall catchpoint tests, ELF parsing tests, Target tests, DWARF tests, source-level stepping tests, source-level breakpoint tests, inline stack tests, source display tests, CFI tests, stack unwinding tests) |
 | `test/targets/end_immediately/main.go` | Test target: exits immediately |
 | `test/targets/run_endlessly/main.go` | Test target: infinite loop |
 | `test/targets/reg_read.s` | Assembly test target: sets known register values and traps (no libc) |

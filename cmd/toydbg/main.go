@@ -166,6 +166,8 @@ func main() {
 			handleDisassemble(proc, fields[1:])
 		case "catchpoint", "catch":
 			handleCatchpoint(proc, fields[1:])
+		case "backtrace", "bt":
+			handleBacktrace(target)
 		case "quit", "q", "exit":
 			return
 		default:
@@ -233,7 +235,7 @@ func handleHelp(args []string) {
 			return
 		}
 	}
-	fmt.Println("commands: continue (c), step (s), next (n), finish (fin), stepi (si), list (l), breakpoint (break), watchpoint (watch), register (reg), memory (mem), disassemble (disas), catchpoint (catch), quit (q), help (h)")
+	fmt.Println("commands: continue (c), step (s), next (n), finish (fin), stepi (si), list (l), backtrace (bt), breakpoint (break), watchpoint (watch), register (reg), memory (mem), disassemble (disas), catchpoint (catch), quit (q), help (h)")
 }
 
 func handleBreakpoint(target *debugger.Target, args []string) {
@@ -923,6 +925,11 @@ func handleDisassemble(proc *debugger.Process, args []string) {
 	}
 
 	printDisassembly(proc, count, addr)
+}
+
+func handleBacktrace(target *debugger.Target) {
+	frames := target.Backtrace(0)
+	fmt.Print(debugger.FormatBacktrace(frames))
 }
 
 func printDisassembly(proc *debugger.Process, count int, addr *uint64) {
