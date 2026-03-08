@@ -70,3 +70,7 @@ func ptraceSetOptions(_ int, _ int) error {
 func ptraceSyscall(_ int) error {
 	return syscall.ENOSYS
 }
+
+func tgkill(_, _ int, _ syscall.Signal) error {
+	return syscall.ENOSYS
+}

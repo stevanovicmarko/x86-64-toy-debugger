@@ -91,7 +91,7 @@ func main() {
 		case "help", "h":
 			handleHelp(fields[1:])
 		case "continue", "c":
-			if err := proc.Resume(); err != nil {
+			if err := proc.ResumeAllThreads(); err != nil {
 				fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
 				continue
 			}
@@ -168,6 +168,8 @@ func main() {
 			handleCatchpoint(proc, fields[1:])
 		case "backtrace", "bt":
 			handleBacktrace(target)
+		case "thread":
+			handleThread(proc, fields[1:])
 		case "quit", "q", "exit":
 			return
 		default:
@@ -235,7 +237,7 @@ func handleHelp(args []string) {
 			return
 		}
 	}
-	fmt.Println("commands: continue (c), step (s), next (n), finish (fin), stepi (si), list (l), backtrace (bt), breakpoint (break), watchpoint (watch), register (reg), memory (mem), disassemble (disas), catchpoint (catch), quit (q), help (h)")
+	fmt.Println("commands: continue (c), step (s), next (n), finish (fin), stepi (si), list (l), backtrace (bt), breakpoint (break), watchpoint (watch), register (reg), memory (mem), disassemble (disas), catchpoint (catch), thread, quit (q), help (h)")
 }
 
 func handleBreakpoint(target *debugger.Target, args []string) {
@@ -729,16 +731,20 @@ func getSigtrapInfo(proc *debugger.Process, reason debugger.StopReason) string {
 
 func printStopReason(target *debugger.Target, reason debugger.StopReason) {
 	proc := target.Process()
+	threadPrefix := ""
+	if len(proc.ThreadStates()) > 1 && reason.TID != 0 {
+		threadPrefix = fmt.Sprintf("thread %d: ", reason.TID)
+	}
 	switch reason.Reason {
 	case debugger.ProcessStopped:
 		sigName := signalName(reason.Info)
 		trapInfo := getSigtrapInfo(proc, reason)
 		pc, err := proc.GetPC()
 		if err != nil {
-			fmt.Printf("process stopped by %s%s\n", sigName, trapInfo)
+			fmt.Printf("%sprocess stopped by %s%s\n", threadPrefix, sigName, trapInfo)
 		} else {
 			funcInfo := formatFunctionInfo(target, pc)
-			fmt.Printf("process stopped by %s at 0x%x%s%s\n", sigName, pc, funcInfo, trapInfo)
+			fmt.Printf("%sprocess stopped by %s at 0x%x%s%s\n", threadPrefix, sigName, pc, funcInfo, trapInfo)
 		}
 	case debugger.ProcessExited:
 		fmt.Printf("process exited with code %d\n", reason.Info)
@@ -940,6 +946,55 @@ func handleDisassemble(proc *debugger.Process, args []string) {
 	}
 
 	printDisassembly(proc, count, addr)
+}
+
+func handleThread(proc *debugger.Process, args []string) {
+	if len(args) == 0 {
+		fmt.Println("usage: thread <list|select> [tid]")
+		return
+	}
+
+	switch args[0] {
+	case "list":
+		threads := proc.ThreadStates()
+		current := proc.CurrentThread()
+		for tid, ts := range threads {
+			marker := " "
+			if tid == current {
+				marker = "*"
+			}
+			stateStr := "stopped"
+			switch ts.State {
+			case debugger.ProcessRunning:
+				stateStr = "running"
+			case debugger.ProcessExited:
+				stateStr = "exited"
+			case debugger.ProcessTerminated:
+				stateStr = "terminated"
+			}
+			fmt.Printf("%s thread %d (%s)\n", marker, tid, stateStr)
+		}
+
+	case "select":
+		if len(args) < 2 {
+			fmt.Println("usage: thread select <tid>")
+			return
+		}
+		tid, err := strconv.Atoi(args[1])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: invalid TID %q: %v\n", args[1], err)
+			return
+		}
+		if _, ok := proc.ThreadStates()[tid]; !ok {
+			fmt.Fprintf(os.Stderr, "toydbg: thread %d not found\n", tid)
+			return
+		}
+		proc.SetCurrentThread(tid)
+		fmt.Printf("switched to thread %d\n", tid)
+
+	default:
+		fmt.Printf("unknown thread subcommand: %q\n", args[0])
+	}
 }
 
 func handleBacktrace(target *debugger.Target) {

@@ -37,6 +37,20 @@ const (
 	// turning SIGTRAP into SIGTRAP|0x80 so we can distinguish syscall stops
 	// from other SIGTRAP causes without inspecting si_code.
 	ptraceOTraceSysGood = 1
+
+	// PTRACE_O_TRACECLONE: when a traced thread calls clone(), the kernel
+	// sends SIGTRAP to the parent thread and SIGSTOP to the new child.
+	// This lets the debugger discover newly created threads.
+	ptraceOTraceClone = 0x8
+
+	// PTRACE_EVENT_CLONE identifies a clone event in the wait status.
+	// When status>>8 == (SIGTRAP | (PTRACE_EVENT_CLONE<<8)), a new thread
+	// was created.
+	ptraceEventClone = 3
+
+	// __WALL flag for waitpid: wait on both processes and threads created
+	// with clone(). Without this, waitpid only sees direct children.
+	wall = 0x40000000
 )
 
 func ptraceCont(pid int) error {
@@ -190,6 +204,19 @@ func ptraceSetOptions(pid int, options int) error {
 	_, _, errno := syscall.RawSyscall6(syscall.SYS_PTRACE,
 		uintptr(ptraceSetOptionsReq), uintptr(pid), 0,
 		uintptr(options), 0, 0)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// tgkill sends a signal to a specific thread within a thread group.
+// Unlike kill(), which delivers to the process, tgkill targets a single
+// thread by TID. This is essential for stopping specific threads in
+// multithreaded debugging (sending SIGSTOP to individual threads).
+func tgkill(tgid, tid int, sig syscall.Signal) error {
+	_, _, errno := syscall.RawSyscall(syscall.SYS_TGKILL,
+		uintptr(tgid), uintptr(tid), uintptr(sig))
 	if errno != 0 {
 		return errno
 	}

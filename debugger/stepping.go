@@ -223,7 +223,7 @@ func (t *Target) StepOut() (StopReason, error) {
 	if !ok {
 		return StopReason{}, newError("rbp register not found")
 	}
-	rbp := proc.regs.Read(rbpInfo).(uint64)
+	rbp := proc.Registers().Read(rbpInfo).(uint64)
 
 	retAddrBytes, err := proc.ReadMemory(rbp+8, 8)
 	if err != nil {

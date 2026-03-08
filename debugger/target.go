@@ -47,6 +47,8 @@ func launchTargetWithOpts(program string, opts LaunchOptions, args []string) (*T
 	}
 
 	t := &Target{process: proc}
+	proc.target = t
+	proc.EnableThreadTracking()
 	t.loadELF(program)
 
 	// Set an internal breakpoint on the real entry point so that
@@ -77,6 +79,8 @@ func AttachTarget(pid int) (*Target, error) {
 	}
 
 	t := &Target{process: proc}
+	proc.target = t
+	proc.EnableThreadTracking()
 
 	// Resolve the executable path from /proc/<pid>/exe.
 	exePath := fmt.Sprintf("/proc/%d/exe", pid)
@@ -195,6 +199,14 @@ func (t *Target) ELFContainingPC() *ELF {
 		return e
 	}
 	return t.mainELF
+}
+
+// notifyThreadLifecycle is called by Process.reportThreadLifecycle when
+// a thread is created or exits. Currently a no-op hook for future use
+// (e.g., replicating debug register state to new threads).
+func (t *Target) notifyThreadLifecycle(reason StopReason) {
+	// Future: replicate hardware breakpoints/watchpoints to new threads,
+	// update per-thread DWARF state, etc.
 }
 
 // Close releases both the process and all ELF files.

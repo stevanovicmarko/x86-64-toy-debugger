@@ -438,3 +438,53 @@ sequenceDiagram
     end
     Note over D: FormatBacktrace: qualify names with ELF filename (e.g. "libcalc.so`func")
     D->>U: print backtrace (frame index, PC, function, source location)
+
+    Note over D,T: ── Phase 19: Multithreading (all-stop mode) ──
+    Note over D: Target calls EnableThreadTracking()
+    D->>K: PTRACE_SETOPTIONS(pid, TRACESYSGOOD | TRACECLONE)
+    K-->>D: success
+    Note over D: Clone events now notify debugger of new threads
+
+    U-->>D: types "continue"
+    Note over D: ResumeAllThreads(): two-pass approach
+    Note over D: Pass 1: stepOverBreakpoint for each stopped thread
+    Note over D: Pass 2: sendContinue for each stopped thread
+    D->>K: PtraceCont(tid1, 0), PtraceCont(tid2, 0), ...
+    Note over T: All threads RESUME execution
+
+    Note over T: Thread N calls clone() → kernel creates new thread
+    Note over T: Parent thread N STOPS (PTRACE_EVENT_CLONE)
+    D->>K: wait4(-1, __WALL) — any thread
+    K-->>D: returns WaitStatus for tid N (clone event)
+    Note over D: handleSignal: TrapClone → resume parent
+    D->>K: PtraceCont(tidN, 0) — resume parent
+    Note over D: New child thread sends initial SIGSTOP
+    D->>K: wait4(-1, __WALL)
+    K-->>D: returns WaitStatus for new tid (SIGSTOP)
+    Note over D: handleSignal: new thread → create ThreadState
+    D->>K: PTRACE_SETOPTIONS(newTid, TRACESYSGOOD | TRACECLONE)
+    Note over D: Resume new thread too
+    D->>K: PtraceCont(newTid, 0)
+
+    Note over T: Thread M hits breakpoint → SIGTRAP
+    Note over T: Thread M STOPS
+    D->>K: wait4(-1, __WALL)
+    K-->>D: returns WaitStatus for tid M
+    Note over D: All-stop: stop all other running threads
+    D->>K: tgkill(pid, tid1, SIGSTOP)
+    D->>K: tgkill(pid, tid2, SIGSTOP)
+    D->>K: wait4(tid1, __WALL), wait4(tid2, __WALL)
+    K-->>D: each thread stops
+    Note over D: If thread stopped by non-SIGSTOP: mark PendingSigstop
+    Note over D: Set currentThread = M
+    D->>U: print "thread M: process stopped by SIGTRAP at 0x..."
+
+    U-->>D: types "thread list"
+    Note over D: Iterate thread map, show TIDs and states
+    D->>U: print "* thread M (stopped)"
+    D->>U: print "  thread N (stopped)"
+
+    U-->>D: types "thread select N"
+    Note over D: SetCurrentThread(N)
+    D->>U: print "switched to thread N"
+    Note over D: register/step commands now operate on thread N

@@ -61,6 +61,7 @@ func TestMain(m *testing.M) {
 		{"anti_debugger", "anti_debugger.c", []string{"-no-pie"}},
 		{"dwarf_target", "dwarf_target.c", []string{"-g", "-no-pie"}},
 		{"stepping_target", "stepping_target.c", []string{"-g", "-no-pie"}},
+		{"multi_threaded", "multi_threaded.c", []string{"-g", "-no-pie", "-lpthread"}},
 	}
 	for _, t := range gccTargets {
 		src := filepath.Join("targets", t.src)
@@ -2779,5 +2780,72 @@ func TestSharedLibraryTracing(t *testing.T) {
 	}
 	if !foundMain {
 		t.Error("expected to find main in calc_client in the backtrace")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Multithreading tests
+// ---------------------------------------------------------------------------
+
+func TestMultithreadedThreadDiscovery(t *testing.T) {
+	var buf strings.Builder
+	target, err := debugger.LaunchTargetWithOptions(
+		targetPath("multi_threaded"),
+		debugger.LaunchOptions{Stdout: &buf, Stderr: &buf},
+	)
+	if err != nil {
+		t.Fatalf("LaunchTarget failed: %v", err)
+	}
+	defer target.Close()
+
+	proc := target.Process()
+
+	// Set a breakpoint on say_hi so we stop when threads call it.
+	sites, err := target.SetBreakpointAtFunction("say_hi", false)
+	if err != nil {
+		t.Fatalf("SetBreakpointAtFunction failed: %v", err)
+	}
+	if len(sites) == 0 {
+		t.Fatal("no breakpoint sites created for say_hi")
+	}
+
+	// Resume all threads and wait for a hit.
+	if err := proc.ResumeAllThreads(); err != nil {
+		t.Fatalf("ResumeAllThreads failed: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal failed: %v", err)
+	}
+
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+	}
+
+	// When stopped at say_hi, there should be multiple threads
+	// (main + at least one worker).
+	threads := proc.ThreadStates()
+	if len(threads) < 2 {
+		t.Errorf("expected at least 2 threads, got %d", len(threads))
+	}
+
+	// The stopping thread's TID should be in the thread map.
+	if reason.TID == 0 {
+		t.Error("expected non-zero TID in stop reason")
+	}
+	if _, ok := threads[reason.TID]; !ok {
+		t.Errorf("stopping thread %d not found in thread map", reason.TID)
+	}
+
+	// Verify we can switch threads and read registers.
+	for tid := range threads {
+		proc.SetCurrentThread(tid)
+		if proc.CurrentThread() != tid {
+			t.Errorf("SetCurrentThread(%d) didn't take effect", tid)
+		}
+		regs := proc.Registers()
+		if regs == nil {
+			t.Errorf("thread %d has nil registers", tid)
+		}
 	}
 }

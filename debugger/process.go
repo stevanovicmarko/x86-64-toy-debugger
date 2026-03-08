@@ -2,11 +2,13 @@ package debugger
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 	"math/bits"
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"syscall"
 )
 
@@ -37,6 +39,7 @@ const (
 	TrapSoftwareBreak                 // Executed int3 (0xCC)
 	TrapHardwareBreak                 // Debug register match (#DB)
 	TrapSyscall                       // Syscall entry or exit
+	TrapClone                         // Thread created via clone()
 	TrapUnknown                       // Unrecognized si_code
 )
 
@@ -53,21 +56,36 @@ type SyscallInformation struct {
 type StopReason struct {
 	Reason      ProcessState
 	Info        uint8
-	TrapReason  *TrapType           // non-nil only for SIGTRAP stops
-	SyscallInfo *SyscallInformation // non-nil only for syscall traps
+	TID         int                     // Thread that caused this stop (0 for single-threaded compat)
+	TrapReason  *TrapType               // non-nil only for SIGTRAP stops
+	SyscallInfo *SyscallInformation     // non-nil only for syscall traps
 }
 
-// newStopReason parses a syscall.WaitStatus into a StopReason.
-func newStopReason(ws syscall.WaitStatus) StopReason {
+// newStopReason parses a syscall.WaitStatus into a StopReason,
+// associating it with the thread that caused the stop.
+func newStopReason(tid int, ws syscall.WaitStatus) StopReason {
+	// Check for ptrace clone event before standard parsing.
+	// When PTRACE_O_TRACECLONE is active, clone events arrive as
+	// status>>8 == (SIGTRAP | (PTRACE_EVENT_CLONE << 8)).
+	if ws.Stopped() && (ws>>8) == syscall.WaitStatus(uint32(syscall.SIGTRAP)|(ptraceEventClone<<8)) {
+		trap := TrapClone
+		return StopReason{
+			Reason:     ProcessStopped,
+			Info:       uint8(syscall.SIGTRAP),
+			TID:        tid,
+			TrapReason: &trap,
+		}
+	}
+
 	switch {
 	case ws.Exited():
-		return StopReason{Reason: ProcessExited, Info: uint8(ws.ExitStatus())}
+		return StopReason{Reason: ProcessExited, Info: uint8(ws.ExitStatus()), TID: tid}
 	case ws.Signaled():
-		return StopReason{Reason: ProcessTerminated, Info: uint8(ws.Signal())}
+		return StopReason{Reason: ProcessTerminated, Info: uint8(ws.Signal()), TID: tid}
 	case ws.Stopped():
-		return StopReason{Reason: ProcessStopped, Info: uint8(ws.StopSignal())}
+		return StopReason{Reason: ProcessStopped, Info: uint8(ws.StopSignal()), TID: tid}
 	default:
-		return StopReason{Reason: ProcessStopped, Info: 0}
+		return StopReason{Reason: ProcessStopped, Info: 0, TID: tid}
 	}
 }
 
@@ -78,12 +96,16 @@ const (
 	trapHWBkpt = 4    // TRAP_HWBKPT — hardware breakpoint/watchpoint
 )
 
-// augmentStopReason enriches a SIGTRAP stop with the specific trap
-// cause by inspecting the signal info and register state.
-func (p *Process) augmentStopReason(reason *StopReason) {
+// augmentStopReasonForThread enriches a SIGTRAP stop with the specific
+// trap cause by inspecting the signal info and register state for a
+// particular thread.
+func (p *Process) augmentStopReasonForThread(tid int, reason *StopReason) {
 	if reason.Reason != ProcessStopped {
 		return
 	}
+
+	thread := p.threads[tid]
+	regs := thread.Regs
 
 	// Check for syscall-stop: PTRACE_O_TRACESYSGOOD sets bit 7 on the
 	// stop signal, so syscall stops arrive as SIGTRAP|0x80 = 133.
@@ -93,12 +115,12 @@ func (p *Process) augmentStopReason(reason *StopReason) {
 		reason.Info = uint8(syscall.SIGTRAP) // normalize for display
 
 		info := &SyscallInformation{}
-		info.Entry = !p.expectingSyscallExit
-		p.expectingSyscallExit = !p.expectingSyscallExit
+		info.Entry = !thread.ExpectingSyscallExit
+		thread.ExpectingSyscallExit = !thread.ExpectingSyscallExit
 
 		// Read syscall number from orig_rax.
 		if origRaxInfo, ok := RegisterInfoByName("orig_rax"); ok {
-			info.ID = uint16(p.regs.Read(origRaxInfo).(uint64))
+			info.ID = uint16(regs.Read(origRaxInfo).(uint64))
 		}
 
 		if info.Entry {
@@ -106,13 +128,13 @@ func (p *Process) augmentStopReason(reason *StopReason) {
 			argRegs := [6]string{"rdi", "rsi", "rdx", "r10", "r8", "r9"}
 			for i, name := range argRegs {
 				if ri, ok := RegisterInfoByName(name); ok {
-					info.Args[i] = p.regs.Read(ri).(uint64)
+					info.Args[i] = regs.Read(ri).(uint64)
 				}
 			}
 		} else {
 			// Read return value from rax.
 			if raxInfo, ok := RegisterInfoByName("rax"); ok {
-				info.Ret = int64(p.regs.Read(raxInfo).(uint64))
+				info.Ret = int64(regs.Read(raxInfo).(uint64))
 			}
 		}
 		reason.SyscallInfo = info
@@ -124,7 +146,7 @@ func (p *Process) augmentStopReason(reason *StopReason) {
 	}
 
 	// Use PTRACE_GETSIGINFO to determine the specific SIGTRAP cause.
-	si, err := ptraceGetSigInfo(p.pid)
+	si, err := ptraceGetSigInfo(tid)
 	if err != nil {
 		trap := TrapUnknown
 		reason.TrapReason = &trap
@@ -179,19 +201,39 @@ func (s SyscallCatchPolicy) contains(id int) bool {
 	return false
 }
 
+// ---------------------------------------------------------------------------
+// Thread State
+// ---------------------------------------------------------------------------
+
+// ThreadState holds the per-thread state for a traced thread.
+// Each thread in a process has its own registers, stop reason,
+// and execution state.
+type ThreadState struct {
+	TID                  int
+	Regs                 *Registers
+	State                ProcessState
+	Reason               StopReason
+	PendingSigstop       bool
+	ExpectingSyscallExit bool
+}
+
 // Process represents a running process being debugged.
 // Users must create one via Launch or Attach; direct construction is not possible
 // because all fields are unexported.
 type Process struct {
-	pid                  int
-	terminateOnEnd       bool
-	isAttached           bool
-	state                ProcessState
-	regs                 *Registers
-	breakpointSites      breakpointSiteCollection
-	watchpoints          watchpointCollection
-	expectingSyscallExit bool
-	syscallCatchPolicy   SyscallCatchPolicy
+	pid                     int
+	terminateOnEnd          bool
+	isAttached              bool
+	state                   ProcessState
+	threads                 map[int]*ThreadState
+	currentThread           int
+	breakpointSites         breakpointSiteCollection
+	watchpoints             watchpointCollection
+	syscallCatchPolicy      SyscallCatchPolicy
+	threadLifecycleCallback func(StopReason)
+	// target is set by Target after construction so that handleSignal
+	// can notify the target of thread lifecycle events.
+	target *Target
 }
 
 // Launch starts a new process under ptrace and returns a Process that
@@ -239,7 +281,7 @@ func launchWithOpts(program string, debug bool, opts LaunchOptions, args []strin
 	}
 	if debug {
 		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Ptrace: true,
+			Ptrace:  true,
 			Setpgid: true,
 		}
 	}
@@ -251,27 +293,43 @@ func launchWithOpts(program string, debug bool, opts LaunchOptions, args []strin
 		return nil, newErrorf("exec failed: %v", err)
 	}
 
+	pid := cmd.Process.Pid
 	proc := &Process{
-		pid:            cmd.Process.Pid,
+		pid:            pid,
 		terminateOnEnd: true,
 		isAttached:     debug,
 		state:          ProcessStopped,
+		threads:        make(map[int]*ThreadState),
+		currentThread:  pid,
 	}
 
 	if debug {
-		if _, err := proc.WaitOnSignal(); err != nil {
+		// Wait for the initial SIGTRAP from exec.
+		var ws syscall.WaitStatus
+		if _, err := syscall.Wait4(pid, &ws, 0, nil); err != nil {
 			runtime.UnlockOSThread()
-			return nil, err
+			return nil, newErrorf("waitpid failed: %v", err)
 		}
-		if err := ptraceSetOptions(proc.pid, ptraceOTraceSysGood); err != nil {
+
+		// Set ptrace options: TRACESYSGOOD for syscall identification.
+		// TRACECLONE is added later by EnableThreadTracking() when
+		// the caller wants thread discovery (via Target).
+		if err := ptraceSetOptions(pid, ptraceOTraceSysGood); err != nil {
 			proc.Close()
 			return nil, newErrorf("set ptrace options: %v", err)
 		}
-		proc.regs = &Registers{pid: proc.pid}
-		if err := proc.regs.readAll(); err != nil {
+
+		// Create the main thread state.
+		mainThread := &ThreadState{
+			TID:   pid,
+			Regs:  &Registers{pid: pid},
+			State: ProcessStopped,
+		}
+		if err := mainThread.Regs.readAll(); err != nil {
 			proc.Close()
 			return nil, err
 		}
+		proc.threads[pid] = mainThread
 	} else {
 		proc.state = ProcessRunning
 	}
@@ -310,11 +368,14 @@ func Attach(pid int) (*Process, error) {
 		terminateOnEnd: false,
 		isAttached:     true,
 		state:          ProcessStopped,
+		threads:        make(map[int]*ThreadState),
+		currentThread:  pid,
 	}
 
-	if _, err := proc.WaitOnSignal(); err != nil {
+	var ws syscall.WaitStatus
+	if _, err := syscall.Wait4(pid, &ws, 0, nil); err != nil {
 		runtime.UnlockOSThread()
-		return nil, err
+		return nil, newErrorf("waitpid failed: %v", err)
 	}
 
 	if err := ptraceSetOptions(pid, ptraceOTraceSysGood); err != nil {
@@ -322,13 +383,61 @@ func Attach(pid int) (*Process, error) {
 		return nil, newErrorf("set ptrace options: %v", err)
 	}
 
-	proc.regs = &Registers{pid: proc.pid}
-	if err := proc.regs.readAll(); err != nil {
+	// Create the main thread state.
+	mainThread := &ThreadState{
+		TID:   pid,
+		Regs:  &Registers{pid: pid},
+		State: ProcessStopped,
+	}
+	if err := mainThread.Regs.readAll(); err != nil {
 		proc.Close()
 		return nil, err
 	}
+	proc.threads[pid] = mainThread
+
+	// Discover any existing threads from /proc/<pid>/task.
+	proc.populateExistingThreads()
 
 	return proc, nil
+}
+
+// populateExistingThreads reads /proc/<pid>/task to discover threads
+// that already exist when attaching to a running process.
+func (p *Process) populateExistingThreads() {
+	taskDir := fmt.Sprintf("/proc/%d/task", p.pid)
+	entries, err := os.ReadDir(taskDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		tid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		if _, exists := p.threads[tid]; exists {
+			continue // already tracked (main thread)
+		}
+		// Seize and interrupt the additional thread.
+		if err := ptraceSeizeProcess(tid); err != nil {
+			continue
+		}
+		if err := ptraceInterruptProcess(tid); err != nil {
+			continue
+		}
+		var ws syscall.WaitStatus
+		if _, err := syscall.Wait4(tid, &ws, 0, nil); err != nil {
+			continue
+		}
+		ptraceSetOptions(tid, ptraceOTraceSysGood)
+
+		thread := &ThreadState{
+			TID:   tid,
+			Regs:  &Registers{pid: tid},
+			State: ProcessStopped,
+		}
+		thread.Regs.readAll()
+		p.threads[tid] = thread
+	}
 }
 
 // Pid returns the OS process ID.
@@ -341,28 +450,118 @@ func (p *Process) State() ProcessState {
 	return p.state
 }
 
-// Registers returns the cached register state. The cache is refreshed
-// automatically by WaitOnSignal each time the process stops.
-func (p *Process) Registers() *Registers {
-	return p.regs
+// CurrentThread returns the TID of the currently active thread.
+func (p *Process) CurrentThread() int {
+	return p.currentThread
 }
 
-// GetPC returns the current program counter (instruction pointer).
+// SetCurrentThread changes which thread is considered "current" for
+// operations like register reads, stepping, etc.
+func (p *Process) SetCurrentThread(tid int) {
+	if _, ok := p.threads[tid]; ok {
+		p.currentThread = tid
+	}
+}
+
+// ThreadStates returns the map of all tracked thread states.
+func (p *Process) ThreadStates() map[int]*ThreadState {
+	return p.threads
+}
+
+// Registers returns the cached register state for the current thread.
+// The cache is refreshed automatically by WaitOnSignal each time the
+// process stops.
+func (p *Process) Registers() *Registers {
+	if ts, ok := p.threads[p.currentThread]; ok {
+		return ts.Regs
+	}
+	return nil
+}
+
+// GetPC returns the current program counter (instruction pointer)
+// for the current thread.
 func (p *Process) GetPC() (uint64, error) {
+	regs := p.Registers()
+	if regs == nil {
+		return 0, newError("registers not available")
+	}
 	info, ok := RegisterInfoByName("rip")
 	if !ok {
 		return 0, newError("rip register not found")
 	}
-	return p.regs.Read(info).(uint64), nil
+	return regs.Read(info).(uint64), nil
 }
 
-// SetPC writes the program counter (instruction pointer).
+// SetPC writes the program counter (instruction pointer) for the
+// current thread.
 func (p *Process) SetPC(addr uint64) error {
+	regs := p.Registers()
+	if regs == nil {
+		return newError("registers not available")
+	}
 	info, ok := RegisterInfoByName("rip")
 	if !ok {
 		return newError("rip register not found")
 	}
-	return p.regs.Write(info, addr)
+	return regs.Write(info, addr)
+}
+
+// getPCForThread returns the PC for a specific thread.
+func (p *Process) getPCForThread(tid int) (uint64, error) {
+	thread, ok := p.threads[tid]
+	if !ok {
+		return 0, newErrorf("thread %d not found", tid)
+	}
+	info, ok := RegisterInfoByName("rip")
+	if !ok {
+		return 0, newError("rip register not found")
+	}
+	return thread.Regs.Read(info).(uint64), nil
+}
+
+// setPCForThread writes the PC for a specific thread.
+func (p *Process) setPCForThread(tid int, addr uint64) error {
+	thread, ok := p.threads[tid]
+	if !ok {
+		return newErrorf("thread %d not found", tid)
+	}
+	info, ok := RegisterInfoByName("rip")
+	if !ok {
+		return newError("rip register not found")
+	}
+	return thread.Regs.Write(info, addr)
+}
+
+// EnableThreadTracking enables PTRACE_O_TRACECLONE on all tracked
+// threads so the kernel notifies us when clone() creates new threads.
+// This is called by Target after construction; bare Process objects
+// don't track thread creation to avoid interfering with simple usage
+// patterns (e.g., Resume without WaitOnSignal).
+func (p *Process) EnableThreadTracking() error {
+	for tid := range p.threads {
+		if err := ptraceSetOptions(tid, ptraceOTraceSysGood|ptraceOTraceClone); err != nil {
+			return newErrorf("enable thread tracking on tid %d: %v", tid, err)
+		}
+	}
+	return nil
+}
+
+// InstallThreadLifecycleCallback sets a callback that is invoked
+// whenever a thread is created or exits. The stop reason describes
+// the event: ProcessStopped = created, ProcessExited/Terminated = ended.
+func (p *Process) InstallThreadLifecycleCallback(callback func(StopReason)) {
+	p.threadLifecycleCallback = callback
+}
+
+// reportThreadLifecycle notifies both the callback and the target
+// about a thread lifecycle event (creation or exit).
+func (p *Process) reportThreadLifecycle(reason StopReason) {
+	if p.threadLifecycleCallback != nil {
+		p.threadLifecycleCallback(reason)
+	}
+	if p.target != nil {
+		p.target.notifyThreadLifecycle(reason)
+	}
 }
 
 // CreateBreakpointSite creates a new (disabled) breakpoint site at the given
@@ -430,10 +629,14 @@ func (p *Process) RemoveBreakpointSite(id int32) error {
 	return nil
 }
 
-// stepOverBreakpoint handles the case where the process is stopped at an
-// enabled breakpoint: disable it, single-step one instruction, re-enable it.
-func (p *Process) stepOverBreakpoint() error {
-	pc, err := p.GetPC()
+// ---------------------------------------------------------------------------
+// Stepping and resuming
+// ---------------------------------------------------------------------------
+
+// stepOverBreakpointForThread handles the case where a thread is stopped at
+// an enabled breakpoint: disable it, single-step one instruction, re-enable.
+func (p *Process) stepOverBreakpointForThread(tid int) error {
+	pc, err := p.getPCForThread(tid)
 	if err != nil {
 		return err
 	}
@@ -444,14 +647,14 @@ func (p *Process) stepOverBreakpoint() error {
 	if err := site.Disable(); err != nil {
 		return err
 	}
-	if err := ptraceSingleStep(p.pid); err != nil {
-		// Re-enable on failure so state stays consistent.
+	p.swallowPendingSigstop(tid)
+	if err := ptraceSingleStep(tid); err != nil {
 		site.Enable()
 		return newErrorf("single step failed: %v", err)
 	}
 	// Wait for the single-step stop.
 	var ws syscall.WaitStatus
-	if _, err := syscall.Wait4(p.pid, &ws, 0, nil); err != nil {
+	if _, err := syscall.Wait4(tid, &ws, wall, nil); err != nil {
 		site.Enable()
 		return newErrorf("wait after single step failed: %v", err)
 	}
@@ -461,11 +664,31 @@ func (p *Process) stepOverBreakpoint() error {
 	return nil
 }
 
-// StepInstruction executes a single machine instruction. If the process
-// is stopped at an enabled breakpoint, the breakpoint is temporarily
-// disabled for the step and then re-enabled.
+// sendContinue issues the appropriate continue ptrace request for a thread.
+func (p *Process) sendContinue(tid int) error {
+	if !p.syscallCatchPolicy.IsNone() {
+		if err := ptraceSyscall(tid); err != nil {
+			return newErrorf("could not resume thread %d (syscall): %v", tid, err)
+		}
+	} else {
+		if err := ptraceCont(tid); err != nil {
+			return newErrorf("could not resume thread %d: %v", tid, err)
+		}
+	}
+	if thread, ok := p.threads[tid]; ok {
+		thread.State = ProcessRunning
+	}
+	p.state = ProcessRunning
+	return nil
+}
+
+// StepInstruction executes a single machine instruction on the current
+// thread. If the thread is stopped at an enabled breakpoint, the
+// breakpoint is temporarily disabled for the step and then re-enabled.
 func (p *Process) StepInstruction() (StopReason, error) {
-	pc, err := p.GetPC()
+	tid := p.currentThread
+
+	pc, err := p.getPCForThread(tid)
 	if err != nil {
 		return StopReason{}, err
 	}
@@ -477,15 +700,19 @@ func (p *Process) StepInstruction() (StopReason, error) {
 		}
 	}
 
-	if err := ptraceSingleStep(p.pid); err != nil {
+	p.swallowPendingSigstop(tid)
+	if err := ptraceSingleStep(tid); err != nil {
 		if bpAtPC != nil {
 			bpAtPC.Enable()
 		}
 		return StopReason{}, newErrorf("single step failed: %v", err)
 	}
+	if thread, ok := p.threads[tid]; ok {
+		thread.State = ProcessRunning
+	}
 	p.state = ProcessRunning
 
-	reason, err := p.WaitOnSignal()
+	reason, err := p.waitOnSignalFor(tid)
 	if err != nil {
 		if bpAtPC != nil {
 			bpAtPC.Enable()
@@ -508,129 +735,309 @@ func (p *Process) StepInstruction() (StopReason, error) {
 // boundaries.
 func (p *Process) SetSyscallCatchPolicy(policy SyscallCatchPolicy) {
 	p.syscallCatchPolicy = policy
-	p.expectingSyscallExit = false
+	// Reset syscall exit tracking for all threads.
+	for _, ts := range p.threads {
+		ts.ExpectingSyscallExit = false
+	}
 }
 
-// Resume continues a stopped process. If stopped at an enabled breakpoint,
-// it first steps over the breakpoint before continuing.
+// Resume continues the current thread. If stopped at an enabled
+// breakpoint, it first steps over the breakpoint before continuing.
 //
 // When a syscall catch policy is active, PTRACE_SYSCALL is used instead
 // of PTRACE_CONT so the tracee stops at each syscall entry/exit.
 func (p *Process) Resume() error {
-	if err := p.stepOverBreakpoint(); err != nil {
+	tid := p.currentThread
+	if err := p.stepOverBreakpointForThread(tid); err != nil {
 		return err
 	}
-	if !p.syscallCatchPolicy.IsNone() {
-		if err := ptraceSyscall(p.pid); err != nil {
-			return newErrorf("could not resume (syscall): %v", err)
-		}
-	} else {
-		if err := ptraceCont(p.pid); err != nil {
-			return newErrorf("could not resume: %v", err)
+	return p.sendContinue(tid)
+}
+
+// ResumeAllThreads resumes all stopped threads. Each thread steps over
+// any breakpoint it's sitting on before all are continued. The two-pass
+// approach prevents a race where one thread runs past a breakpoint while
+// it's disabled for another thread's step-over.
+func (p *Process) ResumeAllThreads() error {
+	// Pass 1: step over breakpoints for all stopped threads.
+	for tid, thread := range p.threads {
+		if thread.State == ProcessStopped {
+			if err := p.stepOverBreakpointForThread(tid); err != nil {
+				return err
+			}
 		}
 	}
-	p.state = ProcessRunning
+	// Pass 2: send continue to all stopped threads.
+	for tid, thread := range p.threads {
+		if thread.State == ProcessStopped {
+			if err := p.sendContinue(tid); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
-// maybeResumeFromSyscall checks whether a syscall stop should be
-// reported to the user based on the current catch policy. If the
-// policy is "some" and the syscall is not in the catch list, it
-// resumes the tracee and waits again, repeating until a relevant
-// stop occurs.
-func (p *Process) maybeResumeFromSyscall(reason StopReason) (StopReason, error) {
-	for reason.SyscallInfo != nil {
-		id := int(reason.SyscallInfo.ID)
-		if p.syscallCatchPolicy.mode == 2 {
-			// Catch all: always report.
-			return reason, nil
-		}
-		if p.syscallCatchPolicy.mode == 1 && p.syscallCatchPolicy.contains(id) {
-			// Catch some: this syscall is in the list.
-			return reason, nil
-		}
-		// Not interested in this syscall — resume and wait again.
-		if err := ptraceSyscall(p.pid); err != nil {
-			return reason, newErrorf("could not resume from syscall: %v", err)
-		}
-		p.state = ProcessRunning
-		var err error
-		reason, err = p.WaitOnSignal()
-		if err != nil {
-			return reason, err
-		}
+// shouldResumeFromSyscall checks whether a syscall stop should be
+// reported to the user. Returns true if the thread should be resumed.
+func (p *Process) shouldResumeFromSyscall(reason StopReason) bool {
+	if reason.SyscallInfo == nil {
+		return false
 	}
-	return reason, nil
+	id := int(reason.SyscallInfo.ID)
+	if p.syscallCatchPolicy.mode == 2 {
+		return false // catch all → report
+	}
+	if p.syscallCatchPolicy.mode == 1 && p.syscallCatchPolicy.contains(id) {
+		return false // this one is in the list → report
+	}
+	return true // not interested → resume
 }
 
-// WaitOnSignal blocks until the process stops or terminates and returns
-// the reason for stopping. When the process is stopped and we are
-// attached, the register cache is refreshed automatically.
-//
-// If the stop is a SIGTRAP and an enabled breakpoint exists at PC-1,
-// the program counter is adjusted back to the breakpoint address. This
-// is necessary because x86-64 increments RIP past the 0xCC byte before
-// delivering the trap.
+// ---------------------------------------------------------------------------
+// Multithreaded signal handling
+// ---------------------------------------------------------------------------
+
+// WaitOnSignal blocks until any thread in the process stops or terminates
+// and returns the reason for stopping. In all-stop mode, when a
+// reportable stop occurs, all other running threads are also stopped
+// before returning control to the caller.
 func (p *Process) WaitOnSignal() (StopReason, error) {
+	return p.waitOnSignalFor(-1)
+}
+
+// waitOnSignalFor blocks until a specific thread (or any thread if
+// toAwait is -1) stops. This is the core of the multithreaded wait
+// logic.
+func (p *Process) waitOnSignalFor(toAwait int) (StopReason, error) {
 	var ws syscall.WaitStatus
-	if _, err := syscall.Wait4(p.pid, &ws, 0, nil); err != nil {
+	options := wall
+	tid, err := syscall.Wait4(toAwait, &ws, options, nil)
+	if err != nil {
 		return StopReason{}, newErrorf("waitpid failed: %v", err)
 	}
 
-	reason := newStopReason(ws)
-	p.state = reason.Reason
+	reason := newStopReason(tid, ws)
 
-	if p.isAttached && p.state == ProcessStopped && p.regs != nil {
-		if err := p.regs.readAll(); err != nil {
-			return reason, err
+	// handleSignal may return nil, meaning the thread should be
+	// resumed and we should wait again.
+	finalReason := p.handleSignal(reason, true)
+	if finalReason == nil {
+		p.sendContinue(tid)
+		return p.waitOnSignalFor(toAwait)
+	}
+
+	reason = *finalReason
+
+	// Update the thread's state.
+	if thread, ok := p.threads[tid]; ok {
+		thread.Reason = reason
+		thread.State = reason.Reason
+	}
+
+	// If the thread exited or was terminated:
+	if reason.Reason == ProcessExited || reason.Reason == ProcessTerminated {
+		p.reportThreadLifecycle(reason)
+		if tid == p.pid {
+			// Main thread exited → process is done.
+			p.state = reason.Reason
+			return reason, nil
+		}
+		// Non-main thread exited → remove it and keep waiting.
+		delete(p.threads, tid)
+		return p.waitOnSignalFor(-1)
+	}
+
+	// We have a signal to report. Stop all other running threads
+	// (all-stop mode).
+	p.stopRunningThreads(tid)
+
+	// Clean up any threads that exited during the stopping process.
+	if mainExitReason := p.cleanupExitedThreads(tid); mainExitReason != nil {
+		reason = *mainExitReason
+	}
+
+	p.state = reason.Reason
+	p.currentThread = tid
+	return reason, nil
+}
+
+// handleSignal processes a stop event and determines whether it should
+// be reported to the user. Returns nil if the thread should be resumed
+// (e.g., clone events, new thread SIGSTOPs, filtered syscalls).
+func (p *Process) handleSignal(reason StopReason, isMainStop bool) *StopReason {
+	tid := reason.TID
+
+	// Clone event from parent thread → don't report, just resume.
+	if reason.TrapReason != nil && *reason.TrapReason == TrapClone && isMainStop {
+		return nil
+	}
+
+	// Check if this is a signal from a thread we don't know about yet.
+	if p.isAttached && reason.Reason == ProcessStopped {
+		if _, exists := p.threads[tid]; !exists {
+			// New thread discovered! Create state for it.
+			thread := &ThreadState{
+				TID:   tid,
+				Regs:  &Registers{pid: tid},
+				State: ProcessStopped,
+			}
+			p.threads[tid] = thread
+
+			// Set ptrace options on the new thread.
+			ptraceSetOptions(tid, ptraceOTraceSysGood|ptraceOTraceClone)
+
+			p.reportThreadLifecycle(reason)
+			if isMainStop {
+				return nil // Don't report thread creation as a stop
+			}
 		}
 
-		// Determine the specific cause of the stop (software BP, hardware
-		// BP, single step, syscall, or unknown).
-		p.augmentStopReason(&reason)
-
-		if reason.TrapReason != nil {
-			switch *reason.TrapReason {
-			case TrapSoftwareBreak:
-				// Software breakpoints: x86-64 increments RIP past the
-				// 0xCC byte before delivering the trap, so we adjust PC
-				// back by 1 if an enabled SW breakpoint exists there.
-				pc, err := p.GetPC()
-				if err == nil {
-					if site := p.breakpointSites.enabledSoftwareAtAddress(pc - 1); site != nil {
-						if err := p.SetPC(pc - 1); err != nil {
-							return reason, err
-						}
-						// If the breakpoint has a hit handler, invoke it.
-						// If the handler returns true, resume and wait again.
-						if site.notifyHit() {
-							if err := p.Resume(); err != nil {
-								return reason, err
-							}
-							return p.WaitOnSignal()
-						}
-					}
-				}
-
-			case TrapHardwareBreak:
-				// Hardware breakpoints/watchpoints: check DR6 to find
-				// which debug register triggered, and if it's a watchpoint,
-				// capture the new data value.
-				if hs, err := p.GetCurrentHardwareStoppoint(); err == nil && hs.IsWatchpoint {
-					if wp, ok := p.watchpoints.getByID(hs.WatchpointID); ok {
-						wp.UpdateData()
-					}
-				}
-
-			case TrapSyscall:
-				// Syscall stops: filter through the catch policy. If the
-				// policy says "skip this syscall", resume and wait again.
-				return p.maybeResumeFromSyscall(reason)
+		// Check for pending SIGSTOP consumption.
+		if thread, ok := p.threads[tid]; ok {
+			if thread.PendingSigstop && reason.Info == uint8(syscall.SIGSTOP) {
+				thread.PendingSigstop = false
+				return nil
 			}
 		}
 	}
 
-	return reason, nil
+	// For stopped threads that we're tracking, read registers and
+	// augment the stop reason.
+	if reason.Reason == ProcessStopped && p.isAttached {
+		if thread, ok := p.threads[tid]; ok && thread.Regs != nil {
+			thread.Regs.readAll()
+			p.augmentStopReasonForThread(tid, &reason)
+
+			if reason.TrapReason != nil {
+				switch *reason.TrapReason {
+				case TrapSoftwareBreak:
+					pc, err := p.getPCForThread(tid)
+					if err == nil {
+						if site := p.breakpointSites.enabledSoftwareAtAddress(pc - 1); site != nil {
+							p.setPCForThread(tid, pc-1)
+							if site.notifyHit() && isMainStop {
+								return nil // hit handler says resume
+							}
+						}
+					}
+
+				case TrapHardwareBreak:
+					regs := thread.Regs
+					dr6Info, _ := RegisterInfoByName("dr6")
+					dr6 := regs.Read(dr6Info).(uint64)
+					triggeredBits := dr6 & 0xF
+					if triggeredBits != 0 {
+						index := bits.TrailingZeros64(triggeredBits)
+						drNames := [4]string{"dr0", "dr1", "dr2", "dr3"}
+						drInfo, _ := RegisterInfoByName(drNames[index])
+						addr := regs.Read(drInfo).(uint64)
+						for _, wp := range p.watchpoints.points {
+							if wp.address == addr && wp.hardwareRegisterIndex == index {
+								wp.UpdateData()
+								break
+							}
+						}
+					}
+
+				case TrapSyscall:
+					if isMainStop && p.shouldResumeFromSyscall(reason) {
+						return nil
+					}
+				}
+			}
+		}
+	}
+
+	return &reason
+}
+
+// stopRunningThreads sends SIGSTOP to all running threads except the
+// one that caused the original stop, waits for each to stop, and
+// records their states.
+func (p *Process) stopRunningThreads(excludeTID int) {
+	for tid, thread := range p.threads {
+		if tid == excludeTID {
+			continue
+		}
+		if thread.State != ProcessRunning {
+			continue
+		}
+
+		// Send SIGSTOP unless one is already pending.
+		if !thread.PendingSigstop {
+			tgkill(p.pid, tid, syscall.SIGSTOP)
+		}
+
+		var ws syscall.WaitStatus
+		waitedTid, err := syscall.Wait4(tid, &ws, wall, nil)
+		if err != nil {
+			continue
+		}
+
+		threadReason := newStopReason(waitedTid, ws)
+
+		if threadReason.Reason == ProcessStopped {
+			if threadReason.Info != uint8(syscall.SIGSTOP) {
+				// We intercepted a real signal, not our SIGSTOP.
+				// There's now a pending SIGSTOP queued for this thread.
+				thread.PendingSigstop = true
+			} else if thread.PendingSigstop {
+				// This was the pending SIGSTOP we expected.
+				thread.PendingSigstop = false
+			}
+		}
+
+		// Process the signal through handleSignal (non-main stop).
+		augmented := p.handleSignal(threadReason, false)
+		if augmented == nil {
+			augmented = &threadReason
+		}
+
+		thread.Reason = *augmented
+		thread.State = augmented.Reason
+	}
+}
+
+// cleanupExitedThreads removes threads that exited during the stopping
+// process. Returns a non-nil StopReason if the main thread exited.
+func (p *Process) cleanupExitedThreads(mainStopTID int) *StopReason {
+	var toRemove []int
+	var mainExitReason *StopReason
+
+	for tid, thread := range p.threads {
+		if tid == mainStopTID {
+			continue
+		}
+		if thread.State == ProcessExited || thread.State == ProcessTerminated {
+			p.reportThreadLifecycle(thread.Reason)
+			toRemove = append(toRemove, tid)
+			if tid == p.pid {
+				reason := thread.Reason
+				mainExitReason = &reason
+			}
+		}
+	}
+
+	for _, tid := range toRemove {
+		delete(p.threads, tid)
+	}
+
+	return mainExitReason
+}
+
+// swallowPendingSigstop consumes a pending SIGSTOP on a thread before
+// single-stepping it. Without this, PTRACE_SINGLESTEP would immediately
+// stop due to the queued SIGSTOP.
+func (p *Process) swallowPendingSigstop(tid int) {
+	thread, ok := p.threads[tid]
+	if !ok || !thread.PendingSigstop {
+		return
+	}
+	ptraceCont(tid)
+	var ws syscall.WaitStatus
+	syscall.Wait4(tid, &ws, wall, nil)
+	thread.PendingSigstop = false
 }
 
 // ReadMemory reads `amount` bytes from the tracee's address space starting
@@ -717,15 +1124,21 @@ func (p *Process) SetHardwareBreakpoint(addr uint64) (int, error) {
 }
 
 // ClearHardwareStoppoint clears the debug register at the given index
-// (0–3) and disables its DR7 enable/condition bits.
+// (0–3) and disables its DR7 enable/condition bits. In multithreaded
+// mode, the change is replicated to all threads.
 func (p *Process) ClearHardwareStoppoint(index int) error {
 	if index < 0 || index > 3 {
 		return newErrorf("invalid debug register index %d", index)
 	}
 
+	regs := p.Registers()
+	if regs == nil {
+		return newError("registers not available")
+	}
+
 	// Read current DR7.
 	dr7Info, _ := RegisterInfoByName("dr7")
-	control := p.regs.Read(dr7Info).(uint64)
+	control := regs.Read(dr7Info).(uint64)
 
 	// Clear the local enable bit for this register (bit 2*index).
 	control &^= 1 << (2 * uint(index))
@@ -733,15 +1146,24 @@ func (p *Process) ClearHardwareStoppoint(index int) error {
 	// Clear the condition (RW) and length (LEN) bits (4 bits at 16+4*index).
 	control &^= 0xF << (16 + 4*uint(index))
 
-	if err := p.regs.Write(dr7Info, control); err != nil {
+	if err := regs.Write(dr7Info, control); err != nil {
 		return newErrorf("clear hardware stoppoint: write DR7 failed: %v", err)
 	}
 
 	// Clear the address register.
 	drName := [4]string{"dr0", "dr1", "dr2", "dr3"}
 	drInfo, _ := RegisterInfoByName(drName[index])
-	if err := p.regs.Write(drInfo, uint64(0)); err != nil {
+	if err := regs.Write(drInfo, uint64(0)); err != nil {
 		return newErrorf("clear hardware stoppoint: write %s failed: %v", drName[index], err)
+	}
+
+	// Replicate to all other threads.
+	for tid, thread := range p.threads {
+		if tid == p.currentThread {
+			continue
+		}
+		thread.Regs.Write(drInfo, uint64(0))
+		thread.Regs.Write(dr7Info, control)
 	}
 
 	return nil
@@ -763,8 +1185,13 @@ type HardwareStoppoint struct {
 // We use TrailingZeros to find the lowest set bit (Go equivalent of
 // __builtin_ctzll from the C++ implementation).
 func (p *Process) GetCurrentHardwareStoppoint() (HardwareStoppoint, error) {
+	regs := p.Registers()
+	if regs == nil {
+		return HardwareStoppoint{}, newError("registers not available")
+	}
+
 	dr6Info, _ := RegisterInfoByName("dr6")
-	dr6 := p.regs.Read(dr6Info).(uint64)
+	dr6 := regs.Read(dr6Info).(uint64)
 
 	// Only the low 4 bits of DR6 indicate which register triggered.
 	triggeredBits := dr6 & 0xF
@@ -775,7 +1202,7 @@ func (p *Process) GetCurrentHardwareStoppoint() (HardwareStoppoint, error) {
 	index := bits.TrailingZeros64(triggeredBits)
 	drNames := [4]string{"dr0", "dr1", "dr2", "dr3"}
 	drInfo, _ := RegisterInfoByName(drNames[index])
-	addr := p.regs.Read(drInfo).(uint64)
+	addr := regs.Read(drInfo).(uint64)
 
 	// Check watchpoints first (they share debug registers with HW breakpoints).
 	for _, wp := range p.watchpoints.points {
@@ -796,11 +1223,17 @@ func (p *Process) GetCurrentHardwareStoppoint() (HardwareStoppoint, error) {
 
 // setHardwareStoppoint is the core implementation for programming a
 // debug register. It finds a free slot, writes the address to DR0–DR3,
-// and configures DR7 with the mode and size.
+// and configures DR7 with the mode and size. In multithreaded mode,
+// the change is replicated to all threads.
 func (p *Process) setHardwareStoppoint(addr uint64, mode StoppointMode, size int) (int, error) {
+	regs := p.Registers()
+	if regs == nil {
+		return -1, newError("registers not available")
+	}
+
 	// Read current DR7 control register.
 	dr7Info, _ := RegisterInfoByName("dr7")
-	control := p.regs.Read(dr7Info).(uint64)
+	control := regs.Read(dr7Info).(uint64)
 
 	// Find a free debug register.
 	index, err := findFreeStoppointRegister(control)
@@ -818,7 +1251,7 @@ func (p *Process) setHardwareStoppoint(addr uint64, mode StoppointMode, size int
 	// Write the address to DR<index>.
 	drNames := [4]string{"dr0", "dr1", "dr2", "dr3"}
 	drInfo, _ := RegisterInfoByName(drNames[index])
-	if err := p.regs.Write(drInfo, addr); err != nil {
+	if err := regs.Write(drInfo, addr); err != nil {
 		return -1, newErrorf("set hardware stoppoint: write %s failed: %v", drNames[index], err)
 	}
 
@@ -826,14 +1259,21 @@ func (p *Process) setHardwareStoppoint(addr uint64, mode StoppointMode, size int
 	control |= 1 << (2 * uint(index))
 
 	// Set condition (RW) and length (LEN) in the upper half of DR7.
-	// Bits 16+4*index..16+4*index+1 = condition (RW)
-	// Bits 18+4*index..18+4*index+1 = length (LEN)
 	shift := 16 + 4*uint(index)
 	control &^= 0xF << shift // clear the 4 bits first
 	control |= (modeEnc | (sizeEnc << 2)) << shift
 
-	if err := p.regs.Write(dr7Info, control); err != nil {
+	if err := regs.Write(dr7Info, control); err != nil {
 		return -1, newErrorf("set hardware stoppoint: write DR7 failed: %v", err)
+	}
+
+	// Replicate to all other threads.
+	for tid, thread := range p.threads {
+		if tid == p.currentThread {
+			continue
+		}
+		thread.Regs.Write(drInfo, addr)
+		thread.Regs.Write(dr7Info, control)
 	}
 
 	return index, nil
@@ -965,23 +1405,36 @@ func (p *Process) Close() {
 	}
 
 	if p.isAttached {
-		if p.state == ProcessRunning {
-			_ = syscall.Kill(p.pid, syscall.SIGSTOP)
-			var ws syscall.WaitStatus
-			syscall.Wait4(p.pid, &ws, 0, nil)
+		// Stop any running threads before detaching.
+		for tid, thread := range p.threads {
+			if thread.State == ProcessRunning {
+				_ = tgkill(p.pid, tid, syscall.SIGSTOP)
+				var ws syscall.WaitStatus
+				syscall.Wait4(tid, &ws, wall, nil)
+			}
 		}
 
-		syscall.PtraceDetach(p.pid)
+		// Detach from all threads.
+		for tid := range p.threads {
+			syscall.PtraceDetach(tid)
+		}
 		_ = syscall.Kill(p.pid, syscall.SIGCONT)
 	}
 
 	if p.terminateOnEnd {
 		_ = syscall.Kill(p.pid, syscall.SIGKILL)
-		var ws syscall.WaitStatus
-		syscall.Wait4(p.pid, &ws, 0, nil)
+		// Reap all threads.
+		for {
+			var ws syscall.WaitStatus
+			pid, err := syscall.Wait4(-1, &ws, wall|syscall.WNOHANG, nil)
+			if err != nil || pid <= 0 {
+				break
+			}
+		}
 	}
 
 	if p.isAttached {
 		runtime.UnlockOSThread()
 	}
 }
+

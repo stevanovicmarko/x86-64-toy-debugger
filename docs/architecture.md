@@ -2386,7 +2386,86 @@ function names with the ELF filename using a backtick separator:
 
 ---
 
-## 30. File Reference
+## 30. Multithreading Support
+
+### Mental Model
+
+A process can contain multiple threads, each with its own registers, stack, and execution state, but sharing memory (code and data). From a debugger's perspective, the key challenge is **tracking all threads** and **coordinating their stops** so the user can inspect a consistent snapshot.
+
+The debugger implements **all-stop mode**: when any thread hits a breakpoint or receives a reportable signal, *all* threads are stopped before control returns to the user. This is the same model used by GDB's default behavior and is simpler to reason about than non-stop mode.
+
+### Thread Discovery
+
+Threads are discovered through two mechanisms:
+
+1. **`PTRACE_O_TRACECLONE`** — When enabled, the kernel notifies us whenever the tracee calls `clone()` to create a new thread. The parent thread stops with a `PTRACE_EVENT_CLONE` event, and the new child thread gets an initial `SIGSTOP`.
+
+2. **`/proc/<pid>/task`** — When attaching to an already-running process, existing threads are enumerated by reading this directory. Each entry is seized and interrupted individually.
+
+Thread tracking is a `Target`-level feature. Bare `Process` objects (used in simple tests) don't enable `PTRACE_O_TRACECLONE` to avoid interfering with programs that `clone()` without the debugger caring about thread lifecycle. `Target` calls `EnableThreadTracking()` after construction.
+
+### Per-Thread State
+
+```go
+type ThreadState struct {
+    TID                  int          // Linux thread ID (= PID for main thread)
+    Regs                 *Registers   // per-thread register cache
+    State                ProcessState // stopped/running/exited
+    Reason               StopReason   // why it last stopped
+    PendingSigstop       bool         // SIGSTOP queued but not yet consumed
+    ExpectingSyscallExit bool         // for syscall entry/exit toggling
+}
+```
+
+The `Process` struct holds a `map[int]*ThreadState` keyed by TID. The `currentThread` field determines which thread register reads, stepping, and other operations target.
+
+### The Two-Pass Resume
+
+`ResumeAllThreads()` uses a two-pass approach to avoid a race condition:
+
+1. **Step over breakpoints** for all stopped threads (disable BP, single-step one instruction, re-enable).
+2. **Send `PTRACE_CONT`** to all stopped threads.
+
+If we did this in one pass (step-then-continue per thread), thread A might run past a breakpoint while it's temporarily disabled for thread B's step-over. The two-pass approach ensures all breakpoints are re-enabled before any thread starts running.
+
+### Pending SIGSTOP
+
+When stopping all running threads (all-stop mode), we send `SIGSTOP` via `tgkill()`. But a thread might stop for a *different* signal before the `SIGSTOP` is delivered. In that case:
+
+- We process the actual signal that caused the stop
+- We mark `PendingSigstop = true` on that thread
+- Before any future single-step on that thread, `swallowPendingSigstop()` does a quick `PTRACE_CONT` + `wait4` to consume the queued `SIGSTOP`
+
+Without this, `PTRACE_SINGLESTEP` would immediately stop due to the pending `SIGSTOP` rather than executing the instruction.
+
+### Hardware Stoppoint Replication
+
+Debug registers (DR0–DR7) are per-thread in the kernel. When a hardware breakpoint or watchpoint is set, the debugger replicates the DR values to all existing threads. New threads automatically inherit the current thread's debug register state.
+
+### REPL Thread Commands
+
+```
+thread list              — show all threads and their states
+thread select <tid>      — switch to a different thread
+```
+
+The `continue` command uses `ResumeAllThreads()` to resume all threads, not just the current one. Stop reasons include the TID when multiple threads exist.
+
+### Wait Logic
+
+`waitOnSignalFor()` calls `wait4(-1, __WALL)` to wait for any thread. The `__WALL` flag is essential for receiving events from threads created via `clone()`. Each stop event goes through `handleSignal()` which:
+
+- Discovers new threads (creates `ThreadState`)
+- Handles clone events transparently (resumes the parent)
+- Augments SIGTRAP with the specific trap cause
+- Filters syscalls based on the catch policy
+- Consumes pending SIGSTOPs
+
+When a reportable stop occurs, `stopRunningThreads()` sends `SIGSTOP` to all other running threads and waits for each to stop, implementing all-stop semantics.
+
+---
+
+## 31. File Reference
 
 | File | Purpose |
 |------|---------|
@@ -2431,6 +2510,7 @@ function names with the ELF filename using a backtick separator:
 | `test/targets/stepping_target.c` | C test target: compiled with `-g` for source-level stepping tests (StepIn, StepOver, StepOut, line/function breakpoints) |
 | `test/targets/libcalc.c` | Shared library source: defines `calc_check_threshold()` for shared library tracing tests |
 | `test/targets/calc_client.c` | Main program source: links against `libcalc.so`, used to test cross-library breakpoints and stack unwinding |
+| `test/targets/multi_threaded.c` | C test target: spawns 10 pthreads calling `say_hi()`, used for multithreading tests |
 | `doc.go` | Module-root package declaration |
 | `docs/sequence-diagram.mmd` | Mermaid sequence diagram of the attach-and-REPL lifecycle |
 | `Dockerfile` | Multi-stage build: compile + slim runtime image |
