@@ -47,16 +47,16 @@ codebase, extending it, or building your own debugger from scratch.
 ```
 cmd/toydbg/          CLI binary — argument parsing + REPL loop
 debugger/            Public library — the sole exported API
-internal/            Private implementation (compiler-enforced boundary)
 test/                Black-box integration tests
   targets/           Minimal programs used as tracees during tests
 docs/                Documentation and diagrams
 ```
 
 **Key constraint:** `debugger` is the only public package. The CLI
-(`cmd/toydbg`) and the test suite (`test/`) both consume it. Neither is
-allowed to import `internal/`. This mirrors how real debugger libraries
-(like LLDB's `lldb` module) separate the engine from the UI.
+(`cmd/toydbg`) and the test suite (`test/`) both consume it. This mirrors
+how real debugger libraries (like LLDB's `lldb` module) separate the
+engine from the UI. Private implementation details within `debugger/` use
+Go's standard unexported (lowercase) naming convention.
 
 ### Why this matters
 
@@ -66,8 +66,6 @@ Keeping a single public API surface means:
   changing the debugger engine.
 - Tests exercise the same interface that real users call, catching
   integration bugs that unit tests on private functions would miss.
-- Go's compiler enforces the `internal/` boundary — code that accidentally
-  imports a private package will not compile.
 
 ---
 

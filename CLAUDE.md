@@ -47,12 +47,11 @@ This is a Go project, inspired by the C++ project *Building a Debugger* by No St
 
 **Package layout:**
 
-- `debugger/` — public library. Exports process primitives: `Launch`, `LaunchWithOptions`, `Attach`, `Resume`, `WaitOnSignal`, `GetPC`, `SetPC`, `CreateBreakpointSite`, `StepInstruction`.
-- `internal/` — private implementation details. Go compiler enforces this boundary.
+- `debugger/` — public library. Exports process primitives (`Launch`, `Attach`, `Resume`, `WaitOnSignal`, etc.) and higher-level `Target` type for symbolic debugging (`LaunchTarget`, `StepIn`, `StepOver`, `StepOut`, `UnwindStack`, etc.). Private implementation details use unexported (lowercase) names within this package.
 - `cmd/toydbg/` — CLI binary with interactive REPL (`(toydbg) ` prompt). Handles argument parsing and command dispatch.
 - `test/` — black-box integration tests that consume `debugger/` as an external package.
 
-**Key constraint:** `debugger` is the sole public API. CLI and tests must go through it; neither should import `internal/`.
+**Key constraint:** `debugger` is the sole public API. CLI and tests must go through it.
 
 **Dependency:** `github.com/chzyer/readline` provides the interactive command line.
 
