@@ -105,7 +105,7 @@ echo "c" | podman run --rm -i --cap-add=SYS_PTRACE --security-opt seccomp=unconf
 # Step 4: Container smoke-test — REPL help
 echo "help" | podman run --rm -i --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
   toydbg /bin/true
-# Expected: "commands: continue (c), step (s), next (n), finish (fin), stepi (si), list (l), backtrace (bt), breakpoint (break), watchpoint (watch), register (reg), memory (mem), disassemble (disas), catchpoint (catch), thread (t), quit (q), help (h)"
+# Expected: "commands: continue (c), step (s), next (n), finish (fin), stepi (si), list (l), backtrace (bt), breakpoint (break), watchpoint (watch), register (reg), memory (mem), disassemble (disas), catchpoint (catch), variable (var), thread (t), quit (q), help (h)"
 ```
 
 > **Why is the container build mandatory?** The Dockerfile runs `go test ./...` inside the image, which compiles the assembly test targets with `gcc` and executes all tests including the ptrace-based register tests. A passing container build proves the full toolchain works: Go compiler, `gcc` for assembly, and ptrace syscalls. Native-only testing does not guarantee the container environment works.

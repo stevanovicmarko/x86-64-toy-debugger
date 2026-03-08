@@ -38,7 +38,8 @@ codebase, extending it, or building your own debugger from scratch.
 27. [Call Frame Information (CFI)](#27-call-frame-information-cfi)
 28. [Stack Unwinding](#28-stack-unwinding)
 29. [Shared Library Support](#29-shared-library-support)
-30. [File Reference](#30-file-reference)
+30. [DWARF Expressions and Variable Reading](#30-dwarf-expressions-and-variable-reading)
+31. [File Reference](#31-file-reference)
 
 ---
 
@@ -2470,21 +2471,116 @@ When a reportable stop occurs, `stopRunningThreads()` sends `SIGSTOP` to all oth
 
 ---
 
+## 30. DWARF Expressions and Variable Reading
+
+DWARF uses a **stack-based bytecode language** to describe where variables live.
+This is necessary because a variable's storage can change during execution — it
+might start in a register, spill to the stack, or be optimized away entirely.
+
+### The taxonomy of DWARF expressions
+
+```
+DWARF expression
+├── Single location description
+│   ├── Simple
+│   │   ├── Address    — variable lives at a computed memory address
+│   │   ├── Register   — variable lives in a register (DW_OP_reg0..31, DW_OP_regx)
+│   │   ├── Implicit   — variable has no storage but a known value
+│   │   └── Empty      — variable location is unknown (optimized out)
+│   └── Composite      — variable is split across multiple locations (DW_OP_piece)
+└── Location list      — location depends on program counter value
+```
+
+### How expressions are encoded
+
+Single location descriptions use `DW_FORM_exprloc`: a ULEB128 length followed
+by bytecode. Location lists use `DW_FORM_sec_offset`: an offset into the
+`.debug_loc` section containing range-to-expression mappings.
+
+### The stack machine (`dwarf_expr.go`)
+
+The evaluator implements ~60 DWARF opcodes operating on a `[]uint64` stack:
+
+| Category | Opcodes | Example |
+|----------|---------|---------|
+| **Literals** | `DW_OP_lit0..31`, `DW_OP_const*` | Push constants |
+| **Registers** | `DW_OP_reg0..31`, `DW_OP_regx`, `DW_OP_breg*`, `DW_OP_bregx` | Read register values |
+| **Memory** | `DW_OP_deref`, `DW_OP_deref_size` | Read from tracee memory |
+| **Arithmetic** | `DW_OP_plus`, `DW_OP_minus`, `DW_OP_mul`, etc. | Stack arithmetic |
+| **Control flow** | `DW_OP_skip`, `DW_OP_bra` | Branches (conditional/unconditional) |
+| **Frame** | `DW_OP_fbreg`, `DW_OP_call_frame_cfa` | Frame base / CFA access |
+| **Composite** | `DW_OP_piece`, `DW_OP_bit_piece` | Multi-location variables |
+| **Implicit** | `DW_OP_stack_value`, `DW_OP_implicit_value` | Values without storage |
+
+The `inFrameInfo` flag changes `DW_OP_reg*` semantics: in `.eh_frame` context,
+register opcodes push the register's value (for CFA computation); in normal
+context, they record a register location.
+
+### Location lists (`dwarf_loc.go`)
+
+A location list maps PC ranges to expressions. The evaluator:
+
+1. Reads the current PC from the register state
+2. Scans entries in `.debug_loc` until finding one whose range contains the PC
+3. Evaluates that entry's expression
+
+Base address selection entries (`first == 0xFFFFFFFFFFFFFFFF`) update the
+base address for subsequent range calculations.
+
+### Global variable index
+
+The `DWARF` type lazily builds a global variable index by walking the DIE tree,
+collecting `DW_TAG_variable` entries with `DW_AT_location` that aren't nested
+inside any `DW_TAG_subprogram`. This enables `FindGlobalVariable("g_int")` to
+quickly locate the DIE for a named global.
+
+### CFI expression rules
+
+The stack unwinder now handles three DWARF expression CFI instructions:
+
+- `DW_CFA_def_cfa_expression` — compute CFA via a DWARF expression
+- `DW_CFA_expression` — register's previous value is at address computed by expression
+- `DW_CFA_val_expression` — register's previous value IS the expression result
+
+For CFI expression rules, the CFA is pushed onto the stack before evaluation.
+
+### Reading variable data
+
+`ReadLocationData()` handles all location kinds:
+
+- **Register**: reads the register and returns its bytes
+- **Address**: reads N bytes from tracee memory
+- **Literal/Data**: returns the inline value
+- **Composite**: assembles data from multiple pieces, supporting bit-level granularity via `memcpyBits()`
+
+### REPL command
+
+The `variable read <name>` command reads a global variable:
+
+```
+(toydbg) var read g_int
+Value: 42
+```
+
+---
+
 ## 31. File Reference
 
 | File | Purpose |
 |------|---------|
-| `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, step, next, finish, stepi, list, backtrace, breakpoint, watchpoint, register, memory, disassemble, catchpoint, help, quit), SIGINT handler, source-level stop display |
+| `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, step, next, finish, stepi, list, backtrace, breakpoint, watchpoint, register, memory, disassemble, catchpoint, variable, help, quit), SIGINT handler, source-level stop display |
 | `debugger/debugger.go` | Package documentation |
 | `debugger/elf.go` | ELF binary wrapper: symbol lookup by name and address, load bias, FunctionContainingAddress, DWARF loading, CFI loading, ContainsAddress, NotifyLoaded |
 | `debugger/elf_collection.go` | ELFCollection type: multi-ELF container with lookup by path, filename, or address |
 | `debugger/dynlib.go` | Dynamic linker integration: rendezvous structure (r_debug), link map walking, vDSO dumping, shared library discovery |
-| `debugger/dwarf.go` | DWARF debug info wrapper: function lookup by address/name, line table index (GetEntryByAddress, GetEntriesByLine, AllLineEntries), source location mapping, InlineStackAtAddress, PrologueEndForRange |
+| `debugger/dwarf.go` | DWARF debug info wrapper: function lookup by address/name, line table index (GetEntryByAddress, GetEntriesByLine, AllLineEntries), source location mapping, InlineStackAtAddress, PrologueEndForRange, ELF file reference for section access |
+| `debugger/dwarf_expr.go` | DWARF expression evaluator: stack machine implementing ~60 DW_OP opcodes, result types (SimpleLocation, Piece, ExprResult), DW_OP_fbreg frame base lookup |
+| `debugger/dwarf_loc.go` | Location attribute evaluation (exprloc and location lists), .debug_loc parsing, global variable index (FindGlobalVariable), ReadLocationData for all location kinds, bit-level memcpyBits |
 | `debugger/cfi.go` | Call Frame Information parser: CIE/FDE parsing, pointer encoding, .eh_frame_hdr binary search, FDEForPC lookup |
 | `debugger/auxv_linux.go` | Linux `/proc/<pid>/auxv` reader for AT_ENTRY (load bias computation) |
 | `debugger/auxv_unsupported.go` | Non-Linux auxv stub |
 | `debugger/target.go` | Target type: combines Process + ELFCollection for symbolic debugging, entry-point breakpoint for dynamic linker init, shared library discovery (LaunchTarget, AttachTarget) |
-| `debugger/unwind.go` | CFI instruction interpreter: executeCFIInstruction, UnwindFrame, register rule types, unwind context |
+| `debugger/unwind.go` | CFI instruction interpreter: executeCFIInstruction (including DW_CFA_expression, DW_CFA_val_expression, DW_CFA_def_cfa_expression), UnwindFrame, register rule types (including expression-based rules), unwind context |
 | `debugger/stack.go` | Stack frame type and stack unwinding orchestration: UnwindStack, Backtrace, FormatBacktrace, inline frame handling |
 | `debugger/stepping.go` | Source-level operations: StepIn, StepOver, StepOut (CFI-based), RunUntilAddress, SetBreakpointAtFunction, SetBreakpointAtLine, PrintSource, PrintSourceAtPC, SourceLocationAtPC, InlineDepthAtPC, DWARF (accessor) |
 | `debugger/error.go` | Custom error type and constructors |
@@ -2503,7 +2599,7 @@ When a reportable stop occurs, `stopRunningThreads()` sends `SIGSTOP` to all oth
 | `debugger/register_info.go` | Register metadata table (125 entries) and lookup functions |
 | `debugger/registers_linux.go` | Register cache: read/write via ptrace |
 | `debugger/registers_unsupported.go` | Non-Linux register stubs |
-| `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests, breakpoint tests, hardware breakpoint tests, watchpoint tests, memory read/write tests, syscall mapping tests, syscall catchpoint tests, ELF parsing tests, Target tests, DWARF tests, source-level stepping tests, source-level breakpoint tests, inline stack tests, source display tests, CFI tests, stack unwinding tests, shared library tracing tests) |
+| `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests, breakpoint tests, hardware breakpoint tests, watchpoint tests, memory read/write tests, syscall mapping tests, syscall catchpoint tests, ELF parsing tests, Target tests, DWARF tests, source-level stepping tests, source-level breakpoint tests, inline stack tests, source display tests, CFI tests, stack unwinding tests, shared library tracing tests, DWARF expression tests, global variable reading tests) |
 | `test/targets/end_immediately/main.go` | Test target: exits immediately |
 | `test/targets/run_endlessly/main.go` | Test target: infinite loop |
 | `test/targets/reg_read.s` | Assembly test target: sets known register values and traps (no libc) |
@@ -2516,6 +2612,7 @@ When a reportable stop occurs, `stopRunningThreads()` sends `SIGSTOP` to all oth
 | `test/targets/libcalc.c` | Shared library source: defines `calc_check_threshold()` for shared library tracing tests |
 | `test/targets/calc_client.c` | Main program source: links against `libcalc.so`, used to test cross-library breakpoints and stack unwinding |
 | `test/targets/multi_threaded.c` | C test target: spawns 10 pthreads calling `say_hi()`, used for multithreading tests |
+| `test/targets/global_variable.c` | C test target: global uint64 variable assigned three values, used for DWARF expression variable reading tests |
 | `doc.go` | Module-root package declaration |
 | `docs/sequence-diagram.mmd` | Mermaid sequence diagram of the attach-and-REPL lifecycle |
 | `Dockerfile` | Multi-stage build: compile + slim runtime image |

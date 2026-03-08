@@ -488,3 +488,24 @@ sequenceDiagram
     Note over D: SetCurrentThread(N)
     D->>U: print "switched to thread N"
     Note over D: register/step commands now operate on thread N
+
+    Note over D,T: ── Phase 20: Variable reading (DWARF expressions) ──
+    U-->>D: types "variable read g_int"
+    Note over D: FindGlobalVariable("g_int") → DIE offset
+    Note over D: Read DW_AT_location attribute from DIE
+    alt DW_FORM_exprloc (single location expression)
+        Note over D: Parse expression bytecode
+        Note over D: Execute stack machine (DW_OP_addr, DW_OP_fbreg, etc.)
+        Note over D: Result: address / register / literal / data
+    else DW_FORM_sec_offset (location list)
+        Note over D: Read .debug_loc section at offset
+        Note over D: Scan entries for PC range containing current RIP
+        Note over D: Evaluate matched entry's expression
+    end
+    alt LocAddress
+        D->>K: process_vm_readv(pid, addr, 8)
+        K-->>D: returns variable bytes
+    else LocRegister
+        Note over D: Read from cached register state
+    end
+    D->>U: print "Value: 42"

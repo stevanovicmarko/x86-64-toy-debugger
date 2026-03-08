@@ -62,6 +62,7 @@ func TestMain(m *testing.M) {
 		{"dwarf_target", "dwarf_target.c", []string{"-g", "-no-pie"}},
 		{"stepping_target", "stepping_target.c", []string{"-g", "-no-pie"}},
 		{"multi_threaded", "multi_threaded.c", []string{"-g", "-no-pie", "-lpthread"}},
+		{"global_variable", "global_variable.c", []string{"-g", "-no-pie"}},
 	}
 	for _, t := range gccTargets {
 		src := filepath.Join("targets", t.src)
@@ -2847,5 +2848,168 @@ func TestMultithreadedThreadDiscovery(t *testing.T) {
 		if regs == nil {
 			t.Errorf("thread %d has nil registers", tid)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DWARF Expression / Global Variable Tests
+// ---------------------------------------------------------------------------
+
+func TestReadGlobalVariable(t *testing.T) {
+	target, err := debugger.LaunchTarget(targetPath("global_variable"))
+	if err != nil {
+		t.Fatalf("LaunchTarget: %v", err)
+	}
+	defer target.Close()
+
+	proc := target.Process()
+
+	// Set a breakpoint on main and resume to it.
+	sites, err := target.SetBreakpointAtFunction("main", false)
+	if err != nil || len(sites) == 0 {
+		t.Fatalf("SetBreakpointAtFunction(main): %v (sites=%d)", err, len(sites))
+	}
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+	}
+
+	// Find the global variable g_int.
+	e := target.ELFContainingPC()
+	if e == nil || e.DWARF() == nil {
+		t.Fatal("no DWARF info")
+	}
+	dw := e.DWARF()
+	dieOffset, found := dw.FindGlobalVariable("g_int")
+	if !found {
+		t.Fatal("FindGlobalVariable(g_int) not found")
+	}
+
+	readGInt := func() uint64 {
+		regs := proc.Registers()
+		result, err := dw.EvalLocationAttr(proc, regs, dieOffset, false)
+		if err != nil {
+			t.Fatalf("EvalLocationAttr: %v", err)
+		}
+		data, err := debugger.ReadLocationData(proc, regs, result, 8)
+		if err != nil {
+			t.Fatalf("ReadLocationData: %v", err)
+		}
+		return binary.LittleEndian.Uint64(data)
+	}
+
+	// At the start of main, g_int should be 0.
+	val := readGInt()
+	if val != 0 {
+		t.Errorf("expected g_int=0 at main entry, got %d", val)
+	}
+
+	// Step over "g_int = 1".
+	reason, err = target.StepOver()
+	if err != nil {
+		t.Fatalf("StepOver: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+	}
+	val = readGInt()
+	if val != 1 {
+		t.Errorf("expected g_int=1 after first step, got %d", val)
+	}
+
+	// Step over "g_int = 42".
+	reason, err = target.StepOver()
+	if err != nil {
+		t.Fatalf("StepOver: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+	}
+	val = readGInt()
+	if val != 42 {
+		t.Errorf("expected g_int=42 after second step, got %d", val)
+	}
+}
+
+func TestDwarfExpressionPieces(t *testing.T) {
+	// Create a DWARF expression manually that consists of three pieces:
+	// Piece 1: DW_OP_reg16, DW_OP_piece 4 — register 16, 4 bytes
+	// Piece 2: DW_OP_piece 8 — empty, 8 bytes (no preceding location)
+	// Piece 3: DW_OP_const4u 0xffffffff, DW_OP_bit_piece 5 12 — address 0xffffffff, 5 bits at offset 12
+	pieceData := []byte{
+		0x60,                   // DW_OP_reg16
+		0x93, 4,                // DW_OP_piece 4
+		0x93, 8,                // DW_OP_piece 8
+		0x0c, 0xff, 0xff, 0xff, 0xff, // DW_OP_const4u 0xffffffff
+		0x9d, 5, 12,            // DW_OP_bit_piece 5 12
+	}
+
+	// We need a minimal target to evaluate the expression, but since the
+	// expression doesn't read memory, we just need a process reference.
+	target, err := debugger.LaunchTarget(targetPath("end_immediately"))
+	if err != nil {
+		t.Fatalf("LaunchTarget: %v", err)
+	}
+	defer target.Close()
+
+	proc := target.Process()
+	regs := proc.Registers()
+
+	expr := debugger.NewDwarfExpression(pieceData, false, 0, nil)
+	result, err := expr.Eval(proc, regs, false, 0)
+	if err != nil {
+		t.Fatalf("Eval: %v", err)
+	}
+
+	if !result.IsComposite {
+		t.Fatal("expected composite result")
+	}
+	if len(result.Pieces) != 3 {
+		t.Fatalf("expected 3 pieces, got %d", len(result.Pieces))
+	}
+
+	// Piece 0: register 16, 4*8 = 32 bits.
+	p0 := result.Pieces[0]
+	if p0.Location.Kind != debugger.LocRegister {
+		t.Errorf("piece 0: expected register location, got %d", p0.Location.Kind)
+	}
+	if p0.Location.RegNum != 16 {
+		t.Errorf("piece 0: expected reg 16, got %d", p0.Location.RegNum)
+	}
+	if p0.BitSize != 32 {
+		t.Errorf("piece 0: expected 32 bits, got %d", p0.BitSize)
+	}
+	if p0.Offset != 0 {
+		t.Errorf("piece 0: expected offset 0, got %d", p0.Offset)
+	}
+
+	// Piece 1: empty, 8*8 = 64 bits.
+	p1 := result.Pieces[1]
+	if p1.Location.Kind != debugger.LocEmpty {
+		t.Errorf("piece 1: expected empty location, got %d", p1.Location.Kind)
+	}
+	if p1.BitSize != 64 {
+		t.Errorf("piece 1: expected 64 bits, got %d", p1.BitSize)
+	}
+
+	// Piece 2: address 0xffffffff, 5 bits at offset 12.
+	p2 := result.Pieces[2]
+	if p2.Location.Kind != debugger.LocAddress {
+		t.Errorf("piece 2: expected address location, got %d", p2.Location.Kind)
+	}
+	if p2.Location.Address != 0xffffffff {
+		t.Errorf("piece 2: expected address 0xffffffff, got 0x%x", p2.Location.Address)
+	}
+	if p2.BitSize != 5 {
+		t.Errorf("piece 2: expected 5 bits, got %d", p2.BitSize)
+	}
+	if p2.Offset != 12 {
+		t.Errorf("piece 2: expected offset 12, got %d", p2.Offset)
 	}
 }

@@ -2,6 +2,7 @@ package debugger
 
 import (
 	"debug/dwarf"
+	"debug/elf"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -76,15 +77,27 @@ type DWARF struct {
 	funcsByName map[string][]*FunctionEntry
 	lines       lineIndex
 	loadBias    uint64
+
+	// elfFile is a reference to the underlying ELF file, needed to
+	// read raw sections like .debug_loc for location lists.
+	elfFile *elf.File
+
+	// Global variable index, built lazily on first query.
+	globalVars      []globalVarEntry
+	globalVarsBuilt bool
+
+	// Cached .debug_loc section data.
+	debugLocData []byte
 }
 
 // newDWARF walks the DWARF DIE tree once, extracting all functions
 // (TagSubprogram) and inlined subroutines (TagInlinedSubroutine),
 // then sorts them by address for fast lookup.
-func newDWARF(data *dwarf.Data) *DWARF {
+func newDWARF(data *dwarf.Data, elfFile *elf.File) *DWARF {
 	d := &DWARF{
 		data:        data,
 		funcsByName: make(map[string][]*FunctionEntry),
+		elfFile:     elfFile,
 	}
 
 	reader := data.Reader()

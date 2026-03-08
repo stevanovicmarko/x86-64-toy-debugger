@@ -92,7 +92,7 @@ func OpenELF(path string) (*ELF, error) {
 	// Load DWARF debug info if present. This is non-fatal — the
 	// debugger works without it, just with less detail.
 	if dwarfData, err := f.DWARF(); err == nil {
-		e.dwarf = newDWARF(dwarfData)
+		e.dwarf = newDWARF(dwarfData, f)
 	}
 
 	// Load call frame information (.eh_frame) if present. This

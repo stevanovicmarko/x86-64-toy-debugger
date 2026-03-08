@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -168,6 +169,8 @@ func main() {
 			handleCatchpoint(proc, fields[1:])
 		case "backtrace", "bt":
 			handleBacktrace(target)
+		case "variable", "var":
+			handleVariable(target, fields[1:])
 		case "thread", "t":
 			handleThread(proc, fields[1:])
 		case "quit", "q", "exit":
@@ -235,9 +238,13 @@ func handleHelp(args []string) {
 			fmt.Println("  catchpoint syscall <list>       - catch specific syscalls (by name or number)")
 			fmt.Println("  example: catchpoint syscall write,read,42")
 			return
+		case "variable", "var":
+			fmt.Println("variable subcommands:")
+			fmt.Println("  variable read <name>            - read a global variable as uint64")
+			return
 		}
 	}
-	fmt.Println("commands: continue (c), step (s), next (n), finish (fin), stepi (si), list (l), backtrace (bt), breakpoint (break), watchpoint (watch), register (reg), memory (mem), disassemble (disas), catchpoint (catch), thread (t), quit (q), help (h)")
+	fmt.Println("commands: continue (c), step (s), next (n), finish (fin), stepi (si), list (l), backtrace (bt), breakpoint (break), watchpoint (watch), register (reg), memory (mem), disassemble (disas), catchpoint (catch), variable (var), thread (t), quit (q), help (h)")
 }
 
 func handleBreakpoint(target *debugger.Target, args []string) {
@@ -994,6 +1001,51 @@ func handleThread(proc *debugger.Process, args []string) {
 
 	default:
 		fmt.Printf("unknown thread subcommand: %q\n", args[0])
+	}
+}
+
+func handleVariable(target *debugger.Target, args []string) {
+	if len(args) < 2 {
+		fmt.Println("usage: variable read <name>")
+		fmt.Println("  type 'help variable' for details")
+		return
+	}
+
+	switch args[0] {
+	case "read":
+		name := args[1]
+		e := target.ELFContainingPC()
+		if e == nil || e.DWARF() == nil {
+			fmt.Fprintln(os.Stderr, "toydbg: no DWARF info available")
+			return
+		}
+		dw := e.DWARF()
+		dieOffset, found := dw.FindGlobalVariable(name)
+		if !found {
+			fmt.Fprintf(os.Stderr, "toydbg: global variable %q not found\n", name)
+			return
+		}
+		proc := target.Process()
+		regs := proc.Registers()
+		if regs == nil {
+			fmt.Fprintln(os.Stderr, "toydbg: registers not available")
+			return
+		}
+		result, err := dw.EvalLocationAttr(proc, regs, dieOffset, false)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: evaluate location: %v\n", err)
+			return
+		}
+		data, err := debugger.ReadLocationData(proc, regs, result, 8)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "toydbg: read variable: %v\n", err)
+			return
+		}
+		val := binary.LittleEndian.Uint64(data)
+		fmt.Printf("Value: %d\n", val)
+
+	default:
+		fmt.Printf("unknown variable subcommand: %q\n", args[0])
 	}
 }
 

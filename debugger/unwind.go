@@ -18,24 +18,29 @@ import (
 type registerRuleKind int
 
 const (
-	ruleUndefined registerRuleKind = iota
+	ruleUndefined     registerRuleKind = iota
 	ruleSameValue
-	ruleOffset    // previous value at CFA + offset
-	ruleValOffset // previous value IS CFA + offset
-	ruleRegister  // previous value stored in another register
+	ruleOffset        // previous value at CFA + offset
+	ruleValOffset     // previous value IS CFA + offset
+	ruleRegister      // previous value stored in another register
+	ruleExpression    // previous value at address computed by DWARF expression
+	ruleValExpression // previous value IS the result of DWARF expression
 )
 
 // registerRule describes how to restore a single register.
 type registerRule struct {
-	kind   registerRuleKind
-	offset int64  // used by ruleOffset and ruleValOffset
-	reg    uint64 // used by ruleRegister (DWARF register number)
+	kind     registerRuleKind
+	offset   int64  // used by ruleOffset and ruleValOffset
+	reg      uint64 // used by ruleRegister (DWARF register number)
+	exprData []byte // used by ruleExpression and ruleValExpression
 }
 
 // cfaRule describes how to compute the Canonical Frame Address.
 type cfaRule struct {
-	reg    uint64 // DWARF register number
-	offset int64
+	reg      uint64 // DWARF register number
+	offset   int64
+	isExpr   bool   // true if CFA is computed by a DWARF expression
+	exprData []byte // expression bytecode (when isExpr is true)
 }
 
 // ---------------------------------------------------------------------------
@@ -53,6 +58,7 @@ type unwindContext struct {
 	registerRules    map[uint64]registerRule
 	cieRegisterRules map[uint64]registerRule
 	ruleStack        []savedRules
+	loadBias         uint64 // needed by DWARF expression evaluation
 }
 
 type savedRules struct {
@@ -235,7 +241,17 @@ func executeCFIInstruction(ctx *unwindContext, cie *CIE) error {
 		ctx.cfa.offset = off * cie.DataAlignmentFactor
 
 	case dwCFADefCFAExpression:
-		return fmt.Errorf("DWARF expressions not yet implemented (DW_CFA_def_cfa_expression)")
+		length, err := ctx.reader.readULEB128()
+		if err != nil {
+			return err
+		}
+		sub, err := ctx.reader.slice(int(length))
+		if err != nil {
+			return err
+		}
+		exprData := make([]byte, len(sub.data))
+		copy(exprData, sub.data)
+		ctx.cfa = cfaRule{isExpr: true, exprData: exprData}
 
 	case dwCFAUndefined:
 		reg, err := ctx.reader.readULEB128()
@@ -309,10 +325,38 @@ func executeCFIInstruction(ctx *unwindContext, cie *CIE) error {
 		ctx.registerRules[reg] = registerRule{kind: ruleRegister, reg: otherReg}
 
 	case dwCFAExpression:
-		return fmt.Errorf("DWARF expressions not yet implemented (DW_CFA_expression)")
+		reg, err := ctx.reader.readULEB128()
+		if err != nil {
+			return err
+		}
+		length, err := ctx.reader.readULEB128()
+		if err != nil {
+			return err
+		}
+		sub, err := ctx.reader.slice(int(length))
+		if err != nil {
+			return err
+		}
+		exprData := make([]byte, len(sub.data))
+		copy(exprData, sub.data)
+		ctx.registerRules[reg] = registerRule{kind: ruleExpression, exprData: exprData}
 
 	case dwCFAValExpression:
-		return fmt.Errorf("DWARF expressions not yet implemented (DW_CFA_val_expression)")
+		reg, err := ctx.reader.readULEB128()
+		if err != nil {
+			return err
+		}
+		length, err := ctx.reader.readULEB128()
+		if err != nil {
+			return err
+		}
+		sub, err := ctx.reader.slice(int(length))
+		if err != nil {
+			return err
+		}
+		exprData := make([]byte, len(sub.data))
+		copy(exprData, sub.data)
+		ctx.registerRules[reg] = registerRule{kind: ruleValExpression, exprData: exprData}
 
 	case dwCFARestoreExtended:
 		reg, err := ctx.reader.readULEB128()
@@ -372,6 +416,7 @@ func (cfi *CallFrameInformation) UnwindFrame(proc *Process, pc uint64, regs *Reg
 
 	// Create the unwind context and execute CIE initial instructions.
 	ctx := newUnwindContext()
+	ctx.loadBias = cfi.loadBias
 	if len(fde.CIE.Instructions) > 0 {
 		ctx.reader = &cfiReader{
 			data:     fde.CIE.Instructions,
@@ -412,12 +457,26 @@ func executeUnwindRules(ctx *unwindContext, oldRegs *Registers, proc *Process) (
 	unwound := cloneRegisters(oldRegs)
 
 	// Compute the CFA from the CFA rule.
-	cfaRegInfo, ok := RegisterInfoByDwarf(int(ctx.cfa.reg))
-	if !ok {
-		return nil, 0, fmt.Errorf("unwind: unknown DWARF register %d for CFA", ctx.cfa.reg)
+	var cfa uint64
+	if ctx.cfa.isExpr {
+		// CFA is computed by a DWARF expression.
+		expr := NewDwarfExpression(ctx.cfa.exprData, true, ctx.loadBias, nil)
+		result, err := expr.Eval(proc, oldRegs, false, 0)
+		if err != nil {
+			return nil, 0, fmt.Errorf("unwind: evaluate CFA expression: %w", err)
+		}
+		if result.Location.Kind != LocAddress {
+			return nil, 0, fmt.Errorf("unwind: CFA expression did not produce an address")
+		}
+		cfa = result.Location.Address
+	} else {
+		cfaRegInfo, ok := RegisterInfoByDwarf(int(ctx.cfa.reg))
+		if !ok {
+			return nil, 0, fmt.Errorf("unwind: unknown DWARF register %d for CFA", ctx.cfa.reg)
+		}
+		cfaRegVal := oldRegs.Read(cfaRegInfo).(uint64)
+		cfa = cfaRegVal + uint64(ctx.cfa.offset)
 	}
-	cfaRegVal := oldRegs.Read(cfaRegInfo).(uint64)
-	cfa := cfaRegVal + uint64(ctx.cfa.offset)
 
 	// The CFA is the caller's stack pointer value.
 	rspInfo, _ := RegisterInfoByName("rsp")
@@ -462,6 +521,37 @@ func executeUnwindRules(ctx *unwindContext, oldRegs *Registers, proc *Process) (
 			// Previous value IS CFA + offset (not stored in memory).
 			val := uint64(int64(cfa) + rule.offset)
 			writeRegisterValue(unwound, regInfo, val)
+
+		case ruleExpression:
+			// Previous value is at the address computed by a DWARF expression.
+			// The CFA is pushed to the stack before evaluation.
+			expr := NewDwarfExpression(rule.exprData, true, ctx.loadBias, nil)
+			result, err := expr.Eval(proc, oldRegs, true, cfa)
+			if err != nil {
+				return nil, 0, fmt.Errorf("unwind: evaluate expression for register %d: %w", dwarfReg, err)
+			}
+			if result.Location.Kind != LocAddress {
+				continue
+			}
+			data, err := proc.ReadMemory(result.Location.Address, 8)
+			if err != nil {
+				return nil, 0, fmt.Errorf("unwind: read memory at 0x%x for expression rule: %w", result.Location.Address, err)
+			}
+			val := binary.LittleEndian.Uint64(data)
+			writeRegisterValue(unwound, regInfo, val)
+
+		case ruleValExpression:
+			// Previous value IS the result of the DWARF expression.
+			// The CFA is pushed to the stack before evaluation.
+			expr := NewDwarfExpression(rule.exprData, true, ctx.loadBias, nil)
+			result, err := expr.Eval(proc, oldRegs, true, cfa)
+			if err != nil {
+				return nil, 0, fmt.Errorf("unwind: evaluate val_expression for register %d: %w", dwarfReg, err)
+			}
+			if result.Location.Kind != LocAddress {
+				continue
+			}
+			writeRegisterValue(unwound, regInfo, result.Location.Address)
 		}
 	}
 
