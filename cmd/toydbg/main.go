@@ -168,7 +168,7 @@ func main() {
 			handleCatchpoint(proc, fields[1:])
 		case "backtrace", "bt":
 			handleBacktrace(target)
-		case "thread":
+		case "thread", "t":
 			handleThread(proc, fields[1:])
 		case "quit", "q", "exit":
 			return
@@ -237,7 +237,7 @@ func handleHelp(args []string) {
 			return
 		}
 	}
-	fmt.Println("commands: continue (c), step (s), next (n), finish (fin), stepi (si), list (l), backtrace (bt), breakpoint (break), watchpoint (watch), register (reg), memory (mem), disassemble (disas), catchpoint (catch), thread, quit (q), help (h)")
+	fmt.Println("commands: continue (c), step (s), next (n), finish (fin), stepi (si), list (l), backtrace (bt), breakpoint (break), watchpoint (watch), register (reg), memory (mem), disassemble (disas), catchpoint (catch), thread (t), quit (q), help (h)")
 }
 
 func handleBreakpoint(target *debugger.Target, args []string) {

@@ -18,7 +18,7 @@ sequenceDiagram
     K-->>D: returns FP register values
     D->>K: PTRACE_PEEKUSER × 8 — read debug regs
     K-->>D: returns debug register values
-    Note over D: Registers cached in Process.regs
+    Note over D: Registers cached in ThreadState.Regs (per-thread)
     Note over T: Tracee remains STOPPED
 
     Note over D,T: ── Phase 1b: Attach (PTRACE_SEIZE) ──
@@ -35,7 +35,7 @@ sequenceDiagram
     K-->>D: returns FP register values
     D->>K: PTRACE_PEEKUSER × 8 — read debug regs
     K-->>D: returns debug register values
-    Note over D: Registers cached in Process.regs
+    Note over D: Registers cached in ThreadState.Regs (per-thread)
     Note over T: Tracee remains STOPPED
 
     Note over D,T: ── Phase 1c: ELF loading (Target) ──
@@ -104,7 +104,7 @@ sequenceDiagram
     Note over D: Debugger UNBLOCKED
     D->>K: PtraceGetRegs / GETFPREGS / PeekUser
     K-->>D: register values
-    Note over D: Registers cached in Process.regs
+    Note over D: Registers cached in ThreadState.Regs (per-thread)
 
     Note over D: Find ELF for PC: ELFContainingAddress(PC) or fallback to mainELF
     Note over D: If shared library ELF: prefix = "libname.so`"

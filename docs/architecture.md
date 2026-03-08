@@ -263,15 +263,18 @@ When the process stops, `WaitOnSignal()` returns a `StopReason`:
 
 ```go
 type StopReason struct {
-    Reason      ProcessState       // Why it stopped
-    Info        uint8              // Exit code or signal number
-    TrapReason  *TrapType          // non-nil only for SIGTRAP stops
-    SyscallInfo *SyscallInformation // non-nil only for syscall traps
+    Reason      ProcessState           // Why it stopped
+    Info        uint8                  // Exit code or signal number
+    TID         int                    // Thread that caused this stop (0 for single-threaded compat)
+    TrapReason  *TrapType              // non-nil only for SIGTRAP stops
+    SyscallInfo *SyscallInformation    // non-nil only for syscall traps
 }
 ```
 
 This is parsed from the kernel's `WaitStatus` using `newStopReason()`, which
 checks `ws.Exited()`, `ws.Signaled()`, and `ws.Stopped()` in that order.
+The `TID` field records which thread caused the stop — essential for
+multithreaded debugging (see [Section 30](#30-multithreading-support)).
 
 ---
 
@@ -357,6 +360,8 @@ shell over the `debugger` API, not an independent system.
 | `help memory` | `help mem` | Print memory subcommand help |
 | `help disassemble` | `help disas` | Print disassemble options help |
 | `help catchpoint` | `help catch` | Print catchpoint subcommand help |
+| `thread list` | `t list` | List all threads with their states (`*` marks current) |
+| `thread select <tid>` | `t select <tid>` | Switch the current thread for register/step operations |
 | `quit` | `q`, `exit` | Exit the debugger |
 
 ### Input handling
