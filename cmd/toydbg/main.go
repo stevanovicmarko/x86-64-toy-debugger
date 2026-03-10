@@ -170,6 +170,8 @@ func main() {
 			handleBacktrace(target)
 		case "variable", "var":
 			handleVariable(target, fields[1:])
+		case "expression", "expr":
+			handleExpression(target, line)
 		case "thread", "t":
 			handleThread(proc, fields[1:])
 		case "quit", "q", "exit":
@@ -243,9 +245,19 @@ func handleHelp(args []string) {
 			fmt.Println("  variable locals                 - print all local variables in scope")
 			fmt.Println("  variable location <name>        - print where a variable lives (register/address)")
 			return
+		case "expression", "expr":
+			fmt.Println("expression evaluates a function call in the running process.")
+			fmt.Println("  expression <func>(<args...>)    - call a function and display the return value")
+			fmt.Println("  examples:")
+			fmt.Println("    expr get_value(42)")
+			fmt.Println("    expr format_name(\"test\")")
+			fmt.Println("    expr compute(3.14)")
+			fmt.Println("    expr process(my_var)")
+			fmt.Println("    expr transform($0)            - pass a previous expression result")
+			return
 		}
 	}
-	fmt.Println("commands: continue (c), step (s), next (n), finish (fin), stepi (si), list (l), backtrace (bt), breakpoint (break), watchpoint (watch), register (reg), memory (mem), disassemble (disas), catchpoint (catch), variable (var), thread (t), quit (q), help (h)")
+	fmt.Println("commands: continue (c), step (s), next (n), finish (fin), stepi (si), list (l), backtrace (bt), breakpoint (break), watchpoint (watch), register (reg), memory (mem), disassemble (disas), catchpoint (catch), variable (var), expression (expr), thread (t), quit (q), help (h)")
 }
 
 func handleBreakpoint(target *debugger.Target, args []string) {
@@ -1095,6 +1107,32 @@ func handleVariableLocation(target *debugger.Target, name string) {
 			fmt.Printf("Piece %d: offset=%d, bit_size=%d, location=", i, piece.Offset, piece.BitSize)
 			printSimpleLoc(piece.Location)
 		}
+	}
+}
+
+func handleExpression(target *debugger.Target, line string) {
+	// Extract the expression after the command name.
+	spaceIdx := strings.Index(line, " ")
+	if spaceIdx < 0 {
+		fmt.Println("usage: expression <function-call>")
+		fmt.Println("  example: expr print_value(42)")
+		return
+	}
+	expr := strings.TrimSpace(line[spaceIdx+1:])
+	if expr == "" {
+		fmt.Println("usage: expression <function-call>")
+		return
+	}
+
+	result, err := target.EvaluateExpression(expr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
+		return
+	}
+
+	if result != nil && result.Value != nil {
+		str := result.Value.Visualize(target.Process(), 0)
+		fmt.Printf("$%d: %s\n", result.ID, str)
 	}
 }
 

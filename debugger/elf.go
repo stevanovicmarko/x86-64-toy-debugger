@@ -67,20 +67,34 @@ func OpenELF(path string) (*ELF, error) {
 	// Read the symbol table (.symtab). This may not exist in
 	// stripped binaries, which is fine — we just won't have symbols.
 	symbols, err := f.Symbols()
-	if err != nil {
-		// No symbol table is not fatal — just means no symbol lookup.
-		return e, nil
+	if err == nil {
+		for i := range symbols {
+			sym := &symbols[i]
+			e.symbolsByName[sym.Name] = append(e.symbolsByName[sym.Name], sym)
+
+			if sym.Size > 0 {
+				e.symbolsByAddr = append(e.symbolsByAddr, addrSymbol{
+					addr: sym.Value,
+					sym:  sym,
+				})
+			}
+		}
 	}
 
-	for i := range symbols {
-		sym := &symbols[i]
-		e.symbolsByName[sym.Name] = append(e.symbolsByName[sym.Name], sym)
+	// Read the dynamic symbol table (.dynsym). Shared libraries
+	// like libc expose symbols (e.g. malloc) only through .dynsym.
+	dynSymbols, err := f.DynamicSymbols()
+	if err == nil {
+		for i := range dynSymbols {
+			sym := &dynSymbols[i]
+			e.symbolsByName[sym.Name] = append(e.symbolsByName[sym.Name], sym)
 
-		if sym.Size > 0 {
-			e.symbolsByAddr = append(e.symbolsByAddr, addrSymbol{
-				addr: sym.Value,
-				sym:  sym,
-			})
+			if sym.Size > 0 {
+				e.symbolsByAddr = append(e.symbolsByAddr, addrSymbol{
+					addr: sym.Value,
+					sym:  sym,
+				})
+			}
 		}
 	}
 

@@ -28,6 +28,10 @@ type Target struct {
 	// r_debug structure. Zero until resolved via the entry-point
 	// breakpoint callback.
 	rendezvousAddr uint64
+
+	// exprResults stores return values from EvaluateExpression calls.
+	// Users can reference them as $0, $1, etc. in subsequent expressions.
+	exprResults []*TypedData
 }
 
 // LaunchTarget starts a new process under ptrace, opens its ELF binary,
@@ -351,7 +355,17 @@ func (t *Target) ResolveIndirectName(name string) (*TypedData, error) {
 }
 
 // getInitialVariableData locates a variable by name and reads its data.
+// It also supports $N syntax for referencing previous expression results.
 func (t *Target) getInitialVariableData(name string) (*TypedData, error) {
+	// Handle $N expression result references.
+	if len(name) > 1 && name[0] == '$' {
+		index, err := strconv.Atoi(name[1:])
+		if err != nil {
+			return nil, fmt.Errorf("invalid expression result index %q", name)
+		}
+		return t.GetExpressionResult(index)
+	}
+
 	off, dw, found := t.FindVariable(name)
 	if !found {
 		return nil, fmt.Errorf("variable %q not found", name)

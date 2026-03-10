@@ -41,7 +41,8 @@ codebase, extending it, or building your own debugger from scratch.
 30. [Multithreading Support](#30-multithreading-support)
 31. [DWARF Expressions and Variable Reading](#31-dwarf-expressions-and-variable-reading)
 32. [Types and Variables](#32-types-and-variables)
-33. [File Reference](#33-file-reference)
+33. [Expression Evaluation](#33-expression-evaluation)
+34. [File Reference](#34-file-reference)
 
 ---
 
@@ -356,6 +357,10 @@ shell over the `debugger` API, not an independent system.
 | `catchpoint syscall` | `catch syscall` | Catch all syscalls (entry and exit) |
 | `catchpoint syscall none` | `catch syscall none` | Stop catching syscalls |
 | `catchpoint syscall <list>` | `catch syscall <list>` | Catch specific syscalls by name or number (comma-separated) |
+| `variable read <name>` | `var read <name>` | Read a variable (supports `name.field`, `ptr->field`, `arr[i]`) |
+| `variable locals` | `var locals` | Print all local variables in the current scope |
+| `variable location <name>` | `var location <name>` | Print where a variable lives (register or memory address) |
+| `expression <func>(<args>)` | `expr <func>(<args>)` | Call a function in the inferior and display the return value |
 | `help` | `h`, empty line | Print the list of available commands |
 | `help register` | `help reg` | Print register subcommand help |
 | `help breakpoint` | `help break` | Print breakpoint subcommand help |
@@ -363,6 +368,8 @@ shell over the `debugger` API, not an independent system.
 | `help memory` | `help mem` | Print memory subcommand help |
 | `help disassemble` | `help disas` | Print disassemble options help |
 | `help catchpoint` | `help catch` | Print catchpoint subcommand help |
+| `help variable` | `help var` | Print variable subcommand help |
+| `help expression` | `help expr` | Print expression usage and examples |
 | `thread list` | `t list` | List all threads with their states (`*` marks current) |
 | `thread select <tid>` | `t select <tid>` | Switch the current thread for register/step operations |
 | `quit` | `q`, `exit` | Exit the debugger |
@@ -1612,6 +1619,10 @@ The `stepping_target` uses C compiled with `-g` to test source-level stepping.
 | `anti_debugger` | `test/targets/anti_debugger.c` | Yes | `-no-pie` | `main` |
 | `dwarf_target` | `test/targets/dwarf_target.c` | Yes | `-g -no-pie` | `main` |
 | `stepping_target` | `test/targets/stepping_target.c` | Yes | `-g -no-pie` | `main` |
+| `multi_threaded` | `test/targets/multi_threaded.c` | Yes | `-g -no-pie -lpthread` | `main` |
+| `global_variable` | `test/targets/global_variable.c` | Yes | `-g -no-pie` | `main` |
+| `blocks` | `test/targets/blocks.c` | Yes | `-g -no-pie -O0` | `main` |
+| `expr_target` | `test/targets/expr_target.c` | Yes | `-g -no-pie -O0` | `main` |
 
 The register targets (`reg_read`, `reg_write`) use the **trap-resume-read
 pattern**: the assembly program executes `int3` (software breakpoint) at
@@ -1672,9 +1683,12 @@ process IDs, register values, and memory addresses, but had no idea what
 the user must mentally map that address to a function name. Real debuggers
 display `main` or `an_innocent_function` next to the address.
 
-ELF (Executable and Linkable Format) binaries contain a **symbol table**
-(`.symtab` section) that maps names to address ranges. By parsing this
-table, the debugger can answer "which function contains address X?"
+ELF (Executable and Linkable Format) binaries contain **symbol tables**
+that map names to address ranges. There are two: `.symtab` (static, may be
+stripped) and `.dynsym` (dynamic, always present in shared libraries). The
+debugger loads both tables so it can resolve symbols in the main executable
+*and* in dynamically loaded libraries like libc (e.g. `malloc`). By merging
+these tables, the debugger can answer "which function contains address X?"
 
 ### Go's `debug/elf` package
 
@@ -1774,10 +1788,10 @@ writes DWARF data into ELF sections (`.debug_info`, `.debug_line`,
 `.debug_abbrev`, `.debug_ranges`). This data maps machine addresses back to
 source constructs: function names, source files, line numbers.
 
-### Why DWARF when we already have `.symtab`?
+### Why DWARF when we already have `.symtab`/`.dynsym`?
 
-The ELF symbol table (`.symtab`) gives us function names and sizes — enough
-for "which function is this address in?" But it cannot answer:
+The ELF symbol tables (`.symtab` + `.dynsym`) give us function names and
+sizes — enough for "which function is this address in?" But they cannot answer:
 
 - **What source file and line produced this instruction?**
 - **Where does an inlined function live in the caller?**
@@ -2680,11 +2694,90 @@ Supported operators: `.` (member access), `->` (pointer dereference + member),
 
 ---
 
-## 33. File Reference
+## 33. Expression Evaluation
+
+Expression evaluation lets the user call functions inside the running process and
+inspect the results. This is the most complex debugger feature because it bridges
+multiple subsystems: DWARF lookup, ABI conventions, memory allocation, and process
+control.
+
+### Mental Model
+
+When the user types `expr decode_signal(7)`, the debugger:
+
+1. **Parses** the expression into a function name (`decode_signal`) and arguments (`7`)
+2. **Locates** the function via DWARF info or the ELF symbol table
+3. **Classifies** each argument per the **SysV x86-64 ABI** — integers go in
+   `rdi, rsi, rdx, rcx, r8, r9`; floats go in `xmm0–xmm7`; large structs go
+   on the stack
+4. **Saves** all registers (so the call is invisible to the program)
+5. **Sets RIP** to the function's entry point
+6. **Pushes** a return address onto the stack — we reuse the program's `AT_ENTRY`
+   address, since the entry-point breakpoint has already fired
+7. **Resumes** the process; the function runs until it returns to the entry-point
+   breakpoint
+8. **Reads** the return value from `rax`/`rdx` (integer), `xmm0`/`xmm1` (float/SSE),
+   or memory (large struct)
+9. **Restores** the original registers
+
+### Argument Types
+
+The evaluator supports these literal argument types:
+
+| Syntax | Type | ABI Class |
+|--------|------|-----------|
+| `42`, `-1` | Integer (int64) | INTEGER |
+| `3.14` | Float (double) | SSE |
+| `"hello"` | String (const char*) | INTEGER (pointer) |
+| `'a'` | Character | INTEGER |
+| `true`, `false` | Boolean | INTEGER |
+| `my_var` | Variable name | depends on DWARF type |
+| `$0` | Previous result | depends on stored type |
+
+String arguments require allocating memory in the inferior (via `inferior_malloc`,
+which calls `malloc()` inside the tracee). The string is written there and a pointer
+is passed.
+
+### Return Value Storage
+
+Return values are dynamically allocated in the inferior via `inferior_malloc` so they
+persist beyond the current stack frame. Users can reference previous results using
+`$N` syntax (e.g., `$0`, `$1`). Re-reading a `$N` variable re-fetches from memory,
+catching any mutations from subsequent calls.
+
+### Key Types and Functions
+
+```
+debugger/expr.go:
+  EvaluateExpression(expr string) → *ExpressionResult
+  GetExpressionResult(index int) → *TypedData
+  inferiorMalloc(size int) → uint64
+  findCallableFunction(name string) → (addr, *dwarf.Entry)
+  classifyType(typ, builtin) → [2]parameterClass
+  setupArguments(args, funcDIE, regs, returnSlot, returnType)
+  readReturnValue(funcDIE, returnType, returnSlot, regs) → *TypedData
+```
+
+### SysV x86-64 ABI Classification
+
+The classification algorithm determines how each argument is passed:
+
+- **INTEGER**: integer types, pointers, booleans → GPRs (rdi, rsi, rdx, rcx, r8, r9)
+- **SSE**: float/double → XMM registers (xmm0–xmm7)
+- **MEMORY**: structs > 16 bytes → stack
+- **X87**: long double → stack (returned via st0)
+
+For structs ≤ 16 bytes, each 8-byte chunk ("eightbyte") is classified independently
+and the results are merged. If any eightbyte is MEMORY, the whole struct goes on the
+stack.
+
+---
+
+## 34. File Reference
 
 | File | Purpose |
 |------|---------|
-| `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, step, next, finish, stepi, list, backtrace, breakpoint, watchpoint, register, memory, disassemble, catchpoint, variable, help, quit), SIGINT handler, source-level stop display |
+| `cmd/toydbg/main.go` | CLI entry point: argument parsing, REPL loop, command dispatch (continue, step, next, finish, stepi, list, backtrace, breakpoint, watchpoint, register, memory, disassemble, catchpoint, variable, expression, help, quit), SIGINT handler, source-level stop display |
 | `debugger/debugger.go` | Package documentation |
 | `debugger/elf.go` | ELF binary wrapper: symbol lookup by name and address, load bias, FunctionContainingAddress, DWARF loading, CFI loading, ContainsAddress, NotifyLoaded |
 | `debugger/elf_collection.go` | ELFCollection type: multi-ELF container with lookup by path, filename, or address |
@@ -2696,7 +2789,8 @@ Supported operators: `.` (member access), `->` (pointer dereference + member),
 | `debugger/auxv_linux.go` | Linux `/proc/<pid>/auxv` reader for AT_ENTRY (load bias computation) |
 | `debugger/auxv_unsupported.go` | Non-Linux auxv stub |
 | `debugger/type.go` | Typed variable support: TypedData struct, Visualize (base types, pointers, arrays, structs, enums), DerefPointer, ReadMember, Index, bitfield fixup, qualifier stripping, char type detection |
-| `debugger/target.go` | Target type: combines Process + ELFCollection for symbolic debugging, entry-point breakpoint for dynamic linker init, shared library discovery (LaunchTarget, AttachTarget), FindVariable, ResolveIndirectName, VariableLocation, LocalVariables |
+| `debugger/expr.go` | Expression evaluation engine: EvaluateExpression, inferior function calls, SysV ABI argument classification (INTEGER/SSE/MEMORY), argument setup, return value reading, inferior_malloc, expression result storage ($N references) |
+| `debugger/target.go` | Target type: combines Process + ELFCollection for symbolic debugging, entry-point breakpoint for dynamic linker init, shared library discovery (LaunchTarget, AttachTarget), FindVariable, ResolveIndirectName, VariableLocation, LocalVariables, expression result storage |
 | `debugger/unwind.go` | CFI instruction interpreter: executeCFIInstruction (including DW_CFA_expression, DW_CFA_val_expression, DW_CFA_def_cfa_expression), UnwindFrame, register rule types (including expression-based rules), unwind context |
 | `debugger/stack.go` | Stack frame type and stack unwinding orchestration: UnwindStack, Backtrace, FormatBacktrace, inline frame handling |
 | `debugger/stepping.go` | Source-level operations: StepIn, StepOver, StepOut (CFI-based), RunUntilAddress, SetBreakpointAtFunction, SetBreakpointAtLine, PrintSource, PrintSourceAtPC, SourceLocationAtPC, InlineDepthAtPC, DWARF (accessor) |
@@ -2731,6 +2825,7 @@ Supported operators: `.` (member access), `->` (pointer dereference + member),
 | `test/targets/multi_threaded.c` | C test target: spawns 10 pthreads calling `say_hi()`, used for multithreading tests |
 | `test/targets/global_variable.c` | C test target: global variables with structs, bitfields, pointers, and arrays for typed variable reading tests |
 | `test/targets/blocks.c` | C test target: nested lexical scopes redefining `i`, used for local variable scoping tests |
+| `test/targets/expr_target.c` | C test target: various function signatures (int, double, string, char, struct, void, 6-arg) for expression evaluation tests |
 | `doc.go` | Module-root package declaration |
 | `docs/sequence-diagram.mmd` | Mermaid sequence diagram of the attach-and-REPL lifecycle |
 | `Dockerfile` | Multi-stage build: compile + slim runtime image |

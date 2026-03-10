@@ -532,3 +532,33 @@ sequenceDiagram
     Note over D: For each: ResolveType, EvalLocationAttr, ReadLocationData
     Note over D: Visualize each variable
     D->>U: print "argc: 1\nargv: 0x7fff...\ni: 42"
+
+    Note over D,T: ── Phase 23: Expression evaluation (inferior call) ──
+    U-->>D: types "expr decode_signal(7)"
+    Note over D: Parse expression → function name + arguments
+    Note over D: findCallableFunction("decode_signal") via DWARF/ELF
+    Note over D: Save all registers (GPRs + FPRs)
+    Note over D: classifyType → SysV ABI: 7 is INTEGER → rdi
+    Note over D: setupArguments: write 7 to rdi
+    Note over D: inferior_malloc for return value storage
+    D->>K: PTRACE_POKEDATA: push entry-point addr onto stack
+    D->>K: PTRACE_SETREGS: RIP = decode_signal, RSP -= 8
+    Note over D: Ensure breakpoint at AT_ENTRY (return address)
+    D->>K: PTRACE_CONT (resume)
+    Note over T: Tracee executes decode_signal(7), returns to entry point
+    K-->>D: SIGTRAP (entry-point breakpoint hit)
+    Note over D: Read return value from rax → 71
+    Note over D: Write result to inferior-allocated slot
+    Note over D: Restore original registers (GPRs + FPRs)
+    Note over D: Store result as $0 for future reference
+    D->>U: print "$0: 71"
+
+    Note over D,T: ── Phase 24: inferior_malloc ──
+    Note over D: (Called internally by expression evaluator)
+    Note over D: findSymbolAddress("malloc") in loaded ELFs
+    Note over D: Save registers, set rdi=size, RIP=malloc addr
+    D->>K: PTRACE_POKEDATA + PTRACE_SETREGS + PTRACE_CONT
+    Note over T: Tracee executes malloc(size), returns to entry point
+    K-->>D: SIGTRAP (entry-point breakpoint hit)
+    Note over D: Read allocated address from rax
+    Note over D: Restore original registers

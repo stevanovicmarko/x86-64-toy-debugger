@@ -64,6 +64,7 @@ func TestMain(m *testing.M) {
 		{"multi_threaded", "multi_threaded.c", []string{"-g", "-no-pie", "-lpthread"}},
 		{"global_variable", "global_variable.c", []string{"-g", "-no-pie"}},
 		{"blocks", "blocks.c", []string{"-g", "-no-pie", "-O0"}},
+		{"expr_target", "expr_target.c", []string{"-g", "-no-pie", "-O0"}},
 	}
 	for _, t := range gccTargets {
 		src := filepath.Join("targets", t.src)
@@ -3136,5 +3137,224 @@ func TestLocalVariableBlocks(t *testing.T) {
 	vis = data.Visualize(proc, 0)
 	if vis != "3" {
 		t.Errorf("expected i=3, got %s", vis)
+	}
+}
+
+func TestExpressionEvalIntArg(t *testing.T) {
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open /dev/null: %v", err)
+	}
+	defer devNull.Close()
+
+	target, err := debugger.LaunchTargetWithOptions(targetPath("expr_target"),
+		debugger.LaunchOptions{Stdout: devNull, Stderr: devNull},
+	)
+	if err != nil {
+		t.Fatalf("LaunchTarget: %v", err)
+	}
+	defer target.Close()
+
+	proc := target.Process()
+
+	// Break at main.
+	sites, err := target.SetBreakpointAtFunction("main", false)
+	if err != nil || len(sites) == 0 {
+		t.Fatalf("SetBreakpointAtFunction(main): %v", err)
+	}
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+	}
+
+	// Call decode_signal(7) — should return 7*10+1 = 71.
+	result, err := target.EvaluateExpression("decode_signal(7)")
+	if err != nil {
+		t.Fatalf("EvaluateExpression: %v", err)
+	}
+	if result == nil || result.Value == nil {
+		t.Fatal("expected a return value")
+	}
+
+	vis := result.Value.Visualize(proc, 0)
+	if vis != "71" {
+		t.Errorf("expected 71, got %s", vis)
+	}
+
+	// Verify we can still use the process normally after the call.
+	pc, err := proc.GetPC()
+	if err != nil {
+		t.Fatalf("GetPC after expr: %v", err)
+	}
+	if pc == 0 {
+		t.Error("PC should be non-zero after expression evaluation")
+	}
+}
+
+func TestExpressionEvalVoidFunction(t *testing.T) {
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open /dev/null: %v", err)
+	}
+	defer devNull.Close()
+
+	target, err := debugger.LaunchTargetWithOptions(targetPath("expr_target"),
+		debugger.LaunchOptions{Stdout: devNull, Stderr: devNull},
+	)
+	if err != nil {
+		t.Fatalf("LaunchTarget: %v", err)
+	}
+	defer target.Close()
+
+	proc := target.Process()
+
+	// Break at main.
+	sites, err := target.SetBreakpointAtFunction("main", false)
+	if err != nil || len(sites) == 0 {
+		t.Fatalf("SetBreakpointAtFunction(main): %v", err)
+	}
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+	}
+
+	// Call dispatch_signal(42) — void, then check side effect via get_last_signal().
+	result, err := target.EvaluateExpression("dispatch_signal(42)")
+	if err != nil {
+		t.Fatalf("EvaluateExpression(dispatch_signal): %v", err)
+	}
+	// Void function — result should be nil.
+	if result != nil {
+		t.Log("void function returned a value (harmless)")
+	}
+
+	// Now call get_last_signal() and check it returns 42.
+	result, err = target.EvaluateExpression("get_last_signal()")
+	if err != nil {
+		t.Fatalf("EvaluateExpression(get_last_signal): %v", err)
+	}
+	if result == nil || result.Value == nil {
+		t.Fatal("expected a return value from get_last_signal")
+	}
+	vis := result.Value.Visualize(proc, 0)
+	if vis != "42" {
+		t.Errorf("expected 42, got %s", vis)
+	}
+}
+
+func TestExpressionEvalSumRegisters(t *testing.T) {
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open /dev/null: %v", err)
+	}
+	defer devNull.Close()
+
+	target, err := debugger.LaunchTargetWithOptions(targetPath("expr_target"),
+		debugger.LaunchOptions{Stdout: devNull, Stderr: devNull},
+	)
+	if err != nil {
+		t.Fatalf("LaunchTarget: %v", err)
+	}
+	defer target.Close()
+
+	proc := target.Process()
+
+	// Break at main.
+	sites, err := target.SetBreakpointAtFunction("main", false)
+	if err != nil || len(sites) == 0 {
+		t.Fatalf("SetBreakpointAtFunction(main): %v", err)
+	}
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+	}
+
+	// Call sum_registers(1, 2, 3, 4, 5, 6) — uses all 6 integer arg registers.
+	// Expected: 1+2+3+4+5+6 = 21
+	result, err := target.EvaluateExpression("sum_registers(1, 2, 3, 4, 5, 6)")
+	if err != nil {
+		t.Fatalf("EvaluateExpression: %v", err)
+	}
+	if result == nil || result.Value == nil {
+		t.Fatal("expected a return value")
+	}
+	vis := result.Value.Visualize(proc, 0)
+	if vis != "21" {
+		t.Errorf("expected 21, got %s", vis)
+	}
+}
+
+func TestExpressionResultReference(t *testing.T) {
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open /dev/null: %v", err)
+	}
+	defer devNull.Close()
+
+	target, err := debugger.LaunchTargetWithOptions(targetPath("expr_target"),
+		debugger.LaunchOptions{Stdout: devNull, Stderr: devNull},
+	)
+	if err != nil {
+		t.Fatalf("LaunchTarget: %v", err)
+	}
+	defer target.Close()
+
+	proc := target.Process()
+
+	// Break at main.
+	sites, err := target.SetBreakpointAtFunction("main", false)
+	if err != nil || len(sites) == 0 {
+		t.Fatalf("SetBreakpointAtFunction(main): %v", err)
+	}
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+	}
+
+	// First call: decode_signal(3) → 31
+	result1, err := target.EvaluateExpression("decode_signal(3)")
+	if err != nil {
+		t.Fatalf("EvaluateExpression(decode_signal(3)): %v", err)
+	}
+	if result1 == nil || result1.Value == nil {
+		t.Fatal("expected a return value")
+	}
+	vis := result1.Value.Visualize(proc, 0)
+	if vis != "31" {
+		t.Errorf("expected 31, got %s", vis)
+	}
+
+	// Verify we can read back the result via $0.
+	td, err := target.GetExpressionResult(0)
+	if err != nil {
+		t.Fatalf("GetExpressionResult(0): %v", err)
+	}
+	vis = td.Visualize(proc, 0)
+	if vis != "31" {
+		t.Errorf("expected $0 = 31, got %s", vis)
 	}
 }
