@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -240,7 +239,9 @@ func handleHelp(args []string) {
 			return
 		case "variable", "var":
 			fmt.Println("variable subcommands:")
-			fmt.Println("  variable read <name>            - read a global variable as uint64")
+			fmt.Println("  variable read <name>            - read a variable (supports name.field, ptr->field, arr[i])")
+			fmt.Println("  variable locals                 - print all local variables in scope")
+			fmt.Println("  variable location <name>        - print where a variable lives (register/address)")
 			return
 		}
 	}
@@ -1005,47 +1006,95 @@ func handleThread(proc *debugger.Process, args []string) {
 }
 
 func handleVariable(target *debugger.Target, args []string) {
-	if len(args) < 2 {
-		fmt.Println("usage: variable read <name>")
+	if len(args) == 0 {
+		fmt.Println("usage: variable <read|locals|location> [args...]")
 		fmt.Println("  type 'help variable' for details")
 		return
 	}
 
 	switch args[0] {
+	case "locals":
+		handleVariableLocals(target)
+
 	case "read":
-		name := args[1]
-		e := target.ELFContainingPC()
-		if e == nil || e.DWARF() == nil {
-			fmt.Fprintln(os.Stderr, "toydbg: no DWARF info available")
+		if len(args) < 2 {
+			fmt.Println("usage: variable read <name>")
 			return
 		}
-		dw := e.DWARF()
-		dieOffset, found := dw.FindGlobalVariable(name)
-		if !found {
-			fmt.Fprintf(os.Stderr, "toydbg: global variable %q not found\n", name)
+		handleVariableRead(target, args[1])
+
+	case "location":
+		if len(args) < 2 {
+			fmt.Println("usage: variable location <name>")
 			return
 		}
-		proc := target.Process()
-		regs := proc.Registers()
-		if regs == nil {
-			fmt.Fprintln(os.Stderr, "toydbg: registers not available")
-			return
-		}
-		result, err := dw.EvalLocationAttr(proc, regs, dieOffset, false)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "toydbg: evaluate location: %v\n", err)
-			return
-		}
-		data, err := debugger.ReadLocationData(proc, regs, result, 8)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "toydbg: read variable: %v\n", err)
-			return
-		}
-		val := binary.LittleEndian.Uint64(data)
-		fmt.Printf("Value: %d\n", val)
+		handleVariableLocation(target, args[1])
 
 	default:
 		fmt.Printf("unknown variable subcommand: %q\n", args[0])
+	}
+}
+
+func handleVariableRead(target *debugger.Target, name string) {
+	data, err := target.ResolveIndirectName(name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
+		return
+	}
+	str := data.Visualize(target.Process(), 0)
+	fmt.Printf("Value: %s\n", str)
+}
+
+func handleVariableLocals(target *debugger.Target) {
+	vars, err := target.LocalVariables()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
+		return
+	}
+	if len(vars) == 0 {
+		fmt.Println("no local variables in scope")
+		return
+	}
+	for _, v := range vars {
+		str := v.Data.Visualize(target.Process(), 0)
+		fmt.Printf("%s: %s\n", v.Name, str)
+	}
+}
+
+func handleVariableLocation(target *debugger.Target, name string) {
+	result, err := target.VariableLocation(name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "toydbg: %v\n", err)
+		return
+	}
+
+	printSimpleLoc := func(loc debugger.SimpleLocation) {
+		switch loc.Kind {
+		case debugger.LocRegister:
+			info, ok := debugger.RegisterInfoByDwarf(int(loc.RegNum))
+			if ok {
+				fmt.Printf("Register: %s\n", info.Name)
+			} else {
+				fmt.Printf("Register: dwarf_%d\n", loc.RegNum)
+			}
+		case debugger.LocAddress:
+			fmt.Printf("Address: 0x%x\n", loc.Address)
+		case debugger.LocLiteral:
+			fmt.Printf("Literal: %d\n", loc.Value)
+		case debugger.LocEmpty:
+			fmt.Println("Optimized out")
+		default:
+			fmt.Printf("Location kind: %d\n", loc.Kind)
+		}
+	}
+
+	if !result.IsComposite {
+		printSimpleLoc(result.Location)
+	} else {
+		for i, piece := range result.Pieces {
+			fmt.Printf("Piece %d: offset=%d, bit_size=%d, location=", i, piece.Offset, piece.BitSize)
+			printSimpleLoc(piece.Location)
+		}
 	}
 }
 

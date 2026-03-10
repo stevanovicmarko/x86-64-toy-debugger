@@ -707,6 +707,10 @@ func (e *DwarfExpression) Eval(proc *Process, regs *Registers, pushCFA bool, cfa
 // evalFrameBase evaluates the DW_AT_frame_base attribute of the function
 // containing the current PC. This is used by DW_OP_fbreg to find the
 // base address of the current stack frame.
+//
+// The frame base expression often uses DW_OP_call_frame_cfa, which
+// needs the canonical frame address (CFA) from the CFI. We compute
+// the CFA from CFI data before evaluating the expression.
 func (e *DwarfExpression) evalFrameBase(proc *Process, regs *Registers) (uint64, error) {
 	if e.dwarfData == nil {
 		return 0, fmt.Errorf("no DWARF data available for frame base lookup")
@@ -720,8 +724,24 @@ func (e *DwarfExpression) evalFrameBase(proc *Process, regs *Registers) (uint64,
 		return 0, fmt.Errorf("no function found at PC 0x%x for frame base", pc)
 	}
 
+	// Compute the CFA from CFI, needed when the frame base uses
+	// DW_OP_call_frame_cfa. Without this, the CFA defaults to 0 and
+	// any fbreg-relative location produces an invalid address.
+	cfa := uint64(0)
+	if proc.target != nil {
+		curELF := proc.target.elfForPC(pc)
+		if curELF != nil {
+			if cfiInfo := curELF.CFI(); cfiInfo != nil {
+				_, computedCFA, err := cfiInfo.UnwindFrame(proc, pc, regs)
+				if err == nil {
+					cfa = computedCFA
+				}
+			}
+		}
+	}
+
 	// Read the DW_AT_frame_base attribute from the function's DIE.
-	result, err := e.dwarfData.EvalLocationAttr(proc, regs, fn.DIEOffset, true)
+	result, err := e.dwarfData.EvalLocationAttrWithCFA(proc, regs, fn.DIEOffset, true, cfa)
 	if err != nil {
 		return 0, fmt.Errorf("evaluate frame base: %w", err)
 	}

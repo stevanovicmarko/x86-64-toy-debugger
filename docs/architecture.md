@@ -38,8 +38,10 @@ codebase, extending it, or building your own debugger from scratch.
 27. [Call Frame Information (CFI)](#27-call-frame-information-cfi)
 28. [Stack Unwinding](#28-stack-unwinding)
 29. [Shared Library Support](#29-shared-library-support)
-30. [DWARF Expressions and Variable Reading](#30-dwarf-expressions-and-variable-reading)
-31. [File Reference](#31-file-reference)
+30. [Multithreading Support](#30-multithreading-support)
+31. [DWARF Expressions and Variable Reading](#31-dwarf-expressions-and-variable-reading)
+32. [Types and Variables](#32-types-and-variables)
+33. [File Reference](#33-file-reference)
 
 ---
 
@@ -2471,7 +2473,7 @@ When a reportable stop occurs, `stopRunningThreads()` sends `SIGSTOP` to all oth
 
 ---
 
-## 30. DWARF Expressions and Variable Reading
+## 31. DWARF Expressions and Variable Reading
 
 DWARF uses a **stack-based bytecode language** to describe where variables live.
 This is necessary because a variable's storage can change during execution — it
@@ -2555,16 +2557,130 @@ For CFI expression rules, the CFA is pushed onto the stack before evaluation.
 
 ### REPL command
 
-The `variable read <name>` command reads a global variable:
+The `variable` command supports typed reading, local variable listing, and
+location queries:
 
 ```
 (toydbg) var read g_int
 Value: 42
+
+(toydbg) var read debuggee.regs[0].name
+Value: "rax"
+
+(toydbg) var locals
+argc: 1
+argv: 0x7fffffffe2a8
+i: 42
+
+(toydbg) var location i
+Address: 0x7fffffffe1ec
 ```
 
 ---
 
-## 31. File Reference
+## 32. Types and Variables
+
+Building on the DWARF expression infrastructure (Section 30), toydbg can now
+read, visualize, and navigate typed variables — local, global, and compound.
+
+### Why types matter
+
+Raw bytes from `ReadLocationData` are meaningless without knowing their type.
+DWARF records the type of every variable via `DW_AT_type`, which references a
+chain of type DIEs (base types, pointers, arrays, structs, qualifiers, typedefs).
+Rather than walking these DIEs manually, toydbg leverages Go's `debug/dwarf`
+package, which provides `Data.Type(offset)` returning fully-resolved Go types.
+
+### Go's DWARF type hierarchy
+
+Go's `debug/dwarf` models DWARF type DIEs as concrete Go types:
+
+| DWARF Tag | Go type | Notes |
+|-----------|---------|-------|
+| `DW_TAG_base_type` (signed) | `*dwarf.IntType` | Embeds `BasicType` |
+| `DW_TAG_base_type` (unsigned) | `*dwarf.UintType` | Embeds `BasicType` |
+| `DW_TAG_base_type` (char) | `*dwarf.CharType` / `*dwarf.UcharType` | |
+| `DW_TAG_base_type` (float) | `*dwarf.FloatType` | |
+| `DW_TAG_base_type` (bool) | `*dwarf.BoolType` | |
+| `DW_TAG_pointer_type` | `*dwarf.PtrType` | `.Type` = pointee |
+| `DW_TAG_array_type` | `*dwarf.ArrayType` | `.Count`, `.Type` = element |
+| `DW_TAG_structure_type` / `DW_TAG_class_type` | `*dwarf.StructType` | `.Field` = members |
+| `DW_TAG_const_type` / `DW_TAG_volatile_type` | `*dwarf.QualType` | `.Type` = inner |
+| `DW_TAG_typedef` | `*dwarf.TypedefType` | `.Type` = aliased |
+| `DW_TAG_enumeration_type` | `*dwarf.EnumType` | `.Val` = enumerators |
+
+Because `*dwarf.IntType` is distinct from `*dwarf.BasicType` in Go's type system
+(even though it embeds it), the `toBasicType()` helper extracts the embedded
+`BasicType` from any of these subtypes for uniform visualization.
+
+### TypedData
+
+`TypedData` in `debugger/type.go` combines:
+
+- `Data []byte` — raw variable bytes
+- `Type dwarf.Type` — the resolved DWARF type
+- `Address *uint64` — optional memory address (nil for register-resident values)
+
+Key methods:
+
+- `Visualize(proc, depth)` — pretty-prints the value as a string
+- `DerefPointer(proc)` — reads the pointed-to value from memory
+- `ReadMember(proc, name)` — extracts a struct member by name
+- `Index(proc, i)` — reads element `i` from an array or pointer
+
+### Visualization dispatch
+
+`Visualize` strips qualifiers/typedefs, then dispatches by Go type:
+
+- **Basic types**: formatted by name and size (int→decimal, float→%g, char→'c', bool→true/false)
+- **Pointers**: hex address, or `"string"` if pointing to a char type
+- **Arrays**: `[elem0, elem1, ...]` with recursive element visualization
+- **Structs**: `{\n\tfield: value\n}` with depth-based indentation
+- **Enums**: enumerator name if found, numeric fallback
+
+### Bitfield support
+
+DWARF encodes bitfields with `DW_AT_bit_size` and either `DW_AT_bit_offset`
+(deprecated) or `DW_AT_data_bit_offset` (DWARF 4+). The `fieldByteOffset()`
+helper computes the correct byte position, and `fixupBitfieldData()` uses
+`memcpyBits()` to extract the relevant bits into a clean buffer before
+visualization.
+
+### Lexical scopes and local variables
+
+Local variables live inside `DW_TAG_subprogram` DIEs (functions) and
+`DW_TAG_lexical_block` DIEs (inner scopes like `if` or `for` blocks).
+`ScopesAtAddress(addr)` walks the DIE tree recursively to find all
+enclosing scopes at a given PC, deepest first. `FindLocalVariable(name, addr)`
+searches these scopes for a matching `DW_TAG_variable` or
+`DW_TAG_formal_parameter` DIE, returning the innermost match (correct
+shadowing behavior).
+
+### Frame base and CFA
+
+Local variable locations often use `DW_OP_fbreg` (frame-base-relative offset).
+The frame base itself is usually `DW_OP_call_frame_cfa`, which requires the
+Canonical Frame Address from CFI. The `evalFrameBase()` function computes the
+CFA via `UnwindFrame()` and passes it to the expression evaluator, enabling
+correct resolution of stack-allocated locals.
+
+### Compound name resolution
+
+`ResolveIndirectName("info.regs[0].name")` parses the expression and
+navigates the type hierarchy:
+
+1. Find variable `info` → get its `TypedData`
+2. `.regs` → `ReadMember(proc, "regs")` → pointer value
+3. `[0]` → `Index(proc, 0)` → dereference pointer at offset
+4. `.name` → `ReadMember(proc, "name")` → char pointer
+5. `Visualize` → read null-terminated string → `"rax"`
+
+Supported operators: `.` (member access), `->` (pointer dereference + member),
+`[n]` (array/pointer indexing).
+
+---
+
+## 33. File Reference
 
 | File | Purpose |
 |------|---------|
@@ -2573,13 +2689,14 @@ Value: 42
 | `debugger/elf.go` | ELF binary wrapper: symbol lookup by name and address, load bias, FunctionContainingAddress, DWARF loading, CFI loading, ContainsAddress, NotifyLoaded |
 | `debugger/elf_collection.go` | ELFCollection type: multi-ELF container with lookup by path, filename, or address |
 | `debugger/dynlib.go` | Dynamic linker integration: rendezvous structure (r_debug), link map walking, vDSO dumping, shared library discovery |
-| `debugger/dwarf.go` | DWARF debug info wrapper: function lookup by address/name, line table index (GetEntryByAddress, GetEntriesByLine, AllLineEntries), source location mapping, InlineStackAtAddress, PrologueEndForRange, ELF file reference for section access |
+| `debugger/dwarf.go` | DWARF debug info wrapper: function lookup by address/name, line table index (GetEntryByAddress, GetEntriesByLine, AllLineEntries), source location mapping, InlineStackAtAddress, PrologueEndForRange, ScopesAtAddress, FindLocalVariable, LocalVariablesAtAddress, ReadDIE, ResolveType |
 | `debugger/dwarf_expr.go` | DWARF expression evaluator: stack machine implementing ~60 DW_OP opcodes, result types (SimpleLocation, Piece, ExprResult), DW_OP_fbreg frame base lookup |
 | `debugger/dwarf_loc.go` | Location attribute evaluation (exprloc and location lists), .debug_loc parsing, global variable index (FindGlobalVariable), ReadLocationData for all location kinds, bit-level memcpyBits |
 | `debugger/cfi.go` | Call Frame Information parser: CIE/FDE parsing, pointer encoding, .eh_frame_hdr binary search, FDEForPC lookup |
 | `debugger/auxv_linux.go` | Linux `/proc/<pid>/auxv` reader for AT_ENTRY (load bias computation) |
 | `debugger/auxv_unsupported.go` | Non-Linux auxv stub |
-| `debugger/target.go` | Target type: combines Process + ELFCollection for symbolic debugging, entry-point breakpoint for dynamic linker init, shared library discovery (LaunchTarget, AttachTarget) |
+| `debugger/type.go` | Typed variable support: TypedData struct, Visualize (base types, pointers, arrays, structs, enums), DerefPointer, ReadMember, Index, bitfield fixup, qualifier stripping, char type detection |
+| `debugger/target.go` | Target type: combines Process + ELFCollection for symbolic debugging, entry-point breakpoint for dynamic linker init, shared library discovery (LaunchTarget, AttachTarget), FindVariable, ResolveIndirectName, VariableLocation, LocalVariables |
 | `debugger/unwind.go` | CFI instruction interpreter: executeCFIInstruction (including DW_CFA_expression, DW_CFA_val_expression, DW_CFA_def_cfa_expression), UnwindFrame, register rule types (including expression-based rules), unwind context |
 | `debugger/stack.go` | Stack frame type and stack unwinding orchestration: UnwindStack, Backtrace, FormatBacktrace, inline frame handling |
 | `debugger/stepping.go` | Source-level operations: StepIn, StepOver, StepOut (CFI-based), RunUntilAddress, SetBreakpointAtFunction, SetBreakpointAtLine, PrintSource, PrintSourceAtPC, SourceLocationAtPC, InlineDepthAtPC, DWARF (accessor) |
@@ -2612,7 +2729,8 @@ Value: 42
 | `test/targets/libcalc.c` | Shared library source: defines `calc_check_threshold()` for shared library tracing tests |
 | `test/targets/calc_client.c` | Main program source: links against `libcalc.so`, used to test cross-library breakpoints and stack unwinding |
 | `test/targets/multi_threaded.c` | C test target: spawns 10 pthreads calling `say_hi()`, used for multithreading tests |
-| `test/targets/global_variable.c` | C test target: global uint64 variable assigned three values, used for DWARF expression variable reading tests |
+| `test/targets/global_variable.c` | C test target: global variables with structs, bitfields, pointers, and arrays for typed variable reading tests |
+| `test/targets/blocks.c` | C test target: nested lexical scopes redefining `i`, used for local variable scoping tests |
 | `doc.go` | Module-root package declaration |
 | `docs/sequence-diagram.mmd` | Mermaid sequence diagram of the attach-and-REPL lifecycle |
 | `Dockerfile` | Multi-stage build: compile + slim runtime image |

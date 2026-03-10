@@ -44,12 +44,38 @@ func (d *DWARF) EvalLocationAttr(proc *Process, regs *Registers, dieOffset dwarf
 		return ExprResult{}, fmt.Errorf("DIE at offset %d has no %s attribute", dieOffset, attrTag)
 	}
 
-	return d.evalLocationField(proc, regs, field, inFrameInfo)
+	return d.evalLocationFieldWithCFA(proc, regs, field, inFrameInfo, 0)
 }
 
-// evalLocationField evaluates a location attribute field, dispatching
+// EvalLocationAttrWithCFA is like EvalLocationAttr but passes a pre-computed
+// CFA to the expression evaluator. This is needed when the expression
+// contains DW_OP_call_frame_cfa (common in DW_AT_frame_base attributes).
+func (d *DWARF) EvalLocationAttrWithCFA(proc *Process, regs *Registers, dieOffset dwarf.Offset, inFrameInfo bool, cfa uint64) (ExprResult, error) {
+	reader := d.data.Reader()
+	reader.Seek(dieOffset)
+	entry, err := reader.Next()
+	if err != nil || entry == nil {
+		return ExprResult{}, fmt.Errorf("cannot read DIE at offset %d", dieOffset)
+	}
+
+	attrTag := dwarf.AttrLocation
+	if inFrameInfo {
+		attrTag = dwarf.AttrFrameBase
+	}
+
+	field := entry.AttrField(attrTag)
+	if field == nil {
+		return ExprResult{}, fmt.Errorf("DIE at offset %d has no %s attribute", dieOffset, attrTag)
+	}
+
+	return d.evalLocationFieldWithCFA(proc, regs, field, inFrameInfo, cfa)
+}
+
+// evalLocationFieldWithCFA evaluates a location attribute field, dispatching
 // between single expressions (exprloc) and location lists (sec_offset).
-func (d *DWARF) evalLocationField(proc *Process, regs *Registers, field *dwarf.Field, inFrameInfo bool) (ExprResult, error) {
+// The cfa parameter is passed to the expression evaluator so that
+// DW_OP_call_frame_cfa can push the correct canonical frame address.
+func (d *DWARF) evalLocationFieldWithCFA(proc *Process, regs *Registers, field *dwarf.Field, inFrameInfo bool, cfa uint64) (ExprResult, error) {
 	switch field.Class {
 	case dwarf.ClassExprLoc:
 		// Single location expression — the value is a []byte of bytecode.
@@ -58,7 +84,7 @@ func (d *DWARF) evalLocationField(proc *Process, regs *Registers, field *dwarf.F
 			return ExprResult{}, fmt.Errorf("DW_FORM_exprloc value is not []byte")
 		}
 		expr := NewDwarfExpression(data, inFrameInfo, d.loadBias, d)
-		return expr.Eval(proc, regs, false, 0)
+		return expr.Eval(proc, regs, false, cfa)
 
 	case dwarf.ClassLocListPtr:
 		// Location list — the value is an offset into .debug_loc.

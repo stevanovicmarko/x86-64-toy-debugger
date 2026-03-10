@@ -509,3 +509,26 @@ sequenceDiagram
         Note over D: Read from cached register state
     end
     D->>U: print "Value: 42"
+
+    Note over D,T: ── Phase 21: Typed variable reading ──
+    U-->>D: types "variable read info.regs[0].name"
+    Note over D: Split name: base="info", rest=".regs[0].name"
+    Note over D: FindLocalVariable("info", PC) or FindGlobalVariable("info")
+    Note over D: ResolveType(DIE offset) → dwarf.Type via Data.Type()
+    Note over D: EvalLocationAttr → ReadLocationData → initial TypedData
+    Note over D: Process operators: .regs → ReadMember, [0] → Index, .name → ReadMember
+    alt Pointer dereference (-> or pointer Index)
+        D->>K: process_vm_readv(pid, pointer_value, element_size)
+        K-->>D: returns pointed-to bytes
+    end
+    Note over D: Visualize(TypedData) → dispatch by dwarf.Type
+    Note over D: PtrType to char → ReadString → "rax"
+    D->>U: print 'Value: "rax"'
+
+    Note over D,T: ── Phase 22: Local variable listing ──
+    U-->>D: types "variable locals"
+    Note over D: ScopesAtAddress(PC) → deepest-first scope chain
+    Note over D: Walk scope children: DW_TAG_variable, DW_TAG_formal_parameter
+    Note over D: For each: ResolveType, EvalLocationAttr, ReadLocationData
+    Note over D: Visualize each variable
+    D->>U: print "argc: 1\nargv: 0x7fff...\ni: 42"

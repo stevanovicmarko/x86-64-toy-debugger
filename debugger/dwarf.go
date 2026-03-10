@@ -3,6 +3,7 @@ package debugger
 import (
 	"debug/dwarf"
 	"debug/elf"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -508,6 +509,172 @@ func (d *DWARF) PrologueEndForRange(lowPC, highPC uint64) (uint64, bool) {
 	}
 
 	return 0, false
+}
+
+// ---------------------------------------------------------------------------
+// Scope and Local Variable Lookup
+//
+// DWARF represents lexical scopes with DW_TAG_lexical_block DIEs that
+// have address ranges. Local variables and parameters live as children
+// of these scope DIEs or the enclosing DW_TAG_subprogram.
+//
+// To find a local variable, we:
+//  1. Find the function containing the PC
+//  2. Walk its children recursively to find all DW_TAG_lexical_block
+//     DIEs whose ranges contain the PC (deepest first)
+//  3. Search each scope's children for DW_TAG_variable or
+//     DW_TAG_formal_parameter DIEs with the requested name
+// ---------------------------------------------------------------------------
+
+// ScopesAtAddress returns the chain of lexical scopes containing the
+// given virtual address, ordered deepest-first. The last element is the
+// enclosing DW_TAG_subprogram DIE.
+func (d *DWARF) ScopesAtAddress(addr uint64) []dwarf.Offset {
+	fileAddr := addr - d.loadBias
+
+	fn := d.FunctionContainingPC(addr)
+	if fn == nil {
+		return nil
+	}
+
+	var scopes []dwarf.Offset
+	d.scopesAtAddressInDIE(fn.DIEOffset, fileAddr, &scopes)
+	scopes = append(scopes, fn.DIEOffset)
+	return scopes
+}
+
+// scopesAtAddressInDIE recursively walks children of the DIE at parentOffset,
+// collecting DW_TAG_lexical_block DIEs whose ranges contain fileAddr.
+// Deepest scopes appear first in the result.
+func (d *DWARF) scopesAtAddressInDIE(parentOffset dwarf.Offset, fileAddr uint64, scopes *[]dwarf.Offset) {
+	reader := d.data.Reader()
+	reader.Seek(parentOffset)
+
+	parent, err := reader.Next()
+	if err != nil || parent == nil || !parent.Children {
+		return
+	}
+
+	for {
+		child, err := reader.Next()
+		if err != nil || child == nil || child.Tag == 0 {
+			break
+		}
+
+		if child.Tag == dwarf.TagLexDwarfBlock {
+			ranges, err := d.data.Ranges(child)
+			if err == nil && rangesContain(ranges, fileAddr) {
+				// Recurse into this block first (deepest-first ordering).
+				d.scopesAtAddressInDIE(child.Offset, fileAddr, scopes)
+				*scopes = append(*scopes, child.Offset)
+			}
+		}
+
+		reader.SkipChildren()
+	}
+}
+
+// FindLocalVariable searches lexical scopes at the given virtual address
+// for a variable or parameter with the given name. It returns the DIE
+// offset and true if found, or (0, false) if not.
+func (d *DWARF) FindLocalVariable(name string, addr uint64) (dwarf.Offset, bool) {
+	scopes := d.ScopesAtAddress(addr)
+
+	for _, scopeOff := range scopes {
+		reader := d.data.Reader()
+		reader.Seek(scopeOff)
+
+		// Read the scope DIE itself.
+		scopeEntry, err := reader.Next()
+		if err != nil || scopeEntry == nil || !scopeEntry.Children {
+			continue
+		}
+
+		// Walk children looking for matching variables.
+		for {
+			child, err := reader.Next()
+			if err != nil || child == nil || child.Tag == 0 {
+				break
+			}
+
+			if child.Tag == dwarf.TagVariable || child.Tag == dwarf.TagFormalParameter {
+				childName := entryName(child)
+				if childName == name && child.AttrField(dwarf.AttrLocation) != nil {
+					return child.Offset, true
+				}
+			}
+
+			reader.SkipChildren()
+		}
+	}
+
+	return 0, false
+}
+
+// LocalVariablesAtAddress returns all variable and parameter DIE offsets
+// visible at the given virtual address, in scope order (deepest first).
+// If multiple scopes define the same name, only the innermost is returned.
+func (d *DWARF) LocalVariablesAtAddress(addr uint64) []dwarf.Offset {
+	scopes := d.ScopesAtAddress(addr)
+	seen := make(map[string]bool)
+	var result []dwarf.Offset
+
+	for _, scopeOff := range scopes {
+		reader := d.data.Reader()
+		reader.Seek(scopeOff)
+
+		scopeEntry, err := reader.Next()
+		if err != nil || scopeEntry == nil || !scopeEntry.Children {
+			continue
+		}
+
+		for {
+			child, err := reader.Next()
+			if err != nil || child == nil || child.Tag == 0 {
+				break
+			}
+
+			if child.Tag == dwarf.TagVariable || child.Tag == dwarf.TagFormalParameter {
+				childName := entryName(child)
+				if childName != "" && !seen[childName] && child.AttrField(dwarf.AttrLocation) != nil {
+					result = append(result, child.Offset)
+					seen[childName] = true
+				}
+			}
+
+			reader.SkipChildren()
+		}
+	}
+
+	return result
+}
+
+// ReadDIE reads a single DIE at the given offset.
+func (d *DWARF) ReadDIE(offset dwarf.Offset) (*dwarf.Entry, error) {
+	reader := d.data.Reader()
+	reader.Seek(offset)
+	entry, err := reader.Next()
+	if err != nil {
+		return nil, err
+	}
+	if entry == nil {
+		return nil, fmt.Errorf("no DIE at offset %d", offset)
+	}
+	return entry, nil
+}
+
+// ResolveType returns the dwarf.Type for the DW_AT_type attribute of
+// the DIE at the given offset.
+func (d *DWARF) ResolveType(dieOffset dwarf.Offset) (dwarf.Type, error) {
+	entry, err := d.ReadDIE(dieOffset)
+	if err != nil {
+		return nil, err
+	}
+	typeOff, ok := entry.Val(dwarf.AttrType).(dwarf.Offset)
+	if !ok {
+		return nil, fmt.Errorf("DIE at offset %d has no DW_AT_type", dieOffset)
+	}
+	return d.data.Type(typeOff)
 }
 
 // pathEndsWith checks whether fullPath ends with suffix at a path

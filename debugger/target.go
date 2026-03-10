@@ -1,9 +1,12 @@
 package debugger
 
 import (
+	"debug/dwarf"
 	"debug/elf"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 )
 
 // atEntry is the auxiliary vector tag for the program entry point.
@@ -207,6 +210,282 @@ func (t *Target) ELFContainingPC() *ELF {
 func (t *Target) notifyThreadLifecycle(reason StopReason) {
 	// Future: replicate hardware breakpoints/watchpoints to new threads,
 	// update per-thread DWARF state, etc.
+}
+
+// ---------------------------------------------------------------------------
+// Variable Lookup and Resolution
+//
+// FindVariable searches for a variable by name: first as a local
+// variable in the current scope, then as a global across all ELFs.
+//
+// ResolveIndirectName handles compound names like "info.regs[0].name"
+// by parsing operators (., ->, []) and navigating the type hierarchy.
+// ---------------------------------------------------------------------------
+
+// FindVariable looks up a variable by name at the current PC.
+// It checks local variables first (lexical scopes), then globals
+// across all loaded ELF files. Returns the DIE offset, the DWARF
+// instance that owns it, and whether it was found.
+func (t *Target) FindVariable(name string) (dwarf.Offset, *DWARF, bool) {
+	pc, err := t.process.GetPC()
+	if err != nil {
+		return 0, nil, false
+	}
+
+	// Try local variables in the ELF containing the current PC.
+	if dw := t.dwarf(); dw != nil {
+		if off, found := dw.FindLocalVariable(name, pc); found {
+			return off, dw, true
+		}
+	}
+
+	// Try global variables across all loaded ELFs.
+	var foundOff dwarf.Offset
+	var foundDW *DWARF
+	found := false
+	t.elves.ForEach(func(e *ELF) {
+		if found {
+			return
+		}
+		dw := e.DWARF()
+		if dw == nil {
+			return
+		}
+		if off, ok := dw.FindGlobalVariable(name); ok {
+			foundOff = off
+			foundDW = dw
+			found = true
+		}
+	})
+	return foundOff, foundDW, found
+}
+
+// ResolveIndirectName resolves a compound variable name like
+// "info.regs[0].name" at the current PC. It supports:
+//   - "." for struct member access
+//   - "->" for pointer dereference + member access
+//   - "[n]" for array/pointer indexing
+func (t *Target) ResolveIndirectName(name string) (*TypedData, error) {
+	// Split off the initial variable name from operators.
+	opPos := strings.IndexAny(name, ".-[")
+	varName := name
+	if opPos >= 0 {
+		varName = name[:opPos]
+	}
+
+	data, err := t.getInitialVariableData(varName)
+	if err != nil {
+		return nil, err
+	}
+
+	// Process remaining operators.
+	rest := ""
+	if opPos >= 0 {
+		rest = name[opPos:]
+	}
+
+	for len(rest) > 0 {
+		switch {
+		case rest[0] == '-':
+			// -> operator: dereference pointer, then read member.
+			if len(rest) < 2 || rest[1] != '>' {
+				return nil, fmt.Errorf("invalid operator at %q", rest)
+			}
+			data, err = data.DerefPointer(t.process)
+			if err != nil {
+				return nil, err
+			}
+			rest = rest[2:]
+			// Fall through to read the member name (handled by '.' or '>' case next iteration).
+			// Actually, after '->', we need to read the member name now.
+			memberEnd := strings.IndexAny(rest, ".-[")
+			memberName := rest
+			if memberEnd >= 0 {
+				memberName = rest[:memberEnd]
+				rest = rest[memberEnd:]
+			} else {
+				rest = ""
+			}
+			data, err = data.ReadMember(t.process, memberName)
+			if err != nil {
+				return nil, err
+			}
+
+		case rest[0] == '.':
+			rest = rest[1:]
+			memberEnd := strings.IndexAny(rest, ".-[")
+			memberName := rest
+			if memberEnd >= 0 {
+				memberName = rest[:memberEnd]
+				rest = rest[memberEnd:]
+			} else {
+				rest = ""
+			}
+			data, err = data.ReadMember(t.process, memberName)
+			if err != nil {
+				return nil, err
+			}
+
+		case rest[0] == '[':
+			closeIdx := strings.Index(rest, "]")
+			if closeIdx < 0 {
+				return nil, fmt.Errorf("missing ']' in %q", rest)
+			}
+			indexStr := rest[1:closeIdx]
+			index, parseErr := strconv.Atoi(indexStr)
+			if parseErr != nil {
+				return nil, fmt.Errorf("invalid index %q", indexStr)
+			}
+			data, err = data.Index(t.process, index)
+			if err != nil {
+				return nil, err
+			}
+			rest = rest[closeIdx+1:]
+
+		default:
+			return nil, fmt.Errorf("unexpected character %q in name", string(rest[0]))
+		}
+	}
+
+	return data, nil
+}
+
+// getInitialVariableData locates a variable by name and reads its data.
+func (t *Target) getInitialVariableData(name string) (*TypedData, error) {
+	off, dw, found := t.FindVariable(name)
+	if !found {
+		return nil, fmt.Errorf("variable %q not found", name)
+	}
+
+	varType, err := dw.ResolveType(off)
+	if err != nil {
+		return nil, fmt.Errorf("resolve type for %q: %w", name, err)
+	}
+
+	regs := t.process.Registers()
+	if regs == nil {
+		return nil, fmt.Errorf("registers not available")
+	}
+
+	result, err := dw.EvalLocationAttr(t.process, regs, off, false)
+	if err != nil {
+		return nil, fmt.Errorf("evaluate location of %q: %w", name, err)
+	}
+
+	size := varType.Size()
+	if size <= 0 {
+		size = 8
+	}
+	data, err := ReadLocationData(t.process, regs, result, int(size))
+	if err != nil {
+		return nil, fmt.Errorf("read data for %q: %w", name, err)
+	}
+
+	// Extract address if the location is a simple memory address.
+	var addr *uint64
+	if !result.IsComposite && result.Location.Kind == LocAddress {
+		a := result.Location.Address
+		addr = &a
+	}
+
+	return &TypedData{Data: data, Type: varType, Address: addr}, nil
+}
+
+// VariableLocation returns a description of where a variable lives
+// (register, memory address, or composite).
+func (t *Target) VariableLocation(name string) (ExprResult, error) {
+	off, dw, found := t.FindVariable(name)
+	if !found {
+		return ExprResult{}, fmt.Errorf("variable %q not found", name)
+	}
+
+	regs := t.process.Registers()
+	if regs == nil {
+		return ExprResult{}, fmt.Errorf("registers not available")
+	}
+
+	return dw.EvalLocationAttr(t.process, regs, off, false)
+}
+
+// LocalVariables returns typed data for all local variables visible
+// at the current PC. Variables in inner scopes shadow outer ones.
+func (t *Target) LocalVariables() ([]struct {
+	Name string
+	Data *TypedData
+}, error) {
+	pc, err := t.process.GetPC()
+	if err != nil {
+		return nil, err
+	}
+
+	dw := t.dwarf()
+	if dw == nil {
+		return nil, fmt.Errorf("no DWARF info available")
+	}
+
+	offsets := dw.LocalVariablesAtAddress(pc)
+	regs := t.process.Registers()
+	if regs == nil {
+		return nil, fmt.Errorf("registers not available")
+	}
+
+	type varEntry struct {
+		Name string
+		Data *TypedData
+	}
+	var result []varEntry
+
+	for _, off := range offsets {
+		entry, err := dw.ReadDIE(off)
+		if err != nil {
+			continue
+		}
+		varName := entryName(entry)
+		if varName == "" {
+			continue
+		}
+
+		varType, err := dw.ResolveType(off)
+		if err != nil {
+			continue
+		}
+
+		locResult, err := dw.EvalLocationAttr(t.process, regs, off, false)
+		if err != nil {
+			continue
+		}
+
+		size := varType.Size()
+		if size <= 0 {
+			size = 8
+		}
+		data, err := ReadLocationData(t.process, regs, locResult, int(size))
+		if err != nil {
+			continue
+		}
+
+		var addr *uint64
+		if !locResult.IsComposite && locResult.Location.Kind == LocAddress {
+			a := locResult.Location.Address
+			addr = &a
+		}
+
+		result = append(result, varEntry{
+			Name: varName,
+			Data: &TypedData{Data: data, Type: varType, Address: addr},
+		})
+	}
+
+	// Convert to exported type.
+	out := make([]struct {
+		Name string
+		Data *TypedData
+	}, len(result))
+	for i, v := range result {
+		out[i].Name = v.Name
+		out[i].Data = v.Data
+	}
+	return out, nil
 }
 
 // Close releases both the process and all ELF files.

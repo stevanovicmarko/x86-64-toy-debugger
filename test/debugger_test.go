@@ -63,6 +63,7 @@ func TestMain(m *testing.M) {
 		{"stepping_target", "stepping_target.c", []string{"-g", "-no-pie"}},
 		{"multi_threaded", "multi_threaded.c", []string{"-g", "-no-pie", "-lpthread"}},
 		{"global_variable", "global_variable.c", []string{"-g", "-no-pie"}},
+		{"blocks", "blocks.c", []string{"-g", "-no-pie", "-O0"}},
 	}
 	for _, t := range gccTargets {
 		src := filepath.Join("targets", t.src)
@@ -3011,5 +3012,129 @@ func TestDwarfExpressionPieces(t *testing.T) {
 	}
 	if p2.Offset != 12 {
 		t.Errorf("piece 2: expected offset 12, got %d", p2.Offset)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Typed Variable Tests
+// ---------------------------------------------------------------------------
+
+func TestTypedGlobalVariables(t *testing.T) {
+	target, err := debugger.LaunchTarget(targetPath("global_variable"))
+	if err != nil {
+		t.Fatalf("LaunchTarget: %v", err)
+	}
+	defer target.Close()
+
+	proc := target.Process()
+
+	// Set breakpoint on main and hit it.
+	sites, err := target.SetBreakpointAtFunction("main", false)
+	if err != nil || len(sites) == 0 {
+		t.Fatalf("SetBreakpointAtFunction(main): %v (sites=%d)", err, len(sites))
+	}
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+	}
+
+	// Test reading a compound name: debuggee.regs[0].name should be "rax".
+	data, err := target.ResolveIndirectName("debuggee.regs[0].name")
+	if err != nil {
+		t.Fatalf("ResolveIndirectName(debuggee.regs[0].name): %v", err)
+	}
+	vis := data.Visualize(proc, 0)
+	if vis != `"rax"` {
+		t.Errorf("expected debuggee.regs[0].name = %q, got %s", `"rax"`, vis)
+	}
+
+	// Test reading reg_list[1].size (bitfield, should be 8).
+	data, err = target.ResolveIndirectName("reg_list[1].size")
+	if err != nil {
+		t.Fatalf("ResolveIndirectName(reg_list[1].size): %v", err)
+	}
+	vis = data.Visualize(proc, 0)
+	if vis != "8" {
+		t.Errorf("expected reg_list[1].size = 8, got %s", vis)
+	}
+}
+
+func TestLocalVariableBlocks(t *testing.T) {
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open /dev/null: %v", err)
+	}
+	defer devNull.Close()
+
+	target, err := debugger.LaunchTargetWithOptions(targetPath("blocks"),
+		debugger.LaunchOptions{Stderr: devNull},
+	)
+	if err != nil {
+		t.Fatalf("LaunchTarget: %v", err)
+	}
+	defer target.Close()
+
+	proc := target.Process()
+
+	// Set breakpoint on main and resume to it.
+	sites, err := target.SetBreakpointAtFunction("main", false)
+	if err != nil || len(sites) == 0 {
+		t.Fatalf("SetBreakpointAtFunction(main): %v", err)
+	}
+	if err := proc.Resume(); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	reason, err := proc.WaitOnSignal()
+	if err != nil {
+		t.Fatalf("WaitOnSignal: %v", err)
+	}
+	if reason.Reason != debugger.ProcessStopped {
+		t.Fatalf("expected ProcessStopped, got %d", reason.Reason)
+	}
+
+	// Step over "int i = 1;" to reach the first fprintf.
+	reason, err = target.StepOver()
+	if err != nil {
+		t.Fatalf("StepOver: %v", err)
+	}
+
+	// At this point, i should be 1.
+	data, err := target.ResolveIndirectName("i")
+	if err != nil {
+		t.Fatalf("ResolveIndirectName(i): %v", err)
+	}
+	vis := data.Visualize(proc, 0)
+	if vis != "1" {
+		t.Errorf("expected i=1, got %s", vis)
+	}
+
+	// Step over fprintf, step over "int i = 2;" to reach second fprintf.
+	target.StepOver()
+	target.StepOver()
+	data, err = target.ResolveIndirectName("i")
+	if err != nil {
+		t.Fatalf("ResolveIndirectName(i) in block 2: %v", err)
+	}
+	vis = data.Visualize(proc, 0)
+	if vis != "2" {
+		t.Errorf("expected i=2, got %s", vis)
+	}
+
+	// Step over fprintf, step over "int i = 3;" to reach third fprintf.
+	target.StepOver()
+	target.StepOver()
+	data, err = target.ResolveIndirectName("i")
+	if err != nil {
+		t.Fatalf("ResolveIndirectName(i) in block 3: %v", err)
+	}
+	vis = data.Visualize(proc, 0)
+	if vis != "3" {
+		t.Errorf("expected i=3, got %s", vis)
 	}
 }
