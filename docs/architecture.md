@@ -112,9 +112,8 @@ entire lifetime of the trace. This pinning is released in `Close()`.
 - **`debugger/ptrace_linux.go`** — thin wrappers around the raw syscalls.
   Functions like `ptraceSeizeProcess` and `ptracePeekUser` translate Go
   arguments into `syscall.RawSyscall6` calls.
-- **`debugger/ptrace_unsupported.go`** — stubs that return `ENOSYS` on
-  non-Linux platforms, so the code compiles everywhere but fails gracefully
-  at runtime.
+- The package only compiles on Linux. Non-Linux development uses
+  dev containers (see `.devcontainer/`).
 
 ---
 
@@ -1299,28 +1298,40 @@ size=8  →  address & 7 == 0
 
 ---
 
-## 17. Platform Abstraction
+## 17. Platform Requirements and Dev Containers
 
-**Source:** `debugger/ptrace_unsupported.go`, `debugger/registers_unsupported.go`
+**Source:** `.devcontainer/devcontainer.json`, `.devcontainer/Dockerfile`
 
-The debugger only works on Linux (ptrace is a Linux-specific API), but the
-code is structured to compile on any platform:
+The debugger requires Linux — ptrace is a Linux-specific API and the entire
+`debugger` package only compiles on Linux. Platform-specific source files
+use Go's `_linux.go` suffix convention:
 
 ```
-//go:build linux       →  ptrace_linux.go, registers_linux.go
-//go:build !linux      →  ptrace_unsupported.go, registers_unsupported.go
+ptrace_linux.go       →  ptrace syscall wrappers
+registers_linux.go    →  register cache (GPR, FPR, debug regs)
+memory_linux.go       →  process_vm_readv wrapper
+auxv_linux.go         →  /proc/<pid>/auxv reader
 ```
 
-The `_unsupported` files export the same function signatures but return
-`syscall.ENOSYS` ("function not implemented"). This means:
+### Development on non-Linux platforms
 
-- `go build` and `go vet` work on macOS for development.
-- `go test` on macOS will fail with clear error messages rather than
-  compile errors.
-- CI can run linters on any platform.
+For macOS and Windows developers, the repository provides a **dev container**
+configuration (`.devcontainer/`). This gives a full Linux environment with
+Go, gcc, and ptrace capabilities — no manual setup required.
 
-For actual execution, a Linux environment is required — either native, WSL2,
-or a container with `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined`.
+**Supported workflows:**
+
+| Environment | How it works |
+|---|---|
+| VS Code + Dev Containers extension | "Reopen in Container" — automatic |
+| JetBrains (GoLand, etc.) | Gateway → Dev Container |
+| GitHub Codespaces | Click "Open in Codespaces" on GitHub |
+| WSL2 (Windows) | Native Linux kernel — build directly |
+| Podman / Docker | Use the project `Dockerfile` with `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined` |
+
+The dev container's `runArgs` include `--cap-add=SYS_PTRACE` and
+`--security-opt seccomp=unconfined` so that ptrace works inside the
+container without any manual flag passing.
 
 ---
 
@@ -2787,7 +2798,8 @@ stack.
 | `debugger/dwarf_loc.go` | Location attribute evaluation (exprloc and location lists), .debug_loc parsing, global variable index (FindGlobalVariable), ReadLocationData for all location kinds, bit-level memcpyBits |
 | `debugger/cfi.go` | Call Frame Information parser: CIE/FDE parsing, pointer encoding, .eh_frame_hdr binary search, FDEForPC lookup |
 | `debugger/auxv_linux.go` | Linux `/proc/<pid>/auxv` reader for AT_ENTRY (load bias computation) |
-| `debugger/auxv_unsupported.go` | Non-Linux auxv stub |
+| `.devcontainer/devcontainer.json` | Dev container configuration (ptrace capabilities, VS Code extensions) |
+| `.devcontainer/Dockerfile` | Dev container image (Go toolchain + gcc) |
 | `debugger/type.go` | Typed variable support: TypedData struct, Visualize (base types, pointers, arrays, structs, enums), DerefPointer, ReadMember, Index, bitfield fixup, qualifier stripping, char type detection |
 | `debugger/expr.go` | Expression evaluation engine: EvaluateExpression, inferior function calls, SysV ABI argument classification (INTEGER/SSE/MEMORY), argument setup, return value reading, inferior_malloc, expression result storage ($N references) |
 | `debugger/target.go` | Target type: combines Process + ELFCollection for symbolic debugging, entry-point breakpoint for dynamic linker init, shared library discovery (LaunchTarget, AttachTarget), FindVariable, ResolveIndirectName, VariableLocation, LocalVariables, expression result storage |
@@ -2803,13 +2815,10 @@ stack.
 | `debugger/process.go` | Process lifecycle: Launch, LaunchWithOptions, Attach, Resume, WaitOnSignal, GetPC, SetPC, breakpoint management, hardware stoppoint methods, watchpoint management, StepInstruction, ReadMemory, WriteMemory, ReadMemoryWithoutTraps, Close, TrapType, SyscallCatchPolicy, augmentStopReason, GetCurrentHardwareStoppoint |
 | `debugger/syscalls.go` | Syscall name/ID mapping table (generated from unistd_64.h): SyscallIDToName, SyscallNameToID |
 | `debugger/memory_linux.go` | Linux `process_vm_readv` wrapper for bulk memory reads |
-| `debugger/memory_unsupported.go` | Non-Linux memory read stub |
 | `debugger/disassembler.go` | Disassembler type: decodes x86-64 instructions via `x86asm` into AT&T syntax |
 | `debugger/ptrace_linux.go` | Linux ptrace syscall wrappers (including GETSIGINFO, SETOPTIONS, SYSCALL) |
-| `debugger/ptrace_unsupported.go` | Non-Linux stubs (return `ENOSYS`) |
 | `debugger/register_info.go` | Register metadata table (125 entries) and lookup functions |
 | `debugger/registers_linux.go` | Register cache: read/write via ptrace |
-| `debugger/registers_unsupported.go` | Non-Linux register stubs |
 | `test/debugger_test.go` | Integration tests (launch, attach, resume, register metadata, register I/O, assembly register tests, breakpoint tests, hardware breakpoint tests, watchpoint tests, memory read/write tests, syscall mapping tests, syscall catchpoint tests, ELF parsing tests, Target tests, DWARF tests, source-level stepping tests, source-level breakpoint tests, inline stack tests, source display tests, CFI tests, stack unwinding tests, shared library tracing tests, DWARF expression tests, global variable reading tests) |
 | `test/targets/end_immediately/main.go` | Test target: exits immediately |
 | `test/targets/run_endlessly/main.go` | Test target: infinite loop |

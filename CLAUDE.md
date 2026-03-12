@@ -57,19 +57,32 @@ This is a Go project, inspired by the C++ project *Building a Debugger* by No St
 
 ## Platform-Specific Setup
 
+The `debugger` package only compiles on Linux (ptrace is a Linux-specific API). There are no cross-platform stubs — non-Linux platforms must use a Linux environment.
+
 ### Linux (native — recommended)
 
 Build and run directly — no container needed. Native execution is preferred over containers (less overhead, no extra security flags).
 
-### macOS (via Podman, Docker, or another container runtime)
+### macOS / Windows (via dev container)
 
-macOS does not support ptrace in the way the debugger requires. Use the container commands above with whichever runtime is installed (`podman` or `docker`).
+The repository includes a **dev container** configuration (`.devcontainer/`) that provides a full Linux development environment with Go, gcc, and ptrace capabilities pre-configured.
 
-### Windows (via WSL2, Podman, or Docker)
+**Supported workflows:**
 
-Use **WSL2**, which provides a real Linux kernel with full ptrace support. Build natively inside a WSL2 terminal. Alternatively use **Docker Desktop** or **Podman** with the container commands above. WSL**1** does *not* support ptrace.
+- **VS Code:** Install the Dev Containers extension, then "Reopen in Container."
+- **JetBrains (GoLand, etc.):** Use Gateway → Dev Container.
+- **GitHub Codespaces:** Click "Open in Codespaces" on GitHub — zero local setup.
+- **WSL2 (Windows only):** Build natively inside a WSL2 terminal — no container needed. WSL**1** does *not* support ptrace.
 
-> **⚠ Container ptrace note:** Containers drop `SYS_PTRACE` by default, so `ptrace(PTRACE_TRACEME, ...)` inside `Launch` would fail with `EPERM`. The default seccomp profile also blocks ptrace. Both `--cap-add=SYS_PTRACE` and `--security-opt seccomp=unconfined` are required. Podman is rootless by default, so these capabilities are granted explicitly without running as root on the host.
+The root `Dockerfile` can also be used to build a minimal production image or run the debugger in a container directly:
+
+```bash
+podman build -t toydbg .
+podman run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+  -it toydbg /path/to/program
+```
+
+> **⚠ Container ptrace note:** Containers drop `SYS_PTRACE` by default, so `ptrace(PTRACE_TRACEME, ...)` inside `Launch` would fail with `EPERM`. The default seccomp profile also blocks ptrace. Both `--cap-add=SYS_PTRACE` and `--security-opt seccomp=unconfined` are required. The dev container's `devcontainer.json` includes these flags automatically. Podman is rootless by default, so these capabilities are granted explicitly without running as root on the host.
 
 ## Verification Rule
 
@@ -105,7 +118,7 @@ echo "c" | podman run --rm -i --cap-add=SYS_PTRACE --security-opt seccomp=unconf
 # Step 4: Container smoke-test — REPL help
 echo "help" | podman run --rm -i --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
   toydbg /bin/true
-# Expected: "commands: continue (c), step (s), next (n), finish (fin), stepi (si), list (l), backtrace (bt), breakpoint (break), watchpoint (watch), register (reg), memory (mem), disassemble (disas), catchpoint (catch), variable (var), thread (t), quit (q), help (h)"
+# Expected: "commands: continue (c), step (s), next (n), finish (fin), stepi (si), list (l), backtrace (bt), breakpoint (break), watchpoint (watch), register (reg), memory (mem), disassemble (disas), catchpoint (catch), variable (var), expression (expr), thread (t), quit (q), help (h)"
 ```
 
 > **Why is the container build mandatory?** The Dockerfile runs `go test ./...` inside the image, which compiles the assembly test targets with `gcc` and executes all tests including the ptrace-based register tests. A passing container build proves the full toolchain works: Go compiler, `gcc` for assembly, and ptrace syscalls. Native-only testing does not guarantee the container environment works.

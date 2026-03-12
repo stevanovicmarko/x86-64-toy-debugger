@@ -4,7 +4,7 @@ This file provides guidance to AI coding assistants working with this repository
 
 ## Project Overview
 
-A toy x86-64 debugger written in Go, inspired by the C++ project in *Building a Debugger* by No Starch Press. The debugger is Linux-only, can launch or attach to processes via ptrace and has an interactive REPL with commands for continuing execution, reading/writing registers, and more. It is not intended for production use. It can be used on other operating systems by running it inside a container (Docker or Podman).
+A toy x86-64 debugger written in Go, inspired by the C++ project in *Building a Debugger* by No Starch Press. The debugger is Linux-only, can launch or attach to processes via ptrace and has an interactive REPL with commands for continuing execution, reading/writing registers, and more. It is not intended for production use. A dev container configuration (`.devcontainer/`) is provided for development on macOS and Windows.
 
 ## Commands
 
@@ -45,16 +45,15 @@ podman run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
 | Package | Role | Visibility |
 |---------|------|------------|
 | `debugger/` | Public library — all debugger primitives (processes, breakpoints, registers, etc.) | **Exported** |
-| `internal/` | Private implementation details | **Private** (compiler-enforced) |
 | `cmd/toydbg/` | CLI binary with interactive REPL | Consumes `debugger/` |
 | `test/` | Black-box integration tests | Consumes `debugger/` |
+| `.devcontainer/` | Dev container configuration (Dockerfile + devcontainer.json) | — |
 | `docs/` | Documentation and notes | — |
 
 ### Constraints
 
-- The `debugger` package is the **sole public API surface**. The CLI and tests must go through it; neither should import `internal/` directly.
-- Go enforces the `internal/` boundary at compile time — any import of `internal/` from outside this module will fail to build.
-- The `debugger` package requires **Linux** (ptrace syscalls). See [Platform-Specific Setup](#platform-specific-setup) below for how to run on each OS.
+- The `debugger` package is the **sole public API surface**. The CLI and tests must go through it.
+- The `debugger` package **only compiles on Linux** (ptrace syscalls, no cross-platform stubs). See [Platform-Specific Setup](#platform-specific-setup) below for non-Linux development.
 
 ### Dependencies
 
@@ -71,6 +70,8 @@ podman run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
 
 ## Platform-Specific Setup
 
+The `debugger` package only compiles on Linux. There are no cross-platform stubs.
+
 ### Linux (native — recommended)
 
 Build and run directly — no container needed:
@@ -80,11 +81,16 @@ go build ./cmd/toydbg
 ./toydbg /path/to/program
 ```
 
-Containers also work on Linux but native execution is preferred (less overhead, no extra security flags).
+### macOS / Windows (via dev container)
 
-### macOS (via Podman, Docker, or another container runtime)
+The repository includes a dev container configuration (`.devcontainer/`) that provides a full Linux environment with Go, gcc, and ptrace capabilities.
 
-macOS does not support ptrace in the way the debugger requires. Use a Linux container:
+- **VS Code:** Install the Dev Containers extension, then "Reopen in Container."
+- **JetBrains (GoLand, etc.):** Use Gateway → Dev Container.
+- **GitHub Codespaces:** Click "Open in Codespaces" on GitHub.
+- **WSL2 (Windows only):** Build natively inside a WSL2 terminal. WSL**1** does *not* support ptrace.
+
+The root `Dockerfile` can also be used to run the debugger in a container:
 
 ```bash
 podman build -t toydbg .   # or: docker build -t toydbg .
@@ -92,19 +98,7 @@ podman run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
   -it toydbg /path/to/program
 ```
 
-### Windows (via WSL2, Podman, or Docker)
-
-Use **WSL2**, which provides a real Linux kernel with full ptrace support:
-
-```bash
-# Inside a WSL2 terminal
-go build ./cmd/toydbg
-./toydbg /path/to/program
-```
-
-Alternatively, use **Docker Desktop** or **Podman** with the same container commands as macOS above. WSL**1** does *not* support ptrace — you must use WSL**2** or containers.
-
-> **⚠ Container ptrace note:** Containers drop `SYS_PTRACE` by default, so `ptrace(PTRACE_TRACEME, ...)` inside `Launch` would fail with `EPERM`. The default seccomp profile also blocks ptrace. Both `--cap-add=SYS_PTRACE` and `--security-opt seccomp=unconfined` are required. Podman is rootless by default, so these capabilities are granted explicitly without running as root on the host.
+> **⚠ Container ptrace note:** Containers drop `SYS_PTRACE` by default, so `ptrace(PTRACE_TRACEME, ...)` inside `Launch` would fail with `EPERM`. The default seccomp profile also blocks ptrace. Both `--cap-add=SYS_PTRACE` and `--security-opt seccomp=unconfined` are required. The dev container's `devcontainer.json` includes these flags automatically.
 
 ## Agentic Workflow Requirement
 
@@ -150,7 +144,7 @@ echo "c" | podman run --rm -i --cap-add=SYS_PTRACE --security-opt seccomp=unconf
 ```bash
 echo "help" | podman run --rm -i --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
   toydbg /bin/true
-# Expected output: "commands: continue (c), step (s), next (n), finish (fin), stepi (si), list (l), backtrace (bt), breakpoint (break), watchpoint (watch), register (reg), memory (mem), disassemble (disas), catchpoint (catch), quit (q), help (h)"
+# Expected output: "commands: continue (c), step (s), next (n), finish (fin), stepi (si), list (l), backtrace (bt), breakpoint (break), watchpoint (watch), register (reg), memory (mem), disassemble (disas), catchpoint (catch), variable (var), expression (expr), thread (t), quit (q), help (h)"
 ```
 
 > **Why is the container build mandatory?** Native-only testing does not guarantee the container environment works. The container is where `gcc` compiles assembly test targets, and where the Dockerfile's `RUN go test ./...` gate catches regressions in the full toolchain.
