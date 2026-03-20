@@ -238,10 +238,10 @@ A traced process moves through four states:
                         │
                         ▼
               ┌──── STOPPED ◀──────────┐
-              │         │              │
-      Resume()│         │              │ WaitOnSignal()
-              │         │              │ (stopped by signal)
-              ▼         │              │
+              │         │            │
+      Resume()│         │            │ WaitOnSignal()
+              │         │            │ (stopped by signal)
+              ▼         │            │
            RUNNING ─────┘──────────────┘
               │
               │  WaitOnSignal()
@@ -291,8 +291,8 @@ shell over the `debugger` API, not an independent system.
 ### Flow
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  1. Parse flags: -p <pid> or /path/to/prog               │
+┌───────────────────────────────────────────────────────────────────┐
+│  1. Parse flags: -p <pid> or /path/to/prog                │
 │  2. Call debugger.LaunchTarget() or AttachTarget()        │
 │  3. Initialize readline with (toydbg) prompt              │
 │  4. Loop:                                                 │
@@ -317,7 +317,7 @@ shell over the `debugger` API, not an independent system.
 │     └─ If process exited → break                          │
 │  5. defer target.Close()                                  │
 │  6. defer rl.Close()                                      │
-└──────────────────────────────────────────────────────────┘
+└────────────────────────────────────────────────────────── ────────┘
 ```
 
 ### Commands
@@ -979,13 +979,13 @@ slice-backed collection with lookup methods. This keeps things concrete
 
 ```
                     ┌─────────────────────┐
-PEEKUSER/POKEUSER → │   struct user       │ ← register state
-                    │   (kernel memory)   │
+PEEKUSER/POKEUSER → │   struct user     │ ← register state
+                    │   (kernel memory) │
                     └─────────────────────┘
 
                     ┌─────────────────────┐
-PEEKDATA/POKEDATA → │   process memory    │ ← code + data
-                    │   (address space)   │
+PEEKDATA/POKEDATA → │   process memory  │ ← code + data
+                    │   (address space) │
                     └─────────────────────┘
 ```
 
@@ -1391,13 +1391,13 @@ The solution has two parts:
 
 ```
 Terminal                Debugger (PG 1)        Inferior (PG 2)
-  │                         │                       │
-  │── SIGINT ──────────────►│                       │
+  │                         │                        │
+  │── SIGINT ───────────────► │                        │
   │                         │── kill(pid, SIGSTOP) ─►│
-  │                         │                       │ STOPS
-  │                         │◄── wait4 unblocks ────│
-  │                         │                       │
-  │◄── "(toydbg) " ────────│                       │
+  │                         │                        │ STOPS
+  │                         │◄── wait4 unblocks ──────│
+  │                         │                        │
+  │◄── "(toydbg) " ──────────│                         │
 ```
 
 ### Why SIGSTOP instead of SIGINT?
@@ -1490,20 +1490,20 @@ from other SIGTRAP causes.
 ```
                    PTRACE_SYSCALL
                         │
-  ┌─────────────────────▼─────────────────────────┐
+  ┌─────────────────────▼────────────────────────────────┐
   │ Tracee runs ... hits syscall(write, ...) ...   │
   │                                                │
   │ STOP #1: syscall entry                         │
   │   orig_rax = 1 (write)                         │
   │   rdi/rsi/rdx/... = args                       │
   │                                                │
-  │                   PTRACE_SYSCALL                │
+  │                   PTRACE_SYSCALL               │
   │                        │                       │
   │ ... kernel executes write() ...                │
   │                                                │
   │ STOP #2: syscall exit                          │
   │   rax = return value (bytes written)           │
-  └────────────────────────────────────────────────┘
+  └──────────────────────────────────────────────────────┘
 ```
 
 ### Entry/exit tracking
@@ -2101,7 +2101,7 @@ while `.debug_frame` is often absent.
 CFI data is organized as a series of entries in `.eh_frame`:
 
 ```
-┌─────────────────────────────────────────┐
+┌──────────────────────────────────────────────┐
 │ CIE (Common Information Entry)          │
 │  ├── length, CIE_id=0, version          │
 │  ├── augmentation string ("zR", "zPLR") │
@@ -2110,17 +2110,17 @@ CFI data is organized as a series of entries in `.eh_frame`:
 │  ├── return_address_register (ULEB128)  │  ← x86-64: 16 (RA)
 │  ├── [augmentation data: R, L, P, ...]  │
 │  └── initial_instructions               │
-├─────────────────────────────────────────┤
+├──────────────────────────────────────────────┤
 │ FDE (Frame Description Entry)           │
 │  ├── length, CIE_pointer (backward)     │
 │  ├── initial_location + address_range   │
 │  ├── [augmentation data]                │
 │  └── instructions                       │
-├─────────────────────────────────────────┤
+├──────────────────────────────────────────────┤
 │ FDE ...                                 │
-├─────────────────────────────────────────┤
-│ CIE (another group) ...                │
-└─────────────────────────────────────────┘
+├──────────────────────────────────────────────┤
+│ CIE (another group) ...                 │
+└──────────────────────────────────────────────┘
 ```
 
 The **CIE pointer** in an FDE is a *backward offset* from the CIE pointer field
@@ -2173,12 +2173,12 @@ pairs, enabling O(log n) FDE lookup instead of scanning the entire `.eh_frame`:
   table_enc (1 byte)
   eh_frame_ptr (encoded)
   fde_count (encoded)
-  ┌──────────────────────────────┐
-  │ search table (sorted):       │
+  ┌─────────────────────────────────┐
+  │ search table (sorted):      │
   │   initial_location₀, fde₀   │
   │   initial_location₁, fde₁   │
-  │   ...                        │
-  └──────────────────────────────┘
+  │   ...                       │
+  └─────────────────────────────────┘
 ```
 
 `FDEForPC()` binary searches this table, then parses the FDE at the found offset.
@@ -2236,11 +2236,11 @@ it:
 
 ```
   Current Frame (add)          Caller Frame (main)
-  ┌──────────────────┐         ┌──────────────────┐
-  │ registers (live)  │  CFI   │ registers (restored)│
-  │ PC = 0x400470     │ ────►  │ PC = 0x4004c4       │
-  │ CFA = rsp + 16    │        │ CFA = rsp + 8        │
-  └──────────────────┘         └──────────────────┘
+  ┌─────────────────────┐        ┌──────────────────────────┐
+  │ registers (live)  │  CFI   │ registers (restored)  │
+  │ PC = 0x400470     │ ────►  │ PC = 0x4004c4          │
+  │ CFA = rsp + 16    │        │ CFA = rsp + 8         │
+  └─────────────────────┘        └──────────────────────────┘
          │                            │
          ▼                            ▼
     FDE instructions:             Next FDE...
